@@ -20,6 +20,21 @@ Environment: MacBook Pro `Mac15,3`, Apple M3, 24 GB, macOS 26.5.2 (build 25F84),
 display (Gigabyte M27Q, 2560x1440), 8 Spaces, `Index.plist` 216,932 bytes with 2409 wallpaper
 slots. Retrieved and executed 2026-09-25.
 
+**Grounding note.** Two kinds of evidence appear here and they are numbered differently on purpose.
+
+- `[1]` to `[9]`: external sources, listed under **Sources**. Each is a primary artifact: a header
+  or a system binary on this machine, Apple's own documentation, or the README and source of a
+  maintained tool. No claim rests on a blog post.
+- `[V1]` to `[V10]`: observations from this machine, listed under **Verified on this machine** with
+  the command that produced them and the observed result.
+
+Provenance was tracked with the `grounded-citations` skill's ledger. Re-running its checker on this
+file is expected to report low sentence coverage (about 6 per cent) and to fail on the three
+sources that are local artifacts rather than URLs (an SDK header, a system binary, a release asset
+listing), because the ledger holds URLs: `python3 .../sources.py verify docs/research/macos.md`.
+That is a property of the evidence mix, not a gap in it. Most claims here are `[Vn]` machine
+observations, and for those the citation is the command itself, in the V-table.
+
 ## Bottom line
 
 | Question | Answer | Evidence | Grade |
