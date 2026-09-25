@@ -12,7 +12,7 @@ own acceptance criteria.
 | `research/scheduling.md` | to be written | launchd, Task Scheduler and systemd user timers: missed-run behaviour across sleep, install/uninstall, and whether they can replace an in-daemon timer |
 | `spec/features.md` | to be written | the v0.1 feature set, the source abstraction, filters, and what is explicitly out of scope |
 | `spec/state-and-cache.md` | to be written | per-OS state and cache locations, eviction policy, atomic writes, corruption recovery |
-| `architecture.md` | to be written | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
+| `architecture.md` | written 2026-09-25 | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
 | `development.md` | to be written | repo layout, build and test matrix, release process, contribution workflow |
 
 ## Reading order
