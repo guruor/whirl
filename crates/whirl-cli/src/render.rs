@@ -4,12 +4,20 @@
 //! module is the CLI's policy on top of it, and it is separate so the policy is
 //! readable in one place: what is printed, what is a failure, and which of the
 //! four exit codes of docs/architecture.md 2.5.1 an answer earns.
+//!
+//! The four exit codes are the whole program's, so they compile everywhere. The
+//! verdict policy and the greeting check are read by the transport, which is a
+//! Unix domain socket in this build (docs/architecture.md 2.1 gives Windows a
+//! named pipe, a later card), so those items are `cfg(unix)`.
 
+#[cfg(unix)]
 use whirl_core::protocol::{self, ErrorCode, LineKind};
 
 /// The verb completed (2.5.1).
 pub const EXIT_OK: u8 = 0;
-/// The daemon refused, and the `ERR` code says why. Exactly one meaning.
+/// The daemon refused, and the `ERR` code says why. Exactly one meaning. Only
+/// the transport can see a refusal, so like it this is `cfg(unix)`.
+#[cfg(unix)]
 pub const EXIT_REFUSED: u8 = 1;
 /// The daemon is not reachable: nothing is listening on the socket.
 pub const EXIT_UNREACHABLE: u8 = 2;
@@ -18,6 +26,7 @@ pub const EXIT_UNREACHABLE: u8 = 2;
 pub const EXIT_USAGE: u8 = 3;
 
 /// What the CLI does with one line from the daemon.
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
     /// Print it and keep reading.
@@ -32,6 +41,7 @@ pub enum Exit {
     Malformed,
 }
 
+#[cfg(unix)]
 pub fn verdict(line: &str) -> Exit {
     match protocol::classify_line(line) {
         LineKind::Ok => Exit::Done,
@@ -47,12 +57,14 @@ pub fn verdict(line: &str) -> Exit {
 /// The exit code for a refusal. One code, because the reason travels on the wire
 /// in the `ERR` line: a second code here would be a second answer to the same
 /// question (2.5.1's "1 keeps exactly one meaning").
+#[cfg(unix)]
 pub fn refused(_code: ErrorCode) -> u8 {
     EXIT_REFUSED
 }
 
 /// The greeting is `OK whirl <version> protocol <n>` (2.4). A client refuses to
 /// run against a protocol it does not know rather than misreading answers.
+#[cfg(unix)]
 pub fn check_greeting(line: &str) -> Result<(), String> {
     let fields: Vec<&str> = line.split(' ').collect();
     if fields.len() != 5 || fields[0] != "OK" {

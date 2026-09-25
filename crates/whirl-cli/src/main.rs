@@ -12,8 +12,14 @@
 
 mod render;
 
-use render::{EXIT_OK, EXIT_REFUSED, EXIT_UNREACHABLE, EXIT_USAGE, Exit};
+#[cfg(unix)]
+use render::EXIT_REFUSED;
+#[cfg(unix)]
+use render::Exit;
+use render::{EXIT_OK, EXIT_UNREACHABLE, EXIT_USAGE};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -83,6 +89,7 @@ fn main() -> ExitCode {
             eprintln!("whirl: {message}");
             ExitCode::from(EXIT_USAGE)
         }
+        #[cfg(unix)]
         Err(TalkError::Io(error)) => {
             eprintln!("whirl: {error}");
             ExitCode::from(EXIT_REFUSED)
@@ -141,15 +148,22 @@ fn request(args: &[String]) -> Result<Request, String> {
     Ok(request)
 }
 
+/// The three ways a conversation with the daemon can end badly. `Io` is
+/// `cfg(unix)` with the transport: without a socket there is no read to fail.
 enum TalkError {
-    Unreachable { path: PathBuf, message: String },
+    Unreachable {
+        path: PathBuf,
+        message: String,
+    },
     Protocol(String),
+    #[cfg(unix)]
     Io(std::io::Error),
 }
 
 /// One connection, one request, one response (2.3). The greeting is checked
 /// before the request goes out, because a client that cannot read the answer
 /// should not ask the question.
+#[cfg(unix)]
 fn talk(request: &Request) -> Result<ExitCode, TalkError> {
     let path = socket_path().map_err(TalkError::Protocol)?;
     let stream = UnixStream::connect(&path).map_err(|error| TalkError::Unreachable {
@@ -204,6 +218,19 @@ fn talk(request: &Request) -> Result<ExitCode, TalkError> {
     }
 }
 
+/// There is no transport on Windows yet: docs/architecture.md 2.1 gives the
+/// platform a named pipe with an explicit DACL, and that is a later card. Until
+/// it lands this client says so, rather than reporting a daemon that is not
+/// there as unreachable.
+#[cfg(not(unix))]
+fn talk(_request: &Request) -> Result<ExitCode, TalkError> {
+    Err(TalkError::Unreachable {
+        path: socket_path().map_err(TalkError::Protocol)?,
+        message: "the control socket is a unix domain socket in this scaffold; the Windows named pipe of docs/architecture.md 2.1 is not implemented yet".to_string(),
+    })
+}
+
+#[cfg(unix)]
 fn read_line(reader: &mut impl BufRead) -> Result<Option<String>, TalkError> {
     let mut buffer = String::new();
     let read = reader.read_line(&mut buffer).map_err(TalkError::Io)?;

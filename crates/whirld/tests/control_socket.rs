@@ -7,6 +7,12 @@
 //!
 //! Run it with `cargo test --workspace`: the daemon looks for `whirl-worker` next
 //! to its own executable, and that is where a test build lays the two binaries.
+//!
+//! Unix only: the transport of docs/architecture.md 2.1 is a Unix domain socket
+//! in this build, and the Windows named pipe is a later card. On Windows the
+//! whole file compiles to nothing rather than to a test that cannot bind.
+
+#![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;

@@ -15,16 +15,38 @@
 //! foreground (docs/development.md section 7) and the log file of `[D 6 §7.2]`
 //! arrives with the daemon that has something to rotate.
 
+#[cfg(unix)]
 mod plan;
+#[cfg(unix)]
 mod socket;
+#[cfg(unix)]
 mod state;
+#[cfg(unix)]
 mod worker;
 
 use std::process::ExitCode;
+#[cfg(unix)]
 use std::sync::Arc;
 
 const USAGE: &str = "usage: whirld [--config <path>] [--socket <path>] [--backend <native|noop>]";
 
+/// The transport of docs/architecture.md 2.1 is a Unix domain socket in this
+/// build. On Windows that document asks for a named pipe with an explicit DACL,
+/// which is a later card: until it lands there is no startup path to compile, so
+/// this binary refuses to start rather than binding something weaker.
+#[cfg(not(unix))]
+fn main() -> ExitCode {
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "whirld: the control socket is a unix domain socket in this scaffold; the Windows named pipe of docs/architecture.md 2.1 is not implemented yet"
+    );
+    ExitCode::from(1)
+}
+
+#[cfg(unix)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -70,12 +92,4 @@ fn run(flags: &plan::Flags) -> Result<(), String> {
     // supervisor's job to do (1.5).
     socket::serve(listener, daemon);
     Ok(())
-}
-
-/// docs/architecture.md 2.1 gives Windows a named pipe with an explicit DACL.
-/// That is a later card, and until it lands this build refuses to start rather
-/// than binding something weaker.
-#[cfg(not(unix))]
-fn run(_flags: &plan::Flags) -> Result<(), String> {
-    Err("the control socket is a unix domain socket in this scaffold; the Windows named pipe of docs/architecture.md 2.1 is not implemented yet".to_string())
 }
