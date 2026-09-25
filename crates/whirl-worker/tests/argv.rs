@@ -109,6 +109,29 @@ fn a_rotation_prints_downloaded_then_set_and_exits_zero() {
     );
 }
 
+/// docs/architecture.md 2.6's `source:` and `plan:` records, byte for byte, for
+/// the config `write_config` writes: 4.2's defaults with one local source and
+/// `"backend": "noop"`.
+///
+/// The order of the plan's keys is 4.2's file order, which is what 2.6's "the
+/// config's own dotted key paths, in file order" fixes, with
+/// `display.mode_effective` beside `display.mode` where 2.6 and 2.10 put that
+/// effective value. `backend=noop` and `sources=1` are this config's own
+/// `backend` and its one enabled source; the plan's values are effective values,
+/// which is why 2.6 exists at all ("what did the daemon actually adopt").
+///
+/// `last=-` and no counter group: the check form of 2.6's record, with the
+/// bracketed group absent because the pipeline that counts candidates does not
+/// exist yet (`src/pipeline.rs` says which stage is a placeholder). The group is
+/// optional in that form, and this pinning is deliberate: the group's arrival
+/// will fail this assertion, which is the signal for the pipeline card to update
+/// it.
+///
+/// It is a literal on purpose: the assertion is "these exact bytes", and a table
+/// this test joined together could hide a reordering of the keys behind a
+/// reordering of the table.
+const CHECK_OUTPUT: &str = "source: pictures local weight=1 enabled=1 last=- reason=-\nplan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1 startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02 filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=- cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 backend=noop sources=1\n";
+
 #[test]
 fn check_prints_the_source_and_plan_records() {
     let dir = scratch("check");
@@ -120,15 +143,12 @@ fn check_prints_the_source_and_plan_records() {
         stdout(&output),
         stderr(&output)
     );
+    // The whole of stdout, which is what the daemon forwards as the body of its
+    // `config check` response (2.5's `config check` row): a missing record, an
+    // extra line, either record moved, a changed value or a counter group that
+    // appears all fail here.
     let text = stdout(&output);
-    assert!(
-        text.lines().any(|line| line.starts_with("source: ")),
-        "{text}"
-    );
-    assert!(
-        text.lines().any(|line| line.starts_with("plan: ")),
-        "{text}"
-    );
+    assert_eq!(text, CHECK_OUTPUT, "the check output of 2.6, byte for byte");
     // A check is not a rotation: no `set:` line, and the setter is never called.
     assert!(!text.contains("set: "), "{text}");
 }
