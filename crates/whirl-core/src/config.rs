@@ -525,6 +525,95 @@ impl Config {
     pub fn default_config_json() -> &'static str {
         DEFAULT_CONFIG_JSON
     }
+
+    /// The effective values of docs/architecture.md 2.6's `plan:` line, as the
+    /// config's own dotted key paths in file order.
+    ///
+    /// It lives here, beside the schema it reads, so that the daemon and the
+    /// worker produce the *same* line: `config check` prints it, and a rotation
+    /// records it, and 2.6's claim is that "what did the daemon actually adopt"
+    /// is answerable from the line alone, which a second implementation with its
+    /// own idea of the key order would quietly break. `whirl-core` is the one
+    /// crate all three binaries link (docs/development.md section 1).
+    ///
+    /// `backend` is passed in rather than read from `self.backend`: 2.6's values
+    /// are effective values, and the resolved backend is what the run adopted
+    /// when 4.3's precedence let `WHIRL_BACKEND` or `--backend` win over the
+    /// file. `display.mode_effective` is what the platform actually gets; with
+    /// no platform code yet it is the configured mode, which is honest only for
+    /// `all` and is why 3.7's fallback is a later card.
+    pub fn plan_pairs(&self, backend: Backend) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut push = |key: &str, value: String| pairs.push((key.to_string(), value));
+        push(
+            "schedule.interval_seconds",
+            self.schedule.interval_seconds.to_string(),
+        );
+        push(
+            "schedule.worker_deadline_seconds",
+            self.schedule.worker_deadline_seconds.to_string(),
+        );
+        push(
+            "startup.enabled",
+            u8::from(self.startup.enabled).to_string(),
+        );
+        push("startup.mode", self.startup.mode.as_str().to_string());
+        push(
+            "startup.respect_manual",
+            u8::from(self.startup.respect_manual).to_string(),
+        );
+        push("display.mode", self.display.mode.as_str().to_string());
+        push(
+            "display.mode_effective",
+            self.display.mode.as_str().to_string(),
+        );
+        push("min_width", self.min_width.to_string());
+        push("min_height", self.min_height.to_string());
+        push("filters.max_bytes", self.filters.max_bytes.to_string());
+        push(
+            "filters.ratio_tolerance",
+            self.filters.ratio_tolerance.to_string(),
+        );
+        push(
+            "filters.target_ratio",
+            match self.filters.target_ratio {
+                Some(ratio) => ratio.to_string(),
+                None => "-".to_string(),
+            },
+        );
+        push(
+            "state.history_entries",
+            self.state.history_entries.to_string(),
+        );
+        push(
+            "dedupe.recent_entries",
+            self.dedupe.recent_entries.to_string(),
+        );
+        push(
+            "cache.root",
+            match &self.cache.root {
+                Some(root) => root.display().to_string(),
+                None => "-".to_string(),
+            },
+        );
+        push("cache.max_bytes", self.cache.max_bytes.to_string());
+        push("cache.max_files", self.cache.max_files.to_string());
+        push("cache.grace_seconds", self.cache.grace_seconds.to_string());
+        push(
+            "cache.orphan_grace_seconds",
+            self.cache.orphan_grace_seconds.to_string(),
+        );
+        push("backend", backend.as_str().to_string());
+        push(
+            "sources",
+            self.sources
+                .iter()
+                .filter(|source| source.weight > 0)
+                .count()
+                .to_string(),
+        );
+        pairs
+    }
 }
 
 // ---------------------------------------------------------------------------

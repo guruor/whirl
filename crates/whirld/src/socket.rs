@@ -7,7 +7,7 @@
 //! Unix only in this scaffold: the Windows named pipe of 2.1 is a later card,
 //! and `main` refuses to start there rather than pretending.
 
-use crate::state::{Daemon, platform};
+use crate::state::{Daemon, Rotation, platform};
 use crate::worker::{Outcome, Verb, WorkerError};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -574,7 +574,7 @@ fn dispatch(daemon: &Daemon, line: &str, out: &mut impl Write) -> io::Result<Con
             let run = daemon.start_slot();
             writeln!(out, "queued")?;
             out.flush()?;
-            let deadline = worker_deadline(daemon);
+            let deadline = daemon.worker_deadline();
             match daemon.worker.run(Verb::Check, None, run, deadline) {
                 Ok(Outcome::Lines(lines)) => {
                     for line in lines {
@@ -610,11 +610,12 @@ fn dispatch(daemon: &Daemon, line: &str, out: &mut impl Write) -> io::Result<Con
     Ok(Control::Continue)
 }
 
-fn worker_deadline(daemon: &Daemon) -> Duration {
-    Duration::from_secs(daemon.effective.config.schedule.worker_deadline_seconds)
-}
-
 /// `queued`, then the worker, then `set:` and `OK`, or the failure (2.5, 2.6).
+///
+/// The rotation itself (spawn, gate, record, and the events of 2.9) is
+/// `Daemon::rotation`, which is also what the scheduler calls for a due slot:
+/// one implementation, so a scheduled rotation and a client's `next` cannot
+/// answer differently. What is here is only the part a client sees.
 fn run_rotation(
     daemon: &Daemon,
     out: &mut impl Write,
@@ -636,41 +637,17 @@ fn run_rotation(
     // point of it (2.6), and the lock is not held while the worker runs (1.8).
     writeln!(out, "queued")?;
     out.flush()?;
-    let deadline = worker_deadline(daemon);
-    let outcome = daemon.worker.run(verb, target, run, deadline);
-    match outcome {
-        Ok(Outcome::Set(record)) => {
-            daemon.record_success(
+    match daemon.rotation(run, via, verb, target) {
+        Rotation::Set(record) => write_response(
+            out,
+            &Response::ok().line(protocol::set_record(
                 &record.digest,
                 &record.origin_key,
                 via,
                 record.path.as_deref(),
-            );
-            write_response(
-                out,
-                &Response::ok().line(protocol::set_record(
-                    &record.digest,
-                    &record.origin_key,
-                    via,
-                    record.path.as_deref(),
-                )),
-            )
-        }
-        Ok(Outcome::Lines(lines)) => {
-            for line in lines {
-                writeln!(out, "{line}")?;
-            }
-            write_ok(out)
-        }
-        Err(WorkerError::Timeout) => {
-            let message = "the worker did not finish inside schedule.worker_deadline_seconds";
-            daemon.record_failure(ErrorCode::Timeout, message);
-            write_err(out, ErrorCode::Timeout, message)
-        }
-        Err(WorkerError::Failed { code, message }) => {
-            daemon.record_failure(code, &message);
-            write_err(out, code, &message)
-        }
+            )),
+        ),
+        Rotation::Failed { code, message } => write_err(out, code, &message),
     }
 }
 

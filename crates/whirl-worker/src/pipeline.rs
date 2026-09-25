@@ -107,7 +107,10 @@ pub fn check(config: &Config, backend: Backend) {
     for source in &config.sources {
         println!("{}", source_record(source).line());
     }
-    println!("{}", protocol::plan_record(&plan_pairs(config, backend)));
+    // One implementation of the plan line, in `whirl-core` beside the schema:
+    // the daemon records the same line for a scheduled rotation, so the two can
+    // never disagree about the key order (2.6).
+    println!("{}", protocol::plan_record(&config.plan_pairs(backend)));
 }
 
 /// The `source:` record of a configured source, from the one implementation in
@@ -116,90 +119,6 @@ pub fn check(config: &Config, backend: Backend) {
 /// the bracketed group only.
 pub fn source_record(source: &SourceConfig) -> SourceRecord {
     source.record(None)
-}
-
-/// The effective values, as the config's own dotted key paths in file order
-/// (2.6). `display.mode_effective` is what the platform actually gets; with no
-/// platform code yet it is the configured mode, which is honest only for `all`
-/// and is why 3.7's fallback is a later card.
-///
-/// `backend` is passed in rather than read from `config.backend`: 2.6's values
-/// are effective values, and the resolved backend is what the run adopted (4.3).
-pub fn plan_pairs(config: &Config, backend: Backend) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut push = |key: &str, value: String| pairs.push((key.to_string(), value));
-    push(
-        "schedule.interval_seconds",
-        config.schedule.interval_seconds.to_string(),
-    );
-    push(
-        "schedule.worker_deadline_seconds",
-        config.schedule.worker_deadline_seconds.to_string(),
-    );
-    push(
-        "startup.enabled",
-        u8::from(config.startup.enabled).to_string(),
-    );
-    push("startup.mode", config.startup.mode.as_str().to_string());
-    push(
-        "startup.respect_manual",
-        u8::from(config.startup.respect_manual).to_string(),
-    );
-    push("display.mode", config.display.mode.as_str().to_string());
-    push(
-        "display.mode_effective",
-        config.display.mode.as_str().to_string(),
-    );
-    push("min_width", config.min_width.to_string());
-    push("min_height", config.min_height.to_string());
-    push("filters.max_bytes", config.filters.max_bytes.to_string());
-    push(
-        "filters.ratio_tolerance",
-        config.filters.ratio_tolerance.to_string(),
-    );
-    push(
-        "filters.target_ratio",
-        match config.filters.target_ratio {
-            Some(ratio) => ratio.to_string(),
-            None => "-".to_string(),
-        },
-    );
-    push(
-        "state.history_entries",
-        config.state.history_entries.to_string(),
-    );
-    push(
-        "dedupe.recent_entries",
-        config.dedupe.recent_entries.to_string(),
-    );
-    push(
-        "cache.root",
-        match &config.cache.root {
-            Some(root) => root.display().to_string(),
-            None => "-".to_string(),
-        },
-    );
-    push("cache.max_bytes", config.cache.max_bytes.to_string());
-    push("cache.max_files", config.cache.max_files.to_string());
-    push(
-        "cache.grace_seconds",
-        config.cache.grace_seconds.to_string(),
-    );
-    push(
-        "cache.orphan_grace_seconds",
-        config.cache.orphan_grace_seconds.to_string(),
-    );
-    push("backend", backend.as_str().to_string());
-    push(
-        "sources",
-        config
-            .sources
-            .iter()
-            .filter(|source| source.weight > 0)
-            .count()
-            .to_string(),
-    );
-    pairs
 }
 
 /// `downloaded:` then the setter, then `set:` (docs/architecture.md 1.6).

@@ -28,10 +28,6 @@
 //! rule 5 sees, and the re-anchor is only ever correct there. Recorded in the
 //! handoff as a reading of two rules that overlap.
 
-// The module is wired into the daemon by the scheduler (`crate::scheduler`),
-// which lands one commit after this one; this allow goes with that commit.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 /// The bounded slice the scheduler sleeps between two observations.
