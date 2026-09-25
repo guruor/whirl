@@ -173,6 +173,14 @@ fn msg_object_at(receiver: Id, cmd: Sel, index: usize) -> Id {
     unsafe { send(receiver, cmd, index) }
 }
 
+/// `[NSError code]` returning `NSInteger`: `long`, signed, 64 bits on both Darwin
+/// ABIs, hence `i64`.
+fn msg_integer(receiver: Id, cmd: Sel) -> i64 {
+    let send: unsafe extern "C" fn(Id, Sel) -> i64 =
+        unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+    unsafe { send(receiver, cmd) }
+}
+
 /// `[NSString UTF8String]`: a NUL-terminated C string borrowed from the string.
 fn msg_utf8(receiver: Id, cmd: Sel) -> *const c_char {
     let send: unsafe extern "C" fn(Id, Sel) -> *const c_char =
@@ -180,18 +188,18 @@ fn msg_utf8(receiver: Id, cmd: Sel) -> *const c_char {
     unsafe { send(receiver, cmd) }
 }
 
-/// `[receiver setDesktopImageURL:url forScreen:screen options:nil]`, the message
-/// `NSWorkspace.h:227` declares as
-/// `- (BOOL)setDesktopImageURL:(NSURL *)url forScreen:(NSScreen *)screen
+/// `[receiver setDesktopImageURL:url forScreen:screen options:nil error:&error]`,
+/// mirroring `- (BOOL)setDesktopImageURL:(NSURL *)url forScreen:(NSScreen *)screen
 /// options:(NSDictionary<NSWorkspaceDesktopImageOptionKey, id> *)options
-/// error:(NSError **)error`.
+/// error:(NSError **)error` (`NSWorkspace.h:227`).
 ///
 /// ABI, argument by argument: the receiver and the selector come first as for
-/// every message, then the arguments in the order the declaration lists them:
-/// two objects and the options dictionary (null here). The return is `BOOL`,
-/// which is `signed char` on both Darwin ABIs, so `i8`; it is read as `!= 0`
-/// rather than as a Rust `bool`, because `bool` is defined for 0 and 1 and an
-/// Objective-C `BOOL` is not.
+/// every message, then the four arguments in the order the declaration lists
+/// them: two objects, the options dictionary (null here), and the address of an
+/// `NSError *` the callee may write through. The return is `BOOL`, which is
+/// `signed char` on both Darwin ABIs, so `i8`; it is read as `!= 0` rather than
+/// as a Rust `bool`, because `bool` is defined for 0 and 1 and an Objective-C
+/// `BOOL` is not.
 ///
 /// This stays on plain `objc_msgSend`: on x86_64 `objc_msgSend_stret` is the
 /// entry point for a message that *returns* a struct and `objc_msgSend_fpret` for
@@ -200,8 +208,8 @@ fn msg_utf8(receiver: Id, cmd: Sel) -> *const c_char {
 /// The options dictionary is null on purpose. `allSpaces` exists in it and is
 /// inert (docs/architecture.md 3.2: two nodes were measured with it and without
 /// it), so it is not set here because the name looks right.
-fn msg_set_desktop_image(workspace: Id, url: Id, screen: Id) -> bool {
-    let send: unsafe extern "C" fn(Id, Sel, Id, Id, Id) -> i8 =
+fn msg_set_desktop_image(workspace: Id, url: Id, screen: Id, error: *mut Id) -> bool {
+    let send: unsafe extern "C" fn(Id, Sel, Id, Id, Id, *mut Id) -> i8 =
         unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
     unsafe {
         send(
@@ -210,6 +218,7 @@ fn msg_set_desktop_image(workspace: Id, url: Id, screen: Id) -> bool {
             url,
             screen,
             ptr::null_mut(),
+            error,
         ) != 0
     }
 }
@@ -306,6 +315,54 @@ fn screen_name(screen: Id, index: usize) -> String {
         .unwrap_or_else(|| format!("screen #{} (the platform reported no name)", index + 1))
 }
 
+/// The facts the failure message needs, read out of the `NSError` the platform
+/// wrote through the out-parameter. Every field is `None` when the call answered
+/// `NO` and left no error object behind, which the message says out loud rather
+/// than filling in a plausible domain.
+struct NsFailure {
+    domain: Option<String>,
+    code: Option<i64>,
+    description: Option<String>,
+}
+
+fn ns_failure(error: Id) -> NsFailure {
+    if error.is_null() {
+        return NsFailure {
+            domain: None,
+            code: None,
+            description: None,
+        };
+    }
+    NsFailure {
+        domain: string_of(error, selector(c"domain")),
+        code: Some(msg_integer(error, selector(c"code"))),
+        description: string_of(error, selector(c"localizedDescription")),
+    }
+}
+
+/// The message a refused set carries: the NSError's domain and code, its own
+/// sentence (docs/architecture.md 4's error table quotes it, "The file doesn't
+/// exist."), the selector, the screen and the path. Pure, so the shape of the
+/// mapping is testable on a machine with no desktop, and the one place a missing
+/// field is spelled out.
+fn describe(failure: &NsFailure, screen: &str, path: &str) -> String {
+    format!(
+        "{} failed on screen {} for {}: NSError domain {} code {} ({})",
+        SELECTOR_SET.to_string_lossy(),
+        screen,
+        path,
+        failure.domain.as_deref().unwrap_or("-"),
+        failure
+            .code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        failure
+            .description
+            .as_deref()
+            .unwrap_or("no NSError was returned"),
+    )
+}
+
 /// A refused set that never reached the platform: the call could not be built or
 /// there was nothing to send it to, so the message says why and carries the path
 /// it was asked for. Always `SetFailed`: nothing was set.
@@ -319,10 +376,10 @@ fn not_set(reason: String, path: &str) -> SetError {
 /// Put `path` on the desktop of every attached screen.
 ///
 /// One call per screen, in `NSScreen.screens` order, all with the cached file's
-/// absolute path (docs/architecture.md 3.2). A screen the platform refuses fails
-/// the whole set: a set that reached some screens and failed on one is a failure,
-/// not a success, because the caller asked for one image everywhere and must not
-/// be told it got it.
+/// absolute path (docs/architecture.md 3.2). Any `NSError` from any screen is
+/// returned as `SetFailed` carrying that screen's domain and code: a set that
+/// reached some screens and failed on one is a failure, not a success, because
+/// the caller asked for one image everywhere and must not be told it got it.
 ///
 /// This is the one call behind the backend boundary (docs/development.md section
 /// 7) and the only place the noop and native paths differ.
@@ -360,13 +417,11 @@ pub fn set(path: &str) -> Result<(), SetError> {
     for (index, screen) in screens.iter().enumerate() {
         let screen = *screen;
         let name = screen_name(screen, index);
-        if !msg_set_desktop_image(workspace, url, screen) {
+        let mut error: Id = ptr::null_mut();
+        if !msg_set_desktop_image(workspace, url, screen, &mut error) {
             return Err(SetError::new(
                 ErrorCode::SetFailed,
-                format!(
-                    "{} failed on screen {name} for {path}: the platform answered NO",
-                    SELECTOR_SET.to_string_lossy()
-                ),
+                describe(&ns_failure(error), &name, path),
             ));
         }
     }
