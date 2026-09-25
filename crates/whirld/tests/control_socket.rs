@@ -233,7 +233,7 @@ fn status_answers_the_stable_key_set() {
         "interval_s: 1800",
         "last_error: -",
         "history_entries: 50",
-        "lock_mode: none",
+        "lock_mode: flock",
     ] {
         assert!(lines.iter().any(|line| line == key), "{key} in {lines:?}");
     }

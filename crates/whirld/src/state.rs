@@ -13,6 +13,7 @@
 //! root this daemon created.
 
 use crate::events::{Bus, Event, unix_seconds};
+use crate::lock::DaemonLock;
 use crate::plan::Effective;
 use crate::statefile::{Kind as File, Store};
 use crate::worker::{Outcome, Verb, WorkerError};
@@ -221,6 +222,12 @@ pub struct Daemon {
     pub worker: crate::worker::Worker,
     /// The state directory, and the only thing that writes to it (7.1).
     pub store: Store,
+    /// `state/locks/daemon.lock`, taken by 1.5 step 1 before this daemon was
+    /// built and held until the process ends. It is a field and not a local of
+    /// `run` because `status` has to report the primitive that actually holds it
+    /// (2.10 `lock_mode`), and reading that from the lock is what stops the key
+    /// from being a constant.
+    lock: DaemonLock,
     /// Every subscribed connection, and the quiet period a heartbeat is
     /// measured from (2.9).
     pub bus: Bus,
@@ -230,7 +237,10 @@ pub struct Daemon {
 
 impl Daemon {
     /// Build the daemon and load the state files of 6.4.
-    pub fn load(effective: Effective, worker: crate::worker::Worker) -> Daemon {
+    ///
+    /// `lock` is the already-held `daemon.lock`: 1.5 step 1 runs before the state
+    /// directory is even opened, so the caller takes it.
+    pub fn load(effective: Effective, worker: crate::worker::Worker, lock: DaemonLock) -> Daemon {
         let store = Store::new(&effective.state_dir);
         let bound = effective.config.state.history_entries;
         let mut state = State::new(bound);
@@ -254,6 +264,7 @@ impl Daemon {
             effective,
             worker,
             store,
+            lock,
             bus: Bus::new(),
             state: Mutex::new(state),
             started: Instant::now(),
@@ -369,9 +380,13 @@ impl Daemon {
             )
             .kv("cache_writable", u8::from(state.cache_writable))
             .kv("sweep_deferred", u8::from(state.sweep_deferred))
-            // The rotation lock of 1.8 is an in-process mutex, not a file lock,
-            // so `none` is the value 8.7's vocabulary gives it.
-            .kv("lock_mode", "none")
+            // The primitive actually holding `state/locks/daemon.lock`, read from
+            // the lock this daemon took at startup (2.10's `lock_mode` row: two
+            // values, no third, and the value names the primitive and not the
+            // fact that locking happens). `none` was here before the
+            // reconciliation: 1.8's in-process mutex is a different lock, and no
+            // rule in either document gives it a `lock_mode`.
+            .kv("lock_mode", self.lock.mode().as_str())
             .kv("state_dir", self.effective.state_dir.display())
             .kv("state_corrupt", dash(state.state_corrupt.clone()))
             .kv("state_quarantined", dash(state.state_quarantined.clone()))
@@ -1094,6 +1109,9 @@ pub fn favorite_state(path: Option<&str>) -> FavoriteState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::{Attempt, Mode};
+    use std::path::PathBuf;
+    use whirl_core::config::Backend;
 
     /// 2.10's `next_in_s` row, one assertion per state it names, with `now`
     /// passed in: a live deadline counts down, a deadline already passed is `0`
@@ -1159,5 +1177,62 @@ mod tests {
             Some(1_800),
             "the flag does not move the deadline"
         );
+    }
+
+    /// The `lock_mode` value of a `status` response (2.10).
+    fn lock_mode(daemon: &Daemon) -> String {
+        daemon
+            .status()
+            .lines()
+            .iter()
+            .find_map(|line| line.strip_prefix("lock_mode: ").map(str::to_string))
+            .expect("lock_mode is in the 2.10 key set")
+    }
+
+    /// A daemon over a directory of its own, holding a lock whose OS answer is
+    /// supplied by `attempt`: the two values of 2.10's row are otherwise not both
+    /// reachable on a machine whose filesystems all support `flock`.
+    fn daemon(dir: &Path, attempt: Attempt) -> Daemon {
+        let state_dir = dir.join("state");
+        let effective = Effective {
+            config_path: dir.join("config.json"),
+            socket_path: dir.join("whirl.sock"),
+            state_dir: state_dir.clone(),
+            cache_dir: dir.join("cache"),
+            backend: Backend::Noop,
+            config: Config::default(),
+        };
+        let worker = crate::worker::Worker::new(
+            PathBuf::from("whirl-worker"),
+            effective.config_path.clone(),
+            Backend::Noop,
+        );
+        let lock = crate::lock::take_as(&state_dir, attempt).expect("the lock is taken");
+        Daemon::load(effective, worker, lock)
+    }
+
+    /// 2.10's `lock_mode` row: "the primitive actually holding
+    /// `state/locks/daemon.lock` ... There is no third value". The value changes
+    /// with the primitive and comes from the lock object, so `none` (the literal
+    /// this key used to be) and any other constant fails one of these two
+    /// assertions whichever constant it is.
+    #[test]
+    fn status_reports_the_primitive_that_holds_the_daemon_lock() {
+        let root = std::env::temp_dir().join(format!("whirl-lock-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Two directories: 8.7's fallback file is exclusive, so one directory
+        // cannot hold a `daemon.lock` of each mode.
+        let flock = daemon(&root.join("flock"), Attempt::Acquired);
+        assert_eq!(lock_mode(&flock), Mode::Flock.as_str());
+        assert_eq!(lock_mode(&flock), "flock");
+
+        let exclusive = daemon(&root.join("excl"), Attempt::Unsupported);
+        assert_eq!(lock_mode(&exclusive), Mode::ExclFile.as_str());
+        assert_eq!(lock_mode(&exclusive), "excl_file");
+
+        drop(flock);
+        drop(exclusive);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
