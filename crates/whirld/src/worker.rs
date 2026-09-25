@@ -281,3 +281,352 @@ fn terminate(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// A temp directory with scripts in it. The tests below are the only place
+    /// where a "worker" is anything other than `whirl-worker`: a deliberately
+    /// slow or misbehaving program is the only way to reach the deadline and the
+    /// `SIGTERM`/`SIGKILL` escalation without waiting five minutes for the real
+    /// one, and `Worker::new` takes the program path, so a script is a worker as
+    /// far as this module is concerned.
+    struct Scripts {
+        dir: PathBuf,
+    }
+
+    impl Scripts {
+        fn new(name: &str) -> Scripts {
+            let dir = std::env::temp_dir()
+                .join(format!("whirl-worker-test-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("a temp directory");
+            Scripts { dir }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+
+        /// Write an executable `/bin/sh` script: the same interpreter every Unix
+        /// this build targets has, and `env_clear()` does not touch argv.
+        fn script(&self, name: &str, body: &str) -> PathBuf {
+            let path = self.path(name);
+            fs::write(&path, body).expect("a script");
+            let mut permissions = fs::metadata(&path).expect("the script").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("an executable script");
+            path
+        }
+
+        fn text(&self, name: &str) -> String {
+            fs::read_to_string(self.path(name)).unwrap_or_else(|error| {
+                panic!("{} was not written: {error}", self.path(name).display())
+            })
+        }
+
+        fn exists(&self, name: &str) -> bool {
+            self.path(name).exists()
+        }
+    }
+
+    impl Drop for Scripts {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The config path is never read: every script here ignores its argv, which
+    /// is itself part of what is being shown (1.6's argv is fixed and the
+    /// program is told, not asked).
+    fn worker(program: PathBuf) -> Worker {
+        Worker::new(
+            program,
+            PathBuf::from("/nonexistent/whirl/config.json"),
+            Backend::Noop,
+        )
+    }
+
+    /// The deadline for the tests that are not about the deadline. `cargo test`
+    /// runs these in parallel and each one spawns a process, so a one-second
+    /// deadline here would be testing the machine's load rather than the worker.
+    fn generous() -> Duration {
+        Duration::from_secs(30)
+    }
+
+    /// The deadline of the test that *is* about the deadline.
+    const ONE_SECOND: Duration = Duration::from_secs(1);
+
+    /// Two files are the same file: the device and inode comparison behind
+    /// `[ a -ef b ]`, used to ask whether this process's own stdin is the null
+    /// device.
+    fn same_file(left: &str, right: &str) -> bool {
+        match (fs::metadata(left), fs::metadata(right)) {
+            (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+            _ => false,
+        }
+    }
+
+    /// 1.6's environment rule, as a set equality rather than a membership test:
+    /// the child sees the two names that are always set, the two the daemon
+    /// adds, the API key when the daemon has one, the nine Linux session
+    /// variables on Linux when they are set, and nothing else. The shell sets
+    /// `PWD`, `SHLVL` and `_` for itself, which is why they are named here
+    /// instead of silently tolerated.
+    ///
+    /// An implementation that forgot `env_clear()` fails on the extra names: the
+    /// test process's own environment has at least `CARGO_*` in it under
+    /// `cargo test`, and the assertion prints both sets when it fails.
+    #[test]
+    fn the_environment_is_exactly_the_names_1_6_lists() {
+        let scripts = Scripts::new("env");
+        let dump = scripts.path("env.txt");
+        let program = scripts.script(
+            "dump.sh",
+            &format!("#!/bin/sh\nenv > '{}'\n", dump.display()),
+        );
+
+        let outcome = worker(program).run(Verb::Rotate, None, 1, generous());
+        assert!(
+            matches!(outcome, Err(WorkerError::Failed { .. })),
+            "the script prints no set: line: {outcome:?}"
+        );
+
+        let mut names: Vec<String> = scripts
+            .text("env.txt")
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_string()))
+            .collect();
+        names.sort();
+
+        let mut expected: Vec<String> = ALWAYS.iter().map(|name| name.to_string()).collect();
+        expected.push("WHIRL_CONFIG".to_string());
+        expected.push("WHIRL_BACKEND".to_string());
+        if std::env::var_os("WHIRL_WALLHAVEN_API_KEY").is_some() {
+            expected.push("WHIRL_WALLHAVEN_API_KEY".to_string());
+        }
+        if cfg!(target_os = "linux") {
+            for name in LINUX_ONLY {
+                if std::env::var_os(name).is_some() {
+                    expected.push(name.to_string());
+                }
+            }
+        }
+        expected.sort();
+
+        // The shell sets its own `PWD`, `SHLVL` and `_` for the process it
+        // execs, and those are the *only* names the daemon did not put there
+        // that are tolerated. They are named in one place and checked for
+        // membership, so a variable smuggled in under a different name fails.
+        const SHELL_OWNED: [&str; 3] = ["PWD", "SHLVL", "_"];
+        let outside: Vec<&String> = names
+            .iter()
+            .filter(|name| !expected.contains(name))
+            .collect();
+        let unexpected: Vec<&&String> = outside
+            .iter()
+            .filter(|name| !SHELL_OWNED.contains(&name.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "the worker saw names 1.6 does not list: {unexpected:?} (whole environment: {})",
+            names.join(" ")
+        );
+        for name in &expected {
+            assert!(
+                names.contains(name),
+                "{name} is missing from the worker's environment ({})",
+                names.join(" ")
+            );
+        }
+    }
+
+    /// `SIGTERM` at the deadline, the whole five-second grace, then `SIGKILL`
+    /// (1.7.1). The script records the `SIGTERM` it was sent and keeps running
+    /// through it, so the marker proves the polite signal arrived and the exit
+    /// proves the kill was needed and worked.
+    ///
+    /// A daemon that skipped `SIGTERM` fails the marker assertion; one that
+    /// killed immediately fails `elapsed >= TERM_GRACE`; one that returned
+    /// without killing leaves the process alive and fails the `kill -0` probe.
+    #[test]
+    fn a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace() {
+        let scripts = Scripts::new("escalate");
+        let marker = scripts.path("term.txt");
+        let pid = scripts.path("pid.txt");
+        let program = scripts.script(
+            "slow.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\ntrap 'echo term >> \"{}\"' TERM\nwhile :; do sleep 0.05; done\n",
+                pid.display(),
+                marker.display()
+            ),
+        );
+
+        let started = Instant::now();
+        let outcome = worker(program).run(Verb::Rotate, None, 7, ONE_SECOND);
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, Err(WorkerError::Timeout)),
+            "the deadline expired, whatever the worker did on the way out: {outcome:?}"
+        );
+        assert!(
+            elapsed >= TERM_GRACE,
+            "the grace period was honoured: {elapsed:?}"
+        );
+        assert!(
+            scripts.exists("term.txt"),
+            "the worker was sent SIGTERM before being killed"
+        );
+        assert_eq!(
+            scripts.text("term.txt").trim(),
+            "term",
+            "the trap ran once, on the one SIGTERM"
+        );
+
+        let pid: u32 = scripts.text("pid.txt").trim().parse().expect("a pid");
+        let probe = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill -0");
+        assert!(
+            !probe.success(),
+            "the worker was killed and reaped, so {pid} is gone"
+        );
+    }
+
+    /// A worker that dies on its own reports the code it named on stderr (2.7),
+    /// and the daemon does not wait for the deadline to notice.
+    #[test]
+    fn a_worker_that_names_a_code_reports_it() {
+        let scripts = Scripts::new("named-code");
+        let program = scripts.script(
+            "fail.sh",
+            "#!/bin/sh\necho 'stage=set code=set_failed message=the setter refused' >&2\nexit 3\n",
+        );
+
+        let started = Instant::now();
+        let outcome = worker(program).run(Verb::Rotate, None, 1, Duration::from_secs(300));
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Err(WorkerError::Failed { code, message }) => {
+                assert_eq!(code, ErrorCode::SetFailed);
+                assert_eq!(
+                    message,
+                    "stage=set code=set_failed message=the setter refused"
+                );
+            }
+            other => panic!("the worker's own code wins over worker_failed: {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the exit was seen and not waited out: {elapsed:?}"
+        );
+    }
+
+    /// A worker that dies silently is `worker_failed`, with whatever it said as
+    /// the message: 2.7's code for an exit the daemon cannot explain.
+    #[test]
+    fn a_silent_death_is_worker_failed() {
+        let scripts = Scripts::new("silent-death");
+        let program = scripts.script(
+            "crash.sh",
+            "#!/bin/sh\necho 'whirl-worker: the download stage panicked' >&2\nexit 1\n",
+        );
+
+        match worker(program).run(Verb::Rotate, None, 1, generous()) {
+            Err(WorkerError::Failed { code, message }) => {
+                assert_eq!(code, ErrorCode::WorkerFailed);
+                assert_eq!(message, "whirl-worker: the download stage panicked");
+            }
+            other => panic!("a non-zero exit with no code: {other:?}"),
+        }
+    }
+
+    /// A worker that exits 0 having printed no `set:` line is `worker_failed`
+    /// too, and the message names what it did print, because that line is all
+    /// the evidence there is (1.6's stdout shape).
+    #[test]
+    fn a_zero_exit_without_a_set_line_is_worker_failed() {
+        let scripts = Scripts::new("no-set-line");
+        let program = scripts.script("quiet.sh", "#!/bin/sh\necho 'downloaded: ok'\n");
+
+        match worker(program).run(Verb::Rotate, None, 1, generous()) {
+            Err(WorkerError::Failed { code, message }) => {
+                assert_eq!(code, ErrorCode::WorkerFailed);
+                assert!(
+                    message.contains("downloaded: ok"),
+                    "the offending line is in the message: {message}"
+                );
+            }
+            other => panic!("exit 0 without a set: line is a failure: {other:?}"),
+        }
+    }
+
+    /// The happy path of the stdout parse: the *last* non-empty line is the
+    /// result, and a trailing carriage return is trimmed off it. Both are
+    /// asserted on the parsed record, so a parse that took the first line or
+    /// left the `\r` in the path fails on a field.
+    ///
+    /// The line here is the worker's own (`set: <digest> <origin_key> <abs
+    /// path>`, 1.6's three fields), which is *not* the four-field `set:` line of
+    /// 2.6: that one carries the `via` and is written by the daemon to a client.
+    #[test]
+    fn the_last_non_empty_line_is_the_result() {
+        let scripts = Scripts::new("last-line");
+        let digest = "a".repeat(64);
+        let program = scripts.script(
+            "set.sh",
+            &format!(
+                "#!/bin/sh\nprintf 'downloaded: {digest} /tmp/candidate.jpg\\n'\nprintf 'set: {digest} pictures:0123456789abcdef /tmp/candidate.jpg\\r'\n"
+            ),
+        );
+
+        match worker(program).run(Verb::Rotate, None, 7, generous()) {
+            Ok(Outcome::Set(record)) => {
+                assert_eq!(record.digest, digest);
+                assert_eq!(record.origin_key, "pictures:0123456789abcdef");
+                assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"));
+                assert_eq!(record.via, Via::Source);
+            }
+            other => panic!("the last line is a set: line: {other:?}"),
+        }
+    }
+
+    /// 1.6's stdin rule: the worker's stdin is the null device, not whatever the
+    /// daemon has. The check is `[ /dev/fd/0 -ef /dev/null ]`, and the test says
+    /// so out loud when its own stdin is *also* the null device, because then an
+    /// inherited stdin would look the same and the assertion would prove
+    /// nothing.
+    #[test]
+    fn the_worker_reads_the_null_device_not_the_daemons_stdin() {
+        let scripts = Scripts::new("stdin");
+        let digest = "b".repeat(64);
+        let program = scripts.script(
+            "stdin.sh",
+            &format!(
+                "#!/bin/sh\nif [ /dev/fd/0 -ef /dev/null ]; then\n  printf 'set: {digest} pictures:fedcba9876543210 /tmp/candidate.jpg\\n'\nelse\n  echo 'stage=stdin code=bad_args message=stdin was inherited' >&2\n  exit 3\nfi\n"
+            ),
+        );
+
+        if same_file("/dev/fd/0", "/dev/null") {
+            eprintln!(
+                "note: this harness's own stdin is the null device, so an inherited stdin would be indistinguishable; the assertion below is vacuous here"
+            );
+        }
+        match worker(program).run(Verb::Rotate, None, 1, generous()) {
+            Ok(Outcome::Set(record)) => {
+                assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"))
+            }
+            other => panic!("the worker's stdin must be the null device: {other:?}"),
+        }
+    }
+}
