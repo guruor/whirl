@@ -598,7 +598,9 @@ terminator  := "OK" | "ERR " code " " message
 - **Two closed vocabularies**, so a client never has to interpret free text:
   - `via` is `source` (the pipeline chose the candidate), `manual` (a `set path`/`set id`
     request), `prev` (a `prev` request), `startup` (the startup rotation, including a manual change
-    the daemon detected), or `recovered` (1.7.3).
+    the daemon detected), or `recovered` (1.7.3). This is the only list: a history entry written to
+    `history.json` records the same five values
+    (`docs/spec/state-and-cache.md` 6.2), so the file and the `entry:` record cannot disagree.
   - `kind` is `local`, `wallhaven` or `external`, and it names the origin, not the mechanism.
     For an `external` entry `origin_key` is `external:<sha256 of the absolute path>` and `digest`
     is `-` when the file could not be hashed, because an image the user set by hand has no source

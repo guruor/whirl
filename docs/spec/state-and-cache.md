@@ -704,16 +704,24 @@ report can `cat` them, and the reviewer can check them, without the daemon.
       "cached_path": "/Users/.../sha256/ab/12/ab12cd34....jpg",
       "mode": "copy",
       "set_at": "2026-09-25T07:41:12Z",
-      "via": "rotate"
+      "via": "source"
     }
   ]
 }
 ```
 
 - `history.json`: newest first, exactly `state.history_entries` entries (default
-  50, matching features.md F5's ring), the oldest dropped on write. `via` is one
-  of `rotate`, `prev`, `set`, `startup`, `external` (an image the user set by
-  hand, features.md 1.5).
+  50, matching features.md F5's ring), the oldest dropped on write. `via` is
+  `docs/architecture.md` 2.6's closed vocabulary, the same five values the `set:`
+  record and `status.last_via` carry: `source`, `manual`, `prev`, `startup`,
+  `recovered`. An image the user set by hand is `kind: external` with
+  `via: startup` (features.md 1.5, architecture.md 1.7.3), not a `via` of its own:
+  `kind` names the origin and `via` names the route, and one closed list on both
+  the wire and the disk is what keeps a state file and a `history` response from
+  disagreeing. `decision:` an earlier draft of this section named `rotate`, `set`
+  and `external` instead. `rotate` and `set` are `source` and `manual`; the
+  `external` spelling is `startup`. A reader accepts all three from a file an
+  earlier build wrote, and this build writes none of them.
 - `favorites.json`: the same entry shape plus `"added_at"`, unordered, one
   `schema` and one `seq`. Pinned files are found by the digest, which is also the
   cache filename, which is why "unfavorite" is a single-set operation with no
