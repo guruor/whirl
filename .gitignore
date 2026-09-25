@@ -6,7 +6,9 @@ Cargo.lock.bak
 # Go (prototype only)
 *.test
 prototype/**/dist/
-prototype/**/wh-rotate
+prototype/wh-rotate/wh-rotate
+prototype/whd/whd
+prototype/whd/whctl
 prototype/**/*.log
 
 # local state and caches produced by any prototype run

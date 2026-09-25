@@ -1,0 +1,13 @@
+{
+  "sources": [
+    { "kind": "wallhaven", "query": "sorting=random&categories=111&purity=100&ratios=16x9", "weight": 3 },
+    { "kind": "wikimedia", "weight": 3 },
+    { "kind": "local", "dir": "/Users/govind.rajpurohit/.hermes/cache/scratch/wh-rotate/wh-cache", "weight": 1 }
+  ],
+  "min_width": 1600,
+  "min_height": 900,
+  "cache_dir": "/Users/govind.rajpurohit/.hermes/cache/scratch/wh-rotate/wh-cache",
+  "keep": 6,
+  "all_spaces": true,
+  "log_file": "/Users/govind.rajpurohit/.hermes/cache/scratch/wh-rotate/wh-rotate.log"
+}
