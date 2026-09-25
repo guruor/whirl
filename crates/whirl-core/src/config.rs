@@ -1650,17 +1650,24 @@ pub mod paths {
 /// control character in a string, a duplicate key, trailing content after the
 /// document) because those are the mistakes that would otherwise be read as
 /// something else, and lenient about nothing else.
-mod json {
+///
+/// `pub(crate)` rather than private: the state files of
+/// docs/spec/state-and-cache.md section 6 are JSON too, and one reader in the
+/// workspace is the rule (docs/development.md section 1). The error type is
+/// [`ConfigError`] because that is what this reader was written against; a
+/// caller reading a state file names the file in its own message, and the
+/// `line N` this reader attaches is the part worth keeping.
+pub(crate) mod json {
     use super::ConfigError;
 
     #[derive(Debug, Clone, PartialEq)]
-    pub(super) struct Node {
-        pub(super) value: Value,
-        pub(super) line: usize,
+    pub(crate) struct Node {
+        pub(crate) value: Value,
+        pub(crate) line: usize,
     }
 
     #[derive(Debug, Clone, PartialEq)]
-    pub(super) enum Value {
+    pub(crate) enum Value {
         Null,
         Bool(bool),
         Num(f64),
@@ -1670,7 +1677,7 @@ mod json {
     }
 
     impl Node {
-        pub(super) fn kind_name(&self) -> &'static str {
+        pub(crate) fn kind_name(&self) -> &'static str {
             match self.value {
                 Value::Null => "null",
                 Value::Bool(_) => "boolean",
@@ -1681,39 +1688,39 @@ mod json {
             }
         }
 
-        pub(super) fn is_null(&self) -> bool {
+        pub(crate) fn is_null(&self) -> bool {
             matches!(self.value, Value::Null)
         }
 
-        pub(super) fn as_str(&self) -> Option<&str> {
+        pub(crate) fn as_str(&self) -> Option<&str> {
             match &self.value {
                 Value::Str(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(super) fn as_bool(&self) -> Option<bool> {
+        pub(crate) fn as_bool(&self) -> Option<bool> {
             match self.value {
                 Value::Bool(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(super) fn as_num(&self) -> Option<f64> {
+        pub(crate) fn as_num(&self) -> Option<f64> {
             match self.value {
                 Value::Num(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(super) fn as_array(&self) -> Option<&[Node]> {
+        pub(crate) fn as_array(&self) -> Option<&[Node]> {
             match &self.value {
                 Value::Arr(elements) => Some(elements),
                 _ => None,
             }
         }
 
-        pub(super) fn as_object(&self) -> Option<&[(String, Node)]> {
+        pub(crate) fn as_object(&self) -> Option<&[(String, Node)]> {
             match &self.value {
                 Value::Obj(entries) => Some(entries),
                 _ => None,
@@ -1722,7 +1729,7 @@ mod json {
     }
 
     /// Parse one JSON document.
-    pub(super) fn parse(text: &str) -> Result<Node, ConfigError> {
+    pub(crate) fn parse(text: &str) -> Result<Node, ConfigError> {
         let mut parser = Parser {
             bytes: text.as_bytes(),
             pos: 0,
@@ -1734,7 +1741,7 @@ mod json {
         if parser.pos < parser.bytes.len() {
             return Err(ConfigError::syntax(
                 parser.line,
-                "trailing content after the config object",
+                "trailing content after the document",
             ));
         }
         Ok(node)

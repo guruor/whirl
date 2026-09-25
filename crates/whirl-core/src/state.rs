@@ -4,9 +4,10 @@
 //! docs/architecture.md 2.10 (what `status` reports) and
 //! docs/spec/state-and-cache.md 2.1 and 6 (the index and the state files).
 //!
-//! This scaffold holds the records and the ring in memory. Persisting them is
-//! another card: nothing in this module opens a file, and the daemon ships no
-//! state writer yet.
+//! The records, the ring, and the three file schemas of 6.1 and 6.2 with the
+//! `parse`/`encode` pair for each. Nothing in this module opens a file: the
+//! shapes live here, beside the protocol they encode, and the daemon owns the
+//! I/O (`crates/whirld/src/statefile.rs`, 6.3's temp-file-`fsync`-`rename`).
 
 use crate::protocol::{Kind, Via};
 use std::collections::VecDeque;
@@ -221,9 +222,784 @@ pub struct CacheIndexEntry {
     pub pinned: bool,
 }
 
+// ---------------------------------------------------------------------------
+// The state files (docs/spec/state-and-cache.md section 6)
+// ---------------------------------------------------------------------------
+
+/// The `schema` integer this build writes and understands. A file whose schema
+/// is greater than this one is a downgrade rather than corruption, and is left
+/// exactly as it is (6.4 step 4).
+pub const SCHEMA: u64 = 1;
+
+/// The three file names, so the daemon and the quarantine message of 6.4 spell
+/// them the same way (`state_corrupt: history.json`).
+pub const CURRENT_FILE: &str = "current.json";
+pub const HISTORY_FILE: &str = "history.json";
+pub const FAVORITES_FILE: &str = "favorites.json";
+
+/// A state file that could not be understood. The caller's answer is the
+/// quarantine of 6.4, so this carries a message for the log and nothing else:
+/// the decision needs no structure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateFileError {
+    pub message: String,
+}
+
+impl StateFileError {
+    fn new(message: impl Into<String>) -> StateFileError {
+        StateFileError {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for StateFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// What reading a state file found. The third case is not an error and not a
+/// value: it is a file from a newer whirl, which this build must not touch
+/// (6.4 step 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateFile<T> {
+    Read(T),
+    SchemaNewer { found: u64 },
+}
+
+impl<T> StateFile<T> {
+    /// The value, when this build understood the file.
+    pub fn value(self) -> Option<T> {
+        match self {
+            StateFile::Read(value) => Some(value),
+            StateFile::SchemaNewer { .. } => None,
+        }
+    }
+}
+
+/// `state/current.json` (docs/spec/state-and-cache.md 6.1): the live scalars and
+/// the display anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CurrentFile {
+    pub seq: u64,
+    pub written_at: String,
+    pub written_by: Option<String>,
+    pub paused: bool,
+    pub rotation_count: u64,
+    /// The persisted deadline, wall clock, RFC 3339 UTC (5.5 rule 1).
+    pub next_at: Option<String>,
+    pub last_error: Option<String>,
+    pub anchor: Option<Anchor>,
+    pub cache: Option<CacheFacts>,
+}
+
+/// `anchor` in `current.json`: what whirl believes the platform is displaying.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Anchor {
+    pub digest: String,
+    /// `None` when there are no bytes of whirl's own (a `reference`-mode set).
+    pub cached_path: Option<String>,
+    pub set_at: Option<String>,
+    pub display_mode: Option<String>,
+}
+
+/// The `cache` block of `current.json`, which is also what `status` reports.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CacheFacts {
+    pub root_id: Option<String>,
+    pub files: u64,
+    pub bytes: u64,
+    pub over_cap_bytes: u64,
+    pub over_cap_files: u64,
+}
+
+/// `state/history.json` (docs/spec/state-and-cache.md 6.2): the ring, newest
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistoryFile {
+    pub seq: u64,
+    pub written_at: String,
+    pub entries: Vec<HistoryEntry>,
+}
+
+/// `state/favorites.json` (docs/spec/state-and-cache.md 6.2): the pin records.
+/// The authoritative pin list is this file, and the cache index carries a copy
+/// (2.1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FavoritesFile {
+    pub seq: u64,
+    pub written_at: String,
+    pub entries: Vec<Favorite>,
+}
+
+impl CurrentFile {
+    pub fn parse(text: &str) -> Result<StateFile<CurrentFile>, StateFileError> {
+        let root = document(text, CURRENT_FILE)?;
+        let schema = schema_of(&root)?;
+        if schema > SCHEMA {
+            return Ok(StateFile::SchemaNewer { found: schema });
+        }
+        let mut file = CurrentFile {
+            seq: opt_int(&root, "seq")?.unwrap_or(0),
+            written_at: opt_str(&root, "written_at")?.unwrap_or_default(),
+            written_by: opt_str(&root, "written_by")?,
+            paused: opt_bool(&root, "paused")?.unwrap_or(false),
+            rotation_count: opt_int(&root, "rotation_count")?.unwrap_or(0),
+            next_at: opt_str(&root, "next_at")?,
+            last_error: opt_str(&root, "last_error")?,
+            anchor: None,
+            cache: None,
+        };
+        if let Some(anchor) = optional(&root, "anchor")? {
+            file.anchor = Some(Anchor {
+                digest: req_str(&anchor, "digest")?,
+                cached_path: opt_str(&anchor, "cached_path")?,
+                set_at: opt_str(&anchor, "set_at")?,
+                display_mode: opt_str(&anchor, "display_mode")?,
+            });
+        }
+        if let Some(cache) = optional(&root, "cache")? {
+            file.cache = Some(CacheFacts {
+                root_id: opt_str(&cache, "root_id")?,
+                files: opt_int(&cache, "files")?.unwrap_or(0),
+                bytes: opt_int(&cache, "bytes")?.unwrap_or(0),
+                over_cap_bytes: opt_int(&cache, "over_cap_bytes")?.unwrap_or(0),
+                over_cap_files: opt_int(&cache, "over_cap_files")?.unwrap_or(0),
+            });
+        }
+        Ok(StateFile::Read(file))
+    }
+
+    pub fn encode(&self) -> String {
+        let mut text = String::new();
+        text.push_str("{\n");
+        text.push_str(&format!("  \"schema\": {SCHEMA},\n"));
+        text.push_str(&format!("  \"seq\": {},\n", self.seq));
+        text.push_str(&format!(
+            "  \"written_at\": {},\n",
+            string(&self.written_at)
+        ));
+        text.push_str(&format!(
+            "  \"written_by\": {},\n",
+            optional_string(self.written_by.as_deref())
+        ));
+        text.push_str(&format!(
+            "  \"paused\": {},\n",
+            if self.paused { "true" } else { "false" }
+        ));
+        text.push_str(&format!("  \"rotation_count\": {},\n", self.rotation_count));
+        text.push_str(&format!(
+            "  \"next_at\": {},\n",
+            optional_string(self.next_at.as_deref())
+        ));
+        text.push_str(&format!(
+            "  \"last_error\": {},\n",
+            optional_string(self.last_error.as_deref())
+        ));
+        match &self.anchor {
+            None => text.push_str("  \"anchor\": null,\n"),
+            Some(anchor) => {
+                text.push_str("  \"anchor\": {\n");
+                text.push_str(&format!("    \"digest\": {},\n", string(&anchor.digest)));
+                text.push_str(&format!(
+                    "    \"cached_path\": {},\n",
+                    optional_string(anchor.cached_path.as_deref())
+                ));
+                text.push_str(&format!(
+                    "    \"set_at\": {},\n",
+                    optional_string(anchor.set_at.as_deref())
+                ));
+                text.push_str(&format!(
+                    "    \"display_mode\": {},\n",
+                    optional_string(anchor.display_mode.as_deref())
+                ));
+                text.push_str("    \"displays\": null\n");
+                text.push_str("  },\n");
+            }
+        }
+        match &self.cache {
+            None => text.push_str("  \"cache\": null\n"),
+            Some(cache) => {
+                text.push_str("  \"cache\": {\n");
+                text.push_str(&format!(
+                    "    \"root_id\": {},\n",
+                    optional_string(cache.root_id.as_deref())
+                ));
+                text.push_str(&format!("    \"files\": {},\n", cache.files));
+                text.push_str(&format!("    \"bytes\": {},\n", cache.bytes));
+                text.push_str(&format!(
+                    "    \"over_cap_bytes\": {},\n",
+                    cache.over_cap_bytes
+                ));
+                text.push_str(&format!(
+                    "    \"over_cap_files\": {}\n",
+                    cache.over_cap_files
+                ));
+                text.push_str("  }\n");
+            }
+        }
+        text.push_str("}\n");
+        text
+    }
+}
+
+impl HistoryFile {
+    pub fn parse(text: &str) -> Result<StateFile<HistoryFile>, StateFileError> {
+        let root = document(text, HISTORY_FILE)?;
+        let schema = schema_of(&root)?;
+        if schema > SCHEMA {
+            return Ok(StateFile::SchemaNewer { found: schema });
+        }
+        let mut file = HistoryFile {
+            seq: opt_int(&root, "seq")?.unwrap_or(0),
+            written_at: opt_str(&root, "written_at")?.unwrap_or_default(),
+            entries: Vec::new(),
+        };
+        for (index, node) in entries_of(&root)?.iter().enumerate() {
+            file.entries.push(history_entry(node, index)?);
+        }
+        Ok(StateFile::Read(file))
+    }
+
+    pub fn encode(&self) -> String {
+        let mut text = format!(
+            "{{\n  \"schema\": {SCHEMA},\n  \"seq\": {},\n  \"written_at\": {},\n  \"entries\": [",
+            self.seq,
+            string(&self.written_at)
+        );
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!(
+                concat!(
+                    "\n    {{\n",
+                    "      \"kind\": {},\n",
+                    "      \"origin_key\": {},\n",
+                    "      \"digest\": {},\n",
+                    "      \"cached_path\": {},\n",
+                    "      \"set_at\": {},\n",
+                    "      \"via\": {}\n",
+                    "    }}"
+                ),
+                string(entry.kind.as_str()),
+                string(&entry.origin_key),
+                optional_string(entry.digest.as_deref()),
+                optional_string(entry.path.as_deref()),
+                string(&entry.set_at),
+                string(entry.via.as_str())
+            ));
+        }
+        text.push_str(if self.entries.is_empty() {
+            "]\n}\n"
+        } else {
+            "\n  ]\n}\n"
+        });
+        text
+    }
+}
+
+impl FavoritesFile {
+    pub fn parse(text: &str) -> Result<StateFile<FavoritesFile>, StateFileError> {
+        let root = document(text, FAVORITES_FILE)?;
+        let schema = schema_of(&root)?;
+        if schema > SCHEMA {
+            return Ok(StateFile::SchemaNewer { found: schema });
+        }
+        let mut file = FavoritesFile {
+            seq: opt_int(&root, "seq")?.unwrap_or(0),
+            written_at: opt_str(&root, "written_at")?.unwrap_or_default(),
+            entries: Vec::new(),
+        };
+        for (index, node) in entries_of(&root)?.iter().enumerate() {
+            let fields = want_object(node, &format!("entries[{index}]"))?;
+            let path = opt_str_in(fields, "cached_path")?;
+            // `state` is recomputed rather than believed: whether the bytes are
+            // there is a fact about the disk right now (2.6, features.md 1.2),
+            // and a value written before the file was deleted would be a lie.
+            file.entries.push(Favorite {
+                added_at: req_str_in(fields, "added_at")?,
+                kind: kind_of(&req_str_in(fields, "kind")?, index)?,
+                origin_key: req_str_in(fields, "origin_key")?,
+                digest: opt_str_in(fields, "digest")?,
+                state: crate::state::favorite_state_of(path.as_deref()),
+                path,
+            });
+        }
+        Ok(StateFile::Read(file))
+    }
+
+    pub fn encode(&self) -> String {
+        let mut text = format!(
+            "{{\n  \"schema\": {SCHEMA},\n  \"seq\": {},\n  \"written_at\": {},\n  \"entries\": [",
+            self.seq,
+            string(&self.written_at)
+        );
+        for (index, entry) in self.entries.iter().enumerate() {
+            if index > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!(
+                concat!(
+                    "\n    {{\n",
+                    "      \"kind\": {},\n",
+                    "      \"origin_key\": {},\n",
+                    "      \"digest\": {},\n",
+                    "      \"cached_path\": {},\n",
+                    "      \"added_at\": {}\n",
+                    "    }}"
+                ),
+                string(entry.kind.as_str()),
+                string(&entry.origin_key),
+                optional_string(entry.digest.as_deref()),
+                optional_string(entry.path.as_deref()),
+                string(&entry.added_at)
+            ));
+        }
+        text.push_str(if self.entries.is_empty() {
+            "]\n}\n"
+        } else {
+            "\n  ]\n}\n"
+        });
+        text
+    }
+}
+
+/// Where a favorite's bytes are (docs/architecture.md 2.6, the favorites record).
+/// One implementation, used by the state-file reader and by `favorites`.
+pub fn favorite_state_of(path: Option<&str>) -> FavoriteState {
+    match path {
+        Some(path) if std::path::Path::new(path).exists() => FavoriteState::Present,
+        Some(_) => FavoriteState::Missing,
+        None => FavoriteState::Unrecoverable,
+    }
+}
+
+/// Parse one state document and require an object with an integer `schema`
+/// (6.4 step 1: a file whose schema is not an integer is quarantined).
+fn document(
+    text: &str,
+    name: &str,
+) -> Result<Vec<(String, crate::config::json::Node)>, StateFileError> {
+    if text.trim().is_empty() {
+        return Err(StateFileError::new(format!("{name} is empty")));
+    }
+    let root = crate::config::json::parse(text)
+        .map_err(|error| StateFileError::new(format!("{name}: {error}")))?;
+    match root.as_object() {
+        Some(entries) => Ok(entries.to_vec()),
+        None => Err(StateFileError::new(format!(
+            "{name}: the document is a {}, not an object",
+            root.kind_name()
+        ))),
+    }
+}
+
+fn schema_of(root: &[(String, crate::config::json::Node)]) -> Result<u64, StateFileError> {
+    let node =
+        field(root, "schema").ok_or_else(|| StateFileError::new("schema: the key is missing"))?;
+    match node.as_num() {
+        // A schema is an integer: `1.5` is not one, and neither is a string.
+        Some(value) if value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64 => {
+            Ok(value as u64)
+        }
+        _ => Err(StateFileError::new(
+            "schema: not a non-negative integer (6.4 step 1)",
+        )),
+    }
+}
+
+fn entries_of(
+    root: &[(String, crate::config::json::Node)],
+) -> Result<Vec<crate::config::json::Node>, StateFileError> {
+    let node = field(root, "entries").ok_or_else(|| StateFileError::new("entries: missing"))?;
+    node.as_array()
+        .map(|entries| entries.to_vec())
+        .ok_or_else(|| StateFileError::new("entries: not an array"))
+}
+
+fn field<'a>(
+    entries: &'a [(String, crate::config::json::Node)],
+    key: &str,
+) -> Option<&'a crate::config::json::Node> {
+    entries
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, node)| node)
+}
+
+fn want_object<'a>(
+    node: &'a crate::config::json::Node,
+    what: &str,
+) -> Result<&'a [(String, crate::config::json::Node)], StateFileError> {
+    node.as_object()
+        .ok_or_else(|| StateFileError::new(format!("{what}: not an object")))
+}
+
+/// A field that may be absent or `null`: both mean "unset", which is what the
+/// state files write for a value a fresh daemon has not set.
+fn optional(
+    root: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<Option<Vec<(String, crate::config::json::Node)>>, StateFileError> {
+    match field(root, key) {
+        None => Ok(None),
+        Some(node) if node.is_null() => Ok(None),
+        Some(node) => Ok(Some(want_object(node, key)?.to_vec())),
+    }
+}
+
+fn opt_str_in(
+    entries: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<Option<String>, StateFileError> {
+    match field(entries, key) {
+        None => Ok(None),
+        Some(node) if node.is_null() => Ok(None),
+        Some(node) => node
+            .as_str()
+            .map(|value| Some(value.to_string()))
+            .ok_or_else(|| type_mismatch(key, "a string", node)),
+    }
+}
+
+fn opt_str(
+    root: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<Option<String>, StateFileError> {
+    opt_str_in(root, key)
+}
+
+fn req_str_in(
+    entries: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<String, StateFileError> {
+    opt_str_in(entries, key)?
+        .ok_or_else(|| StateFileError::new(format!("{key}: the key is missing")))
+}
+
+fn req_str(
+    root: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<String, StateFileError> {
+    req_str_in(root, key)
+}
+
+fn opt_int(
+    root: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<Option<u64>, StateFileError> {
+    match field(root, key) {
+        None => Ok(None),
+        Some(node) if node.is_null() => Ok(None),
+        Some(node) => match node.as_num() {
+            Some(value) if value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64 => {
+                Ok(Some(value as u64))
+            }
+            _ => Err(type_mismatch(key, "a non-negative integer", node)),
+        },
+    }
+}
+
+fn opt_bool(
+    root: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<Option<bool>, StateFileError> {
+    match field(root, key) {
+        None => Ok(None),
+        Some(node) if node.is_null() => Ok(None),
+        Some(node) => node
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| type_mismatch(key, "a boolean", node)),
+    }
+}
+
+fn type_mismatch(key: &str, expected: &str, node: &crate::config::json::Node) -> StateFileError {
+    StateFileError::new(format!(
+        "{key}: expected {expected}, found {}",
+        node.kind_name()
+    ))
+}
+
+/// A history entry's `via`, tolerant on read and exact on write.
+///
+/// `docs/spec/state-and-cache.md` 6.2 spells this field `rotate`, `prev`, `set`,
+/// `startup`, `external`; `docs/architecture.md` 2.6 fixes the protocol's closed
+/// vocabulary as `source`, `manual`, `prev`, `startup`, `recovered`. This build
+/// writes the protocol's values, so a state file and a `history` response cannot
+/// disagree, and accepts both when reading, so a file written by a reader of the
+/// other list is not called corrupt. The conflict is raised in the handoff
+/// rather than settled here.
+fn via_of(name: &str, index: usize) -> Result<Via, StateFileError> {
+    match name {
+        "rotate" | "source" => Some(Via::Source),
+        "set" | "manual" => Some(Via::Manual),
+        "prev" => Some(Via::Prev),
+        "startup" | "external" => Some(Via::Startup),
+        "recovered" => Some(Via::Recovered),
+        _ => None,
+    }
+    .ok_or_else(|| StateFileError::new(format!("entries[{index}].via: unknown value {name:?}")))
+}
+
+fn kind_of(name: &str, index: usize) -> Result<Kind, StateFileError> {
+    Kind::parse(name).ok_or_else(|| {
+        StateFileError::new(format!("entries[{index}].kind: unknown value {name:?}"))
+    })
+}
+
+fn history_entry(
+    node: &crate::config::json::Node,
+    index: usize,
+) -> Result<HistoryEntry, StateFileError> {
+    let fields = want_object(node, &format!("entries[{index}]"))?;
+    let kind = kind_of(&req_str_in(fields, "kind")?, index)?;
+    Ok(HistoryEntry {
+        set_at: req_str_in(fields, "set_at")?,
+        via: via_of(&req_str_in(fields, "via")?, index)?,
+        kind,
+        origin_key: req_str_in(fields, "origin_key")?,
+        digest: opt_str_in(fields, "digest")?,
+        path: opt_str_in(fields, "cached_path")?,
+    })
+}
+
+/// A JSON string literal, escaped rather than trusted: a state file carries
+/// paths a user chose, and a path may contain a quote or a control character.
+fn string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if (character as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", character as u32))
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn optional_string(value: Option<&str>) -> String {
+    match value {
+        Some(value) => string(value),
+        None => "null".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_current_file_round_trips_through_its_own_encoding() {
+        let file = CurrentFile {
+            seq: 7,
+            written_at: "2026-09-25T07:41:12Z".to_string(),
+            written_by: Some("whirl/0.1.0 pid=4211 run=3".to_string()),
+            paused: true,
+            rotation_count: 40,
+            next_at: Some("2026-09-25T08:11:12Z".to_string()),
+            last_error: Some("source \"a\" timed out".to_string()),
+            anchor: Some(Anchor {
+                digest: "a".repeat(64),
+                cached_path: Some("/cache/objects/aa/".to_string() + &"a".repeat(64) + ".jpg"),
+                set_at: Some("2026-09-25T07:41:12Z".to_string()),
+                display_mode: Some("copy".to_string()),
+            }),
+            cache: Some(CacheFacts {
+                root_id: Some("f2b7a1c0-0000-4000-8000-000000000000".to_string()),
+                files: 312,
+                bytes: 41_943_040,
+                over_cap_bytes: 0,
+                over_cap_files: 0,
+            }),
+        };
+        let parsed = CurrentFile::parse(&file.encode()).expect("a state file this build wrote");
+        assert_eq!(parsed, StateFile::Read(file));
+    }
+
+    #[test]
+    fn a_history_file_round_trips_with_its_order() {
+        let file = HistoryFile {
+            seq: 9,
+            written_at: "2026-09-25T07:41:12Z".to_string(),
+            entries: vec![
+                HistoryEntry {
+                    set_at: "2026-09-25T07:41:12Z".to_string(),
+                    via: Via::Manual,
+                    kind: Kind::External,
+                    origin_key: "external:b84a".to_string(),
+                    digest: Some("b".repeat(64)),
+                    path: Some("/tmp/one.jpg".to_string()),
+                },
+                HistoryEntry {
+                    set_at: "2026-09-25T07:11:12Z".to_string(),
+                    via: Via::Source,
+                    kind: Kind::Wallhaven,
+                    origin_key: "a:17".to_string(),
+                    digest: None,
+                    path: None,
+                },
+            ],
+        };
+        let parsed = HistoryFile::parse(&file.encode())
+            .expect("this build's own encoding")
+            .value()
+            .expect("a schema this build understands");
+        assert_eq!(parsed, file, "newest first, and nothing reordered");
+    }
+
+    #[test]
+    fn a_favorite_file_needs_no_state_field_and_recomputes_one() {
+        // `state` is a fact about the disk, so a file that claims `present` for
+        // a path that is not there must not be believed (2.6).
+        let text = r#"{
+          "schema": 1,
+          "seq": 2,
+          "written_at": "2026-09-25T07:41:12Z",
+          "entries": [
+            {
+              "kind": "local",
+              "origin_key": "a:17",
+              "digest": null,
+              "cached_path": "/nonexistent/whirl-test-object.jpg",
+              "added_at": "2026-09-01T00:00:00Z",
+              "state": "present"
+            }
+          ]
+        }"#;
+        let parsed = FavoritesFile::parse(text)
+            .expect("a readable file")
+            .value()
+            .expect("schema 1");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].state, FavoriteState::Missing);
+        assert_eq!(parsed.entries[0].added_at, "2026-09-01T00:00:00Z");
+    }
+
+    #[test]
+    fn a_newer_schema_is_read_only_rather_than_corrupt() {
+        // 6.4 step 4: a downgrade leaves the file alone. The three readers agree.
+        let newer = r#"{"schema": 2, "seq": 1, "next_at": null}"#;
+        assert_eq!(
+            CurrentFile::parse(newer),
+            Ok(StateFile::SchemaNewer { found: 2 })
+        );
+        assert_eq!(
+            HistoryFile::parse(newer),
+            Ok(StateFile::SchemaNewer { found: 2 })
+        );
+        assert_eq!(
+            FavoritesFile::parse(newer),
+            Ok(StateFile::SchemaNewer { found: 2 })
+        );
+    }
+
+    #[test]
+    fn corruption_is_refused_rather_than_defaulted() {
+        // 6.4 step 1: a file that does not parse, an empty file, and a schema
+        // that is not an integer are all quarantine, not a fresh start.
+        for bad in [
+            "",
+            "   \n",
+            "{\"schema\": 1, \"seq\": 1",
+            "{\"schema\": \"one\", \"seq\": 1}",
+            "{\"schema\": 1.5}",
+            "{\"schema\": 1, \"paused\": \"yes\"}",
+            "[1, 2, 3]",
+            "{\"schema\": 1, \"entries\": {}}",
+            "{\"schema\": 1, \"entries\": [{\"kind\": \"image\"}]}",
+            "{\"schema\": 1, \"entries\": [{\"kind\": \"gif\", \"via\": \"set\", \"set_at\": \"x\", \"origin_key\": \"a:1\"}]}",
+            "{\"seq\": 1}",
+        ] {
+            assert!(
+                CurrentFile::parse(bad).is_err()
+                    || HistoryFile::parse(bad).is_err()
+                    || FavoritesFile::parse(bad).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+        // Missing keys that are merely unset are not corruption: `next_at` and
+        // `last_error` are absent in a fresh file, and the object is still read.
+        let sparse = r#"{"schema": 1}"#;
+        let parsed = CurrentFile::parse(sparse).expect("a sparse file").value();
+        assert_eq!(parsed, Some(CurrentFile::default()));
+    }
+
+    #[test]
+    fn the_two_via_vocabularies_both_read() {
+        // 6.2's list and 2.6's list disagree; a reader accepts both, and writes
+        // the protocol's (the handoff quotes both).
+        let text = |via: &str| {
+            format!(
+                r#"{{"schema": 1, "entries": [{{"kind": "local", "via": "{via}",
+                   "set_at": "2026-09-25T07:41:12Z", "origin_key": "a:1"}}]}}"#
+            )
+        };
+        let read = |via: &str| {
+            HistoryFile::parse(&text(via))
+                .expect("readable")
+                .value()
+                .expect("schema 1")
+                .entries[0]
+                .via
+        };
+        assert_eq!(read("rotate"), Via::Source);
+        assert_eq!(read("source"), Via::Source);
+        assert_eq!(read("set"), Via::Manual);
+        assert_eq!(read("manual"), Via::Manual);
+        assert_eq!(read("external"), Via::Startup);
+        assert_eq!(read("startup"), Via::Startup);
+        assert_eq!(read("prev"), Via::Prev);
+        assert_eq!(read("recovered"), Via::Recovered);
+        assert!(HistoryFile::parse(&text("sideways")).is_err());
+    }
+
+    #[test]
+    fn a_written_document_is_json_this_build_can_read_back() {
+        // The encoder is hand-written, so the one property that matters is that
+        // the reader accepts it: a path with a quote, a backslash and a newline
+        // is the case a naive encoder gets wrong.
+        let nasty = "/tmp/a\"b\\c\nd.jpg";
+        let file = FavoritesFile {
+            seq: 1,
+            written_at: "2026-09-25T07:41:12Z".to_string(),
+            entries: vec![Favorite {
+                added_at: "2026-09-25T07:41:12Z".to_string(),
+                kind: Kind::External,
+                origin_key: "external:zz".to_string(),
+                digest: None,
+                state: FavoriteState::Unrecoverable,
+                path: None,
+            }],
+        };
+        let text = file.encode();
+        assert!(text.contains("external:zz"));
+        let parsed = FavoritesFile::parse(&text).expect("its own encoding");
+        assert_eq!(parsed.value(), Some(file));
+
+        let anchor = Anchor {
+            digest: "c".repeat(64),
+            cached_path: Some(nasty.to_string()),
+            set_at: None,
+            display_mode: None,
+        };
+        let file = CurrentFile {
+            anchor: Some(anchor.clone()),
+            ..CurrentFile::default()
+        };
+        let parsed = CurrentFile::parse(&file.encode()).expect("its own encoding");
+        assert_eq!(parsed.value().and_then(|file| file.anchor), Some(anchor));
+    }
 
     fn entry(digest: &str) -> HistoryEntry {
         HistoryEntry {
