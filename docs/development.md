@@ -338,6 +338,14 @@ before it is used as a range.
   `fmt`, `clippy`, `test`, `msrv`, `guards` and `artifacts` at the first `cargo`
   command, because there is no workspace to build. Merge the scaffold with, or
   before, the first push that triggers this workflow.
+- **The `secrets` job was made to fail before it was trusted.** Run `36137663507`
+  is that job red with the other twelve jobs green, on a single probe commit that
+  added a credential-shaped file: the log line is
+  `##[error]gitleaks rule generic-api-key matched ci-red-check.txt:5 in commit 8e133a179b8d`.
+  Run `36137447410` is the same job green on the change itself: `1 commits
+  scanned`, `no leaks found`. The probe commit was dropped from the branch rather
+  than reverted, because a revert leaves the commit that adds the value inside the
+  scanned range and the job stays red (section 6, `Secrets`).
 
 ### What rots, and where the single copy of it lives
 
@@ -602,6 +610,12 @@ An exemption from the scanner's rules lives in `.gitleaks.toml`, needs a
 `description` saying why the hit is not a secret, and is printed by the `secrets`
 job on every run. An exemption a reviewer cannot see is an unwritten rule, and the
 next person widens it.
+
+The scan reads the commits, not the tree, so removing a credential in a later
+commit does not clear it: the commit that added it is still in the range and the
+job stays red. That is the job working. Rotate the credential, then drop the
+commit from the branch (`git rebase --interactive`, or `git reset`) and push the
+rewritten branch.
 
 ## 7. Local development
 
