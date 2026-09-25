@@ -721,7 +721,7 @@ stream. It is a mode, not a verb with an answer:
 | `favorite_removed` | `<digest>` | a pin was removed |
 | `cache_swept` | `<removed> <reclaimed_bytes> <hidden>` | a sweep completed; `hidden` is how many entries were kept only because they are pinned `[D 6 §5.3]` |
 | `clock_jump` | `<seconds>` | the wall clock moved more than one interval, so the deadline was recomputed `[D 4 §Part 2]` |
-| `config_reloaded` | - | the daemon re-read the config and it parsed `[D 5 §F0]` |
+| `config_reloaded` | - | the daemon re-read the config and it parsed `[D 5 §F0]`; no fields, because no digest of the config exists anywhere in the protocol for one to carry |
 | `anchor_unverified` | - | 1.7.3 step 3 took effect: the daemon does not know what is on screen and is protecting the whole grace window |
 | `shutdown` | - | the daemon is exiting; the connection closes immediately after |
 | `heartbeat` | `<unix_seconds>` | 30 s of quiet |
@@ -948,7 +948,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
                                                         --> resume
                                                         <-- OK
 <-- event: 187 resumed
-<-- event: 188 config_reloaded e67d23e7820c49a8051dac2831f38290f5e72f66c8db5079eeb60d82f14894c0
+<-- event: 188 config_reloaded
 <-- event: 189 cache_swept 12 34816000 1
 <-- event: 190 clock_jump 7200
 <-- event: 191 anchor_unverified
