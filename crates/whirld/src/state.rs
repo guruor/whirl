@@ -543,6 +543,14 @@ impl Daemon {
         protocol::plan_record(&self.effective.config.plan_pairs(self.effective.backend))
     }
 
+    /// 8.7's reporting half, for the one verb that reports it besides `status`:
+    /// 4.2's `cache.root` comment has `config check` "report `lock_mode:
+    /// excl_file` if a weaker lock had to be used". `None` under `flock`, because
+    /// 2.5's `config check` row lists that body exhaustively.
+    pub fn lock_line(&self) -> Option<String> {
+        self.lock.report_line()
+    }
+
     /// The deadline a worker gets: `schedule.worker_deadline_seconds` (1.7.1).
     pub fn worker_deadline(&self) -> Duration {
         Duration::from_secs(self.effective.config.schedule.worker_deadline_seconds)

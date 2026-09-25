@@ -149,6 +149,19 @@ impl DaemonLock {
             whirl_core::protocol::rfc3339_utc(crate::events::unix_seconds())
         )
     }
+
+    /// 8.7's reporting half: "report `lock_mode: excl_file` in `status` so the
+    /// weaker guarantee is visible rather than assumed". 4.2's `cache.root`
+    /// comment has `config check` report the same fact. Under `flock` there is
+    /// nothing to add, which is why this is an `Option` and not a line: 2.5's
+    /// `config check` body is exhaustive, and `status` derives its own value from
+    /// `mode` rather than from here.
+    pub fn report_line(&self) -> Option<String> {
+        match self.mode {
+            Mode::Flock => None,
+            Mode::ExclFile => Some(format!("lock_mode: {}", self.mode.as_str())),
+        }
+    }
 }
 
 impl Drop for DaemonLock {
@@ -324,6 +337,62 @@ fn cannot_lock(path: &Path, error: &std::io::Error) -> String {
     format!("cannot take the daemon lock at {}: {error}", path.display())
 }
 
+/// 8.7: "Cache root on a filesystem that does not support `flock`: the lock
+/// file's `flock` returns `ENOTSUP`", and 4.2's `cache.root` comment makes it a
+/// check: "config check refuses a root whose filesystem does not support flock,
+/// and reports `lock_mode: excl_file` if a weaker lock had to be used".
+///
+/// The probe is a real file in the cache root's own `tmp/`, taken the way 8.4's
+/// writability probe takes one (`tmp/<token>.part`; the pid stands in for the run
+/// id, because a check is not a run and must not consume one), and it removes
+/// what it wrote.
+///
+/// A probe that cannot be taken at all is not this refusal: 8.4 and 8.5 make an
+/// unwritable cache root a reported degraded cache rather than a refusal, and
+/// turning a permissions error into a claim about the filesystem's capabilities
+/// would be asserting a fact this probe did not learn.
+pub fn cache_root_accepts_flock(cache_dir: &Path) -> Result<(), String> {
+    cache_root_accepts_flock_with(cache_dir, flock_attempt)
+}
+
+/// The same, with the capability probe supplied: 8.7's `ENOTSUP` direction is
+/// one no filesystem on this machine can produce.
+fn cache_root_accepts_flock_with(
+    cache_dir: &Path,
+    probe: impl Fn(&File) -> Result<Attempt, std::io::Error>,
+) -> Result<(), String> {
+    let tmp = cache_dir.join("tmp");
+    if create_private_dir(&tmp).is_err() {
+        return Ok(());
+    }
+    let path = tmp.join(format!("{}-flock-probe.part", std::process::id()));
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(_) => return Ok(()),
+    };
+    let attempt = probe(&file);
+    let _ = std::fs::remove_file(&path);
+    match attempt {
+        // `Unsupported` is `ENOTSUP`/`EOPNOTSUPP`/`ENOSYS` (see `flock_attempt`):
+        // a filesystem that cannot answer the call is a filesystem that cannot
+        // lock, which is the refusal 8.7 asks for.
+        Ok(Attempt::Unsupported) => Err(format!(
+            "cache.root {}: this filesystem does not support flock (ENOTSUP), which 8.7 refuses rather than running on the weaker lock",
+            cache_dir.display()
+        )),
+        // `Acquired` is the answer the check wants, and `Held` (another probe
+        // holding this file) still proves the filesystem can lock.
+        Ok(_) | Err(_) => Ok(()),
+    }
+}
+
 /// A lock taken with the OS answer supplied. 2.10's row has two values and this
 /// machine's filesystems only ever produce one of them, so this is how both
 /// directions of [`select`] and of 8.7's fallback are reachable in a test.
@@ -444,5 +513,51 @@ mod tests {
             !path.exists(),
             "8.7's file is the lock, so releasing it has to remove it"
         );
+    }
+
+    /// The other half of the same derivation: under `flock` there is nothing to
+    /// report, which is why 2.5's `config check` body is unchanged there.
+    #[test]
+    fn the_flock_primitive_reports_no_extra_line() {
+        let dir = scratch("flock-report");
+        let lock = take(&dir).expect("the lock");
+        assert_eq!(lock.mode(), Mode::Flock);
+        assert_eq!(lock.report_line(), None);
+    }
+
+    /// 8.7's cache-root refusal, in both directions. The real probe runs on this
+    /// machine's filesystem (which can `flock`); the `ENOTSUP` direction is the
+    /// one APFS cannot produce, so it is supplied.
+    #[test]
+    fn the_cache_root_check_refuses_only_a_filesystem_that_cannot_flock() {
+        let dir = scratch("cache-root");
+        assert_eq!(
+            cache_root_accepts_flock(&dir),
+            Ok(()),
+            "the filesystem this test runs on can flock"
+        );
+        let left_behind: Vec<_> = std::fs::read_dir(dir.join("tmp"))
+            .expect("the probe's directory")
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .collect();
+        assert!(
+            left_behind.is_empty(),
+            "8.4's probe removes what it wrote: {left_behind:?}"
+        );
+
+        let refused = cache_root_accepts_flock_with(&dir, |_| Ok(Attempt::Unsupported))
+            .expect_err("a filesystem without flock is refused");
+        assert!(refused.contains("cache.root"), "{refused}");
+        assert!(refused.contains("ENOTSUP"), "{refused}");
+        assert!(refused.contains(&dir.display().to_string()), "{refused}");
+    }
+
+    /// A probe that cannot be taken at all is not the 8.7 refusal: 8.4 and 8.5
+    /// make an unwritable cache root a reported degraded state, not a refusal.
+    #[test]
+    fn a_cache_root_that_cannot_be_probed_is_not_refused() {
+        let dir = scratch("cache-root-missing");
+        let missing = dir.join("nowhere").join("cache");
+        assert_eq!(cache_root_accepts_flock(&missing), Ok(()));
     }
 }
