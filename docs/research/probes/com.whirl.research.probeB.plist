@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- probe B: minimum interval granularity. StartInterval 1 s; if the documented
+     10 s default throttle applies, fires land ~10 s apart, not 1 s apart. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whirl.research.probeB</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>printf 'B fire %s\n' "$(date +%s.%N)" >> "$HOME/whirl-probe-b.log"</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>1</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/whirl-probe-b.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/whirl-probe-b.err</string>
+</dict>
+</plist>

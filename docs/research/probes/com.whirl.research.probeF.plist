@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- probe F: throttle causation. Same shape as probe A (StartInterval 2) but with
+     ThrottleInterval 1. If the 10 s floor in A came from the default throttle,
+     this job fires every ~2 s instead. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whirl.research.probeF</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>printf 'F fire %s\n' "$(date +%s.%N)" >> "$HOME/whirl-probe-f.log"</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>2</integer>
+    <key>ThrottleInterval</key>
+    <integer>1</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/whirl-probe-f.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/whirl-probe-f.err</string>
+</dict>
+</plist>

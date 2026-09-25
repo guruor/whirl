@@ -1,0 +1,8 @@
+# systemd loginctl(1): enable-linger
+# source: https://raw.githubusercontent.com/systemd/systemd/main/man/loginctl.xml
+https://www.freedesktop.org/software/systemd/man/latest/loginctl.html
+# excerpt copied verbatim from the fetched page text
+
+### enable-linger USER…
+Enable/disable user lingering for one or more users. If enabled for a specific user, a user manager is spawned for the user at boot and kept around after logouts. This allows users who are not logged in to run long-running services. Takes one or more user names or numeric UIDs as argument. If no argument is specified, enables/disables lingering for the user of the session of the caller.
+See also KillUserProcesses= setting in logind.conf5.

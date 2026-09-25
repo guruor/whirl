@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- probe A: StartInterval cadence + RunAtLoad + log capture.
+     Interval 5 s, expected: one run at load, then one run every 5 s. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whirl.research.probeA</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>printf 'A fire %s\n' "$(date +%s.%N)" >> "$HOME/whirl-probe-a.log"</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>5</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/whirl-probe-a.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/whirl-probe-a.err</string>
+</dict>
+</plist>

@@ -1,0 +1,16 @@
+# Microsoft Learn: execType Complex Type (Task Scheduler schema)
+# source: https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-exectype-complextype
+# fetched 2026-09-25 from this machine, HTTP 200
+# The complete child element set of the Exec action, verbatim from the page's schema listing.
+# This is the evidence for an absence claim: Task Scheduler's Exec action has no output or
+# redirection element, so a task cannot send stdout/stderr to a file the way launchd's
+# StandardOutPath/StandardErrorPath does.
+
+<xs:element name="Command" type="pathType" />
+<xs:element name="Arguments" type="string" minOccurs="0" />
+<xs:element name="WorkingDirectory" type="pathType" minOccurs="0" />
+
+# Child elements table on the same page lists exactly these three:
+#   Arguments (string)          Specifies the arguments associated with the command-line operation.
+#   Command (pathType)          Specifies the executable file or document to be run.
+#   WorkingDirectory (pathType) Specifies the directory where either the executable or those files used by the executable exists.
