@@ -147,6 +147,183 @@ jobs:
               sys.exit("; ".join(failed))
           PY
 
+  secrets:
+    name: secrets (gitleaks)
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # The sha256 of gitleaks_8.30.1_linux_x64.tar.gz. It comes from the
+      # release's own gitleaks_8.30.1_checksums.txt, which is fetched too and
+      # grepped for this value, so a swapped binary and a swapped checksum file
+      # cannot both pass. No action is used for the scanner, so there is no tag
+      # to trust: the version, the URL and the digest are all pinned here.
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scan compares two commits, and the base commit is not in a
+          # shallow clone.
+          fetch-depth: 0
+      - name: Install gitleaks ${{ env.GITLEAKS_VERSION }} and verify the release digest
+        run: |
+          set -eu
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          sums="gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          curl --silent --show-error --fail --location --remote-name "$base/$tarball"
+          curl --silent --show-error --fail --location --remote-name "$base/$sums"
+          echo "$GITLEAKS_SHA256  $tarball" | sha256sum --check --strict
+          grep --fixed-strings "$GITLEAKS_SHA256  $tarball" "$sums" > /dev/null
+          tar --extract --gzip --file "$tarball" gitleaks
+          ./gitleaks version
+      - name: Print the allowlist, so an exemption is never silent
+        run: |
+          python3 - <<'PY'
+          import sys
+          import tomllib
+
+          # The fields gitleaks 8.30.1 reads on an allowlist entry. It ignores a
+          # field it does not know, so a typo here would be a silent exemption.
+          FIELDS = {
+              "description",
+              "condition",
+              "commits",
+              "paths",
+              "regexes",
+              "regextarget",
+              "stopwords",
+              "targetrules",
+          }
+
+          with open(".gitleaks.toml", "rb") as handle:
+              config = tomllib.load(handle)
+
+          entries = []
+          if "allowlist" in config:
+              entries.append(("[allowlist]", config["allowlist"]))
+          for index, entry in enumerate(config.get("allowlists", []), start=1):
+              entries.append((f"[[allowlists]] #{index}", entry))
+          for rule in config.get("rules", []):
+              if "allowlist" in rule:
+                  entries.append((f"rules.{rule.get('id', '?')}.allowlist", rule["allowlist"]))
+              for index, entry in enumerate(rule.get("allowlists", []), start=1):
+                  entries.append((f"rules.{rule.get('id', '?')}.allowlists #{index}", entry))
+
+          if not entries:
+              print("gitleaks allowlist: empty. Nothing is exempt from the shipped rules.")
+              sys.exit(0)
+
+          print(f"gitleaks allowlist: {len(entries)} exemption(s), each one a claim that a hit is not a secret:")
+          failed = False
+          for where, entry in entries:
+              if not isinstance(entry, dict):
+                  print(f"\n  {where}\n    not a table: {entry!r}")
+                  failed = True
+                  continue
+              reason = entry.get("description", "")
+              print(f"\n  {where}")
+              print(f"    reason: {reason or '(none written)'}")
+              for name in sorted(entry, key=str.lower):
+                  if name.lower() != "description":
+                      print(f"    {name}: {entry[name]}")
+              unknown = sorted(set(entry) - FIELDS)
+              if unknown:
+                  print(
+                      f"    unknown field(s) {unknown}: gitleaks ignores them, so this entry "
+                      "is not doing what it looks like it does"
+                  )
+                  failed = True
+              if not reason:
+                  failed = True
+          if failed:
+              sys.exit(
+                  "every allowlist entry needs a `description` saying why the hit is not a "
+                  "secret, and only the fields gitleaks reads"
+              )
+          print(f"\ngitleaks allowlist: {len(entries)} exemption(s), all with a reason.")
+          PY
+      - name: Scan the commits this change adds, and name what they leak
+        env:
+          # Event payload values reach the shell as environment variables, not as
+          # text spliced into the script, and the script validates them as hex.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSHED_FROM: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+
+          # A pull request carries its base; a push to `main` carries the tip it
+          # was pushed from. Either way the range is what this change adds.
+          base="${BASE_SHA:-}"
+          [ -n "$base" ] || base="${PUSHED_FROM:-}"
+          case "$base" in
+            "" | 0000000000000000000000000000000000000000 | *[!0-9a-f]*)
+              base=""
+              echo "::notice::the event carried no usable base commit; falling back to the head's parent"
+              ;;
+          esac
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base=$(git rev-parse --verify --quiet "${HEAD_SHA:-HEAD}^" || true)
+          fi
+          if [ -z "$base" ]; then
+            echo "::error::no commit to compare against, so the scan cannot be scoped to this change. Run this job by hand from a branch that has history."
+            exit 1
+          fi
+
+          # A colour-forcing git config (color.ui or color.diff set to `always`)
+          # makes `git log -p` emit ANSI escapes, which gitleaks' patch parser
+          # cannot read: it then prints `0 commits scanned`, `no leaks found` and
+          # exits 0. Reproduced on a developer machine, so pin both keys off for
+          # the child `git log` (GIT_CONFIG_* is `git -c` through the
+          # environment).
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false
+          export GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false
+
+          echo "scanning ${base}..${HEAD_SHA}"
+          status=0
+          ./gitleaks git --no-banner --redact --verbose --config .gitleaks.toml \
+            --log-opts="$base..${HEAD_SHA}" \
+            --report-format json --report-path gitleaks-report.json \
+            --exit-code 0 2>&1 | tee gitleaks.log || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::gitleaks exited $status, so the scan did not complete and a clean report would mean nothing."
+            exit "$status"
+          fi
+          # A scan that read no commits exits 0 and finds nothing. Green there is
+          # green because nothing was checked.
+          if grep --fixed-strings "0 commits scanned" gitleaks.log > /dev/null; then
+            echo "::error::the scan read no commits, so this job checked nothing: check the range above, the checkout depth, and the git colour settings."
+            exit 1
+          fi
+      - name: Fail on a finding, naming the rule and the file
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("gitleaks-report.json") as handle:
+              findings = json.load(handle)
+
+          if not findings:
+              print("gitleaks: no findings in the commits this change adds")
+              sys.exit(0)
+
+          for finding in findings:
+              file = finding.get("File") or "(unknown file)"
+              line = finding.get("StartLine") or 0
+              rule = finding.get("RuleID") or "(unknown rule)"
+              commit = (finding.get("Commit") or "")[:12]
+              print(
+                  f"::error file={file},line={line}::gitleaks rule {rule} matched "
+                  f"{file}:{line} in commit {commit}. A credential in the history is a "
+                  "credential in every clone: rotate it, then remove it with an "
+                  "exemption only if it is not a secret."
+              )
+          print(f"gitleaks: {len(findings)} finding(s), listed above by rule and file.")
+          sys.exit(1)
+          PY
+
   artifacts:
     name: artifacts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

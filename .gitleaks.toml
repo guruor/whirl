@@ -1,0 +1,20 @@
+# The secret scanner's configuration. `.github/workflows/ci.yml`, job `secrets`,
+# is the only thing that reads it.
+#
+# The rules that ship with gitleaks stay on; this file adds exemptions and
+# nothing else. An exemption is a claim that a scanner hit is not a secret, and
+# a claim needs a reason and a reader: every entry below carries a `description`,
+# and the `secrets` job prints every entry and its reason on every run and fails
+# when one has none (docs/development.md section 6, `Secrets`). Nothing else is
+# exempt -- a hit no entry names fails the job.
+
+title = "whirl"
+
+[extend]
+# Without this, a config file *replaces* the shipped rule set instead of adding
+# to it, and a scanner that silently checks nothing is worse than none.
+useDefault = true
+
+[[allowlists]]
+description = "Build output and per-card worktrees are throwaway directories. Both are gitignored, so a scan of a pull request's own commits cannot see them; this entry is here so that the day one is force-added, its contents are excluded by a stated rule rather than by luck."
+paths = ['^target/', '^\.worktrees/']

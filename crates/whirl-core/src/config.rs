@@ -2490,7 +2490,12 @@ mod tests {
 
     #[test]
     fn a_key_that_looks_like_an_api_key_is_refused() {
-        let text = "{\n  \"sources\": [\n    { \"id\": \"s\", \"kind\": \"wallhaven\", \"api_key_ref\": \"a1b2c3d4e5f60718293a4b5c6d7e8f90\" }\n  ]\n}";
+        // Key-shaped: 40 key-ish characters, which is what `looks_like_a_key`
+        // refuses from 32. Deliberately a repeated pattern rather than random
+        // hex: the rule is length and shape, not entropy, so the test still
+        // bites, and a secret scanner has no entropy here to object to. A
+        // random-looking literal is what got this test reported once.
+        let text = "{\n  \"sources\": [\n    { \"id\": \"s\", \"kind\": \"wallhaven\", \"api_key_ref\": \"example0example0example0example0example0\" }\n  ]\n}";
         let error = refusal(text);
         assert_eq!(error.field.as_deref(), Some("sources[0].api_key_ref"));
         assert!(error.to_string().contains("NAME, never a value"));
