@@ -1,0 +1,12 @@
+# Microsoft Learn: TaskSettings / settingsType elements (defaults: battery, 72 h limit, instance policy, restart-on-failure)
+# source: https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings
+https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-disallowstartifonbatteries-settingstype-element
+https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-executiontimelimit-settingstype-element
+https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-multipleinstancespolicy-settingstype-element
+https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-restartonfailure-settingstype-element
+# excerpt copied verbatim from the fetched page text
+
+Gets or sets the policy that defines how the Task Scheduler deals with multiple instances of the task.
+Gets or sets the number of times that the Task Scheduler will attempt to restart the task.
+Gets or sets a value that specifies how long the Task Scheduler will attempt to restart the task.
+By default, a task will be stopped 72 hours after it starts to run. You can change this by changing the ExecutionTimeLimit setting.

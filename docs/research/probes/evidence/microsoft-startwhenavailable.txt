@@ -1,0 +1,7 @@
+# Microsoft Learn: <ws:StartWhenAvailable> (settingsType) element + ITaskSettings::get_StartWhenAvailable
+# source: https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-startwhenavailable-settingstype-element
+https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itasksettings-get_startwhenavailable
+# excerpt copied verbatim from the fetched page text
+
+This property applies only to time-based tasks with an end boundary or time-based tasks that are set to repeat infinitely.
+Tasks that are started after the scheduled time has passed (because of the StartWhenAvailable property being set to True) are queued in the Task Scheduler service's queue of tasks and they are started after a delay. The default delay is 10 minutes.

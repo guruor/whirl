@@ -1,0 +1,7 @@
+# Apple, Daemons and Services Programming Guide: Creating Launch Daemons and Agents (archived)
+# source: https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html
+# excerpt copied verbatim from the fetched page text
+
+<key>StartInterval</key>
+Alternately, you can specify a calendar-based interval. The following example starts the job on the 7th day of every month at 13:45 (1:45 pm). Like the Unix cron subsystem, any missing key of the StartCalendarInterval dictionary is treated as a wildcard—in this case, the month is omitted, so the job is run every month.
+<key>StartCalendarInterval</key>

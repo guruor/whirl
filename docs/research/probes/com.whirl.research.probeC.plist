@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- probe C: overlap. StartInterval 5 s with a body that runs 12 s.
+     Question: does launchd start a second instance while the first runs. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whirl.research.probeC</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>printf 'C start %s pid=%s\n' "$(date +%s.%N)" "$$" >> "$HOME/whirl-probe-c.log"; sleep 12; printf 'C end   %s pid=%s\n' "$(date +%s.%N)" "$$" >> "$HOME/whirl-probe-c.log"</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>5</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/whirl-probe-c.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/whirl-probe-c.err</string>
+</dict>
+</plist>

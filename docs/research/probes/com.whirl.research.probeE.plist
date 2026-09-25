@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- probe E: KeepAlive true with a body that exits immediately.
+     Question: is the restart governed by the default 10 s throttle. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whirl.research.probeE</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>printf 'E run %s pid=%s\n' "$(date +%s.%N)" "$$" >> "$HOME/whirl-probe-e.log"; exit 0</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/whirl-probe-e.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/whirl-probe-e.err</string>
+</dict>
+</plist>

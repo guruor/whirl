@@ -1,0 +1,7 @@
+# Microsoft Learn: Task Scheduler: Automatic maintenance (Allow wake timer power option, wake support caveats)
+# source: https://learn.microsoft.com/en-us/windows/win32/taskschd/task-maintenence
+# excerpt copied verbatim from the fetched page text
+
+With the advent of laptops, and the heavy focus on battery life, machines are no longer configured to allow S3 wakeup in most circumstances, and generally Doze-To-S4 (hibernate) as soon as possible, to save battery. In response to these changes, Task Scheduler (> Win7) runs maintenance tasks whenever they are due, and the machine is idle and on AC power.
+Check whether Allow Wake Timer is enabled in Power Options.
+WakeToRun: Task should be allowed to wake the machine.

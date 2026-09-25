@@ -1,0 +1,5 @@
+# Microsoft Learn Q&A (community answer, not product documentation): the event text Task Scheduler logs when a run is skipped
+# source: https://learn.microsoft.com/en-us/answers/questions/578167/why-is-my-scheduled-task-not-running-when-i-am-log
+# excerpt copied verbatim from the fetched page text
+
+The Event Property displayed when Windows attempts to run this task (while logged off) is: "Task Scheduler did not launch task "\AutoRun_MorningReports" as it missed its schedule. Consider using the configuration option to start the task when available, if schedule is missed."

@@ -1,0 +1,6 @@
+# Microsoft Learn: StartWhenAvailable (settingsType) Element - schema, default false
+# source: https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-startwhenavailable-settingstype-element
+# excerpt copied verbatim from the fetched page text
+
+Specifies that the Task Scheduler can start the task at any time after its scheduled time has passed.
+default="false"

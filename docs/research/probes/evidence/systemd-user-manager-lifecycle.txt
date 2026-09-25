@@ -1,0 +1,13 @@
+# systemd loginctl(1) enable-linger + logind.conf(5) KillUserProcesses (user manager lifecycle while logged out)
+# source: https://raw.githubusercontent.com/systemd/systemd/main/man/loginctl.xml
+https://www.freedesktop.org/software/systemd/man/latest/loginctl.html
+https://raw.githubusercontent.com/systemd/systemd/main/man/logind.conf.xml
+# excerpt copied verbatim from the fetched page text
+
+### enable-linger USER…
+Enable/disable user lingering for one or more users. If enabled for a specific user, a user manager is spawned for the user at boot and kept around after logouts. This allows users who are not logged in to run long-running services. Takes one or more user names or numeric UIDs as argument. If no argument is specified, enables/disables lingering for the user of the session of the caller.
+See also KillUserProcesses= setting in logind.conf5.
+### KillUserProcesses=
+Takes a boolean argument. Configures whether the processes of a user should be killed when the user logs out. If true, the scope unit corresponding to the session and all processes inside that scope will be terminated. If false, the scope is "abandoned", see systemd.scope5, and processes are not killed. Defaults to &KILL_USER_PROCESSES;, but see the options KillOnlyUsers= and KillExcludeUsers= below.
+In addition to session processes, user process may run under the user manager unit user@.service. Depending on the linger settings, this may allow users to run processes independent of their login sessions. See the description of enable-linger in loginctl1.
+Note that setting KillUserProcesses=yes will break tools like screen1 and tmux1, unless they are moved out of the session scope. See example in systemd-run1.
