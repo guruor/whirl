@@ -48,9 +48,64 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # First in the graph, and `build` and `release` both wait behind it: a tag that
+  # is not on `main` must publish nothing at all, and that is only true if this
+  # job is the gate the other two name in `needs:`. The rule it enforces (a
+  # release is a tag `vX.Y.Z` on `main`, docs/development.md section 5) is a
+  # fact about history, so this job is a fetch and one ancestry question.
+  guard:
+    name: guard (${{ github.ref_name }} is on main)
+    runs-on: ubuntu-latest
+    steps:
+      # `fetch-depth: 0`, because the check below asks a question about history
+      # and the default shallow checkout cannot answer it: with no history
+      # fetched, `git merge-base --is-ancestor` cannot connect the tagged commit
+      # to `main` and fails for every tag, `main`'s own tip included. Fetching
+      # the repository's history is the whole cost. It is safe because this job
+      # only reads: the workflow declares `contents: read`, and the job writes
+      # nothing, pushes nothing and is given no write token. The step below
+      # refuses to decide at all when `origin/main` is not in the checkout, so a
+      # checkout setting that regresses fails closed rather than open.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Refuse a tag whose commit is not on main
+        shell: bash
+        env:
+          # The tag and the commit reach this script through `env:`: no event
+          # payload is spliced into a `run:` step.
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          if ! git rev-parse --verify --quiet refs/remotes/origin/main > /dev/null; then
+            echo "::error::origin/main is not in this checkout, so this job cannot say whether $TAG is on main. Refusing rather than publishing a release that nothing checked; the checkout needs the repository's history (fetch-depth: 0)."
+            exit 1
+          fi
+          main=$(git rev-parse origin/main)
+          echo "tag $TAG points at $SHA"
+          echo "origin/main is $main"
+          if git merge-base --is-ancestor "$SHA" origin/main; then
+            if [ "$SHA" = "$main" ]; then
+              echo "the tagged commit is main's tip"
+            else
+              echo "the tagged commit is an ancestor of main, which has moved ahead of it since the tag was cut; the release still describes the tagged commit"
+            fi
+            exit 0
+          fi
+          common=$(git merge-base "$SHA" origin/main || true)
+          if [ -n "$common" ]; then
+            echo "ancestry: $SHA is NOT an ancestor of origin/main; the two share history up to $common"
+          else
+            echo "ancestry: $SHA is NOT an ancestor of origin/main, and the two share no history at all"
+          fi
+          echo "::error::$TAG is not on main, so it is not a release. Nothing was built and no release will be published. A release is a tag vX.Y.Z on main (docs/development.md section 5): delete this tag, get the commit onto main through the promotion, and tag main's tip."
+          exit 1
+
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    needs: [guard]
     strategy:
       fail-fast: false
       matrix:
@@ -145,7 +200,7 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [guard, build]
     permissions:
       # Creating the release and attaching assets is a write. Only this job gets
       # it; the build jobs above, and every job in `ci.yml`, stay read-only.
