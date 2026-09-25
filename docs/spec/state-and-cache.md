@@ -695,14 +695,10 @@ report can `cat` them, and the reviewer can check them, without the daemon.
   "written_at": "2026-09-25T07:41:12Z",
   "entries": [
     {
-      "digest": "ab12cd34...",
-      "source": "space",
       "kind": "wallhaven",
-      "origin": "https://w.wallhaven.cc/full/ab/wallhaven-ab12cd.jpg",
       "origin_key": "wallhaven:ab12cd",
-      "width": 2560, "height": 1440, "bytes": 3822331,
+      "digest": "ab12cd34...",
       "cached_path": "/Users/.../sha256/ab/12/ab12cd34....jpg",
-      "mode": "copy",
       "set_at": "2026-09-25T07:41:12Z",
       "via": "source"
     }
@@ -722,10 +718,30 @@ report can `cat` them, and the reviewer can check them, without the daemon.
   and `external` instead. `rotate` and `set` are `source` and `manual`; the
   `external` spelling is `startup`. A reader accepts all three from a file an
   earlier build wrote, and this build writes none of them.
-- `favorites.json`: the same entry shape plus `"added_at"`, unordered, one
-  `schema` and one `seq`. Pinned files are found by the digest, which is also the
-  cache filename, which is why "unfavorite" is a single-set operation with no
-  filesystem walk.
+- The entry is the six fields a rotation produces or the daemon knows: `kind`,
+  `origin_key`, `digest`, `cached_path`, `set_at`, `via`. Architecture 2.6's
+  worker result is `<digest> <origin_key> <via> <path>`; `kind` comes from the
+  source the daemon spawned and `set_at` from the moment it wrote the ring.
+  `digest` and `cached_path` are `null` where there is nothing to record: an
+  `external` image whose bytes could not be hashed, and a `reference`-mode set,
+  where the file whirl must not delete is the user's own (6.1; 2.6's `-` on the
+  wire).
+- `decision:` the entry carries no `source`, `origin`, `width`, `height`, `bytes`
+  or `mode`. The first five are `cache/index.json` fields (2.1): that is where
+  the sweep, a `prev` re-materialisation and the favorites lookup read them, and
+  a state file that repeated them would be a second copy free to disagree with
+  the index. `mode` is not a record field at all: it is the source's own config
+  key (`sources[].mode`, architecture 4.2), and a `reference`-mode set is visible
+  as `cached_path: null`. The example above used to carry all six, which is a
+  shape the worker cannot produce.
+- `favorites.json`: `kind`, `origin_key`, `digest`, `cached_path` and
+  `"added_at"`, and no `set_at` or `via`, which describe a rotation rather than a
+  pin; unordered, one `schema` and one `seq`. `state` is not stored either:
+  whether the bytes are there is a fact about the disk right now, so the reader
+  recomputes it and the `favorites` record prints it, and a value written before
+  the file was deleted is never believed. Pinned files are found by the digest,
+  which is also the cache filename, which is why "unfavorite" is a single-set
+  operation with no filesystem walk.
 
 ### 6.3 The write protocol, every state file, no exceptions
 
