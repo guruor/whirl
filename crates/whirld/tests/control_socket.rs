@@ -491,6 +491,162 @@ fn history_reports_the_ring_newest_first_in_the_record_form() {
     );
 }
 
+/// 6.2's ring, end to end: newest first, exactly `state.history_entries` (50)
+/// entries, the oldest dropped on write, `history_count` reporting what is in
+/// the ring rather than how many rotations have happened, and the whole thing
+/// surviving a restart.
+///
+/// 51 rotations, so the 51st is the one that overflows the bound. What each
+/// assertion fails on: a ring with no bound (or one bounded at 51) answers
+/// `count: 51` with 51 entries; a ring that drops the newest instead of the
+/// oldest loses the last file's digest and keeps the first one; an encoder that
+/// wrote the entries oldest-first fails the comparison against the response; a
+/// ring that is not read back at startup comes back empty, so both the count and
+/// the body of the restart's `history 50` change; and a `history.json` this
+/// build cannot parse fails in `HistoryFile::parse` rather than silently.
+///
+/// The file is read back with the parser the daemon itself uses
+/// (`whirl_core::state::HistoryFile`), so the assertion is about the file the
+/// next daemon parses rather than about a substring of it, and it is the state
+/// layout's own path (`state/history.json`, 6.1).
+#[test]
+fn the_ring_keeps_the_fifty_newest_entries_and_survives_a_restart() {
+    let mut daemon = start("the_ring_keeps_the_fifty_newest_entries_and_survives_a_restart");
+
+    /// The digest of the `set:` record in a rotation's response.
+    fn digest_of(lines: &[String]) -> String {
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix("set: "))
+            .unwrap_or_else(|| panic!("a set: line in {lines:?}"))
+            .split(' ')
+            .next()
+            .expect("a digest")
+            .to_string()
+    }
+
+    /// The digests of a `history` response, in the order it wrote them: field 5
+    /// of `entry: <set_at> <via> <kind> <origin_key> <digest> <path|->` (2.6).
+    fn recorded_of(lines: &[String]) -> Vec<String> {
+        body(lines)
+            .iter()
+            .filter(|line| line.starts_with("entry: "))
+            .map(|line| {
+                line["entry: ".len()..]
+                    .split(' ')
+                    .nth(4)
+                    .expect("a digest")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    // 51 distinct files, so 51 distinct digests, and the bound is 50.
+    let mut digests = Vec::new();
+    for index in 0..51 {
+        let path = daemon.dir.join(format!("ring-{index:02}.jpg"));
+        std::fs::write(&path, format!("ring {index}")).expect("a file to set");
+        let lines = daemon.ask(&format!("set path {}", path.display()));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("OK"),
+            "rotation {index}: {lines:?}"
+        );
+        digests.push(digest_of(&lines));
+    }
+    let mut distinct = digests.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 51, "the 51 sets are distinguishable");
+    let oldest = digests[0].clone();
+    // `history` is newest first (2.5, 2.6), so the expectation is the reverse of
+    // the order the rotations happened in, less the one the ring dropped.
+    let expected: Vec<String> = digests[1..].iter().rev().cloned().collect();
+
+    let lines = daemon.ask("history 50");
+    assert_eq!(lines.last().map(String::as_str), Some("OK"));
+    assert_eq!(
+        body(&lines)[0],
+        "count: 50",
+        "the ring is bounded at state.history_entries (6.2)"
+    );
+    let recorded = recorded_of(&lines);
+    assert_eq!(
+        recorded.len(),
+        50,
+        "the count and the entries agree: {lines:?}"
+    );
+    assert_eq!(
+        recorded, expected,
+        "the newest 50, newest first: the 51st set is what dropped the first"
+    );
+    assert!(
+        !recorded.contains(&oldest),
+        "the oldest entry is the one the ring dropped (6.2)"
+    );
+
+    let status = daemon.ask("status");
+    assert_eq!(
+        value(&status, "history_entries"),
+        "50",
+        "the bound 2.10 names"
+    );
+    assert_eq!(
+        value(&status, "history_count"),
+        "50",
+        "50 entries in the ring after 51 rotations, not 51 (2.10)"
+    );
+
+    let history = daemon.dir.join("state").join("history.json");
+    let text = std::fs::read_to_string(&history).expect("state/history.json");
+    let file = whirl_core::state::HistoryFile::parse(&text)
+        .expect("a history file this build wrote")
+        .value()
+        .expect("schema 1 is this build's schema");
+    assert_eq!(
+        file.entries.len(),
+        50,
+        "the file holds the bound, so the 51st rotation dropped one (6.2)"
+    );
+    let on_disk: Vec<String> = file
+        .entries
+        .iter()
+        .map(|entry| entry.digest.clone().expect("a digest"))
+        .collect();
+    assert_eq!(
+        on_disk, recorded,
+        "the file and the response agree, newest first (6.2)"
+    );
+
+    // A restart re-reads the file, and nothing here rotates while it does:
+    // `set path` is not a slot on the grid, so `next_at` is still in the future
+    // and 5.5 rule 6 has no past deadline to rotate on. That is what keeps the
+    // two rings comparable.
+    daemon.child.kill().expect("the daemon is killed");
+    daemon.child.wait().expect("it is reaped");
+    daemon.child = spawn_daemon(&daemon.dir, &daemon.socket, true);
+
+    let after = daemon.ask("history 50");
+    assert_eq!(after.last().map(String::as_str), Some("OK"));
+    assert_eq!(
+        body(&after)[0],
+        "count: 50",
+        "the ring survived the restart"
+    );
+    assert_eq!(
+        recorded_of(&after),
+        recorded,
+        "same entries, same order, after a restart (6.2, 6.4)"
+    );
+    let status = daemon.ask("status");
+    assert_eq!(value(&status, "history_count"), "50");
+    assert_eq!(
+        value(&status, "last_digest"),
+        expected[0],
+        "the anchor is the newest entry's digest (6.1)"
+    );
+}
+
 #[test]
 fn refusals_name_their_code_and_the_line_protocol_holds() {
     let daemon = start("refusals_name_their_code_and_the_line_protocol_holds");

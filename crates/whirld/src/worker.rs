@@ -358,7 +358,23 @@ mod tests {
     }
 
     /// The deadline of the test that *is* about the deadline.
-    const ONE_SECOND: Duration = Duration::from_secs(1);
+    ///
+    /// It has to be short enough that this test proves the escalation rather than
+    /// the 300 s default of 1.7.1, and long enough that it cannot be defeated by
+    /// the child's own start-up: the child has to be forked, exec'd, and have
+    /// installed its `TERM` trap before the deadline can fire, and a `SIGTERM`
+    /// delivered before the trap exists kills it by default action, which is a
+    /// failure that says nothing about the daemon.
+    ///
+    /// One second was not long enough. Reproduced on this machine (macOS, 6 `sh`
+    /// busy loops plus the eight test binaries of `cargo test --workspace` in
+    /// parallel): 1 run in 8 failed on `elapsed >= TERM_GRACE` with the child
+    /// dead in about 1 s, which is that race and not a daemon defect. Three
+    /// seconds is 100x below the documented default and comfortably longer than
+    /// any process start-up observed here; the trap is also installed before the
+    /// pid file is written, so a child that is slow to start survives the signal
+    /// whenever the two orderings can still be reconciled.
+    const DEADLINE: Duration = Duration::from_secs(3);
 
     /// Two files are the same file: the device and inode comparison behind
     /// `[ a -ef b ]`, used to ask whether this process's own stdin is the null
@@ -452,6 +468,10 @@ mod tests {
     /// A daemon that skipped `SIGTERM` fails the marker assertion; one that
     /// killed immediately fails `elapsed >= TERM_GRACE`; one that returned
     /// without killing leaves the process alive and fails the `kill -0` probe.
+    /// The `trap` is the script's first statement and the pid file its second:
+    /// both orderings are load-sensitive, and installing the handler before
+    /// anything that can block keeps the window in which a `SIGTERM` would kill
+    /// the child by default action as small as the shell can make it.
     #[test]
     fn a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace() {
         let scripts = Scripts::new("escalate");
@@ -460,14 +480,14 @@ mod tests {
         let program = scripts.script(
             "slow.sh",
             &format!(
-                "#!/bin/sh\necho $$ > '{}'\ntrap 'echo term >> \"{}\"' TERM\nwhile :; do sleep 0.05; done\n",
-                pid.display(),
-                marker.display()
+                "#!/bin/sh\ntrap 'echo term >> \"{}\"' TERM\necho $$ > '{}'\nwhile :; do sleep 0.05; done\n",
+                marker.display(),
+                pid.display()
             ),
         );
 
         let started = Instant::now();
-        let outcome = worker(program).run(Verb::Rotate, None, 7, ONE_SECOND);
+        let outcome = worker(program).run(Verb::Rotate, None, 7, DEADLINE);
         let elapsed = started.elapsed();
 
         assert!(
