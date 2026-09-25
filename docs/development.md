@@ -602,9 +602,18 @@ gitleaks git --config .gitleaks.toml --redact \
 
 `gitleaks` is not a build dependency; take it from the project's releases (CI pins
 8.30.1, and the job verifies the release digest) or from your package manager. If
-it prints `0 commits scanned` then it read nothing and its `no leaks found` means
-nothing: a `color.ui` or `color.diff` of `always` in your git config does exactly
-that, and the CI job pins both off for this scan.
+it prints `0 commits scanned` then it read nothing, its `no leaks found` means
+nothing, and the cause is your git config: `color.ui` or `color.diff` of `always`
+makes `git log -p` colourise a pipe, and gitleaks cannot read that. The CI job
+pins both off for this reason, and the same two overrides work locally:
+
+```sh
+git fetch origin main
+GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false \
+GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false \
+gitleaks git --config .gitleaks.toml --redact \
+  --log-opts="$(git merge-base origin/main HEAD)..HEAD"
+```
 
 An exemption from the scanner's rules lives in `.gitleaks.toml`, needs a
 `description` saying why the hit is not a secret, and is printed by the `secrets`
