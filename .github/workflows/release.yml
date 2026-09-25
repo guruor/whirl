@@ -6,6 +6,14 @@ name: release
 # `.github/workflows/ci.yml` builds, one archive per platform, and attaches them
 # to a GitHub Release whose notes come from a template in the repository.
 #
+# The rule is enforced here, not assumed. The first job, `guard`, fails unless the
+# tagged commit is an ancestor of `origin/main`, and `build` and `release` both
+# name it in `needs:`, so a tag pushed anywhere else builds nothing and publishes
+# nothing. Ancestry covers both legitimate cases: a tag exactly at `main`'s tip (a
+# commit is its own ancestor, and the job says so), and `main` having moved ahead
+# of the tag since it was cut (the tagged commit is still in `main`'s history, so
+# the release is still the release that commit describes).
+#
 # Why a second workflow rather than another job in `ci.yml`: this one runs on a
 # tag, needs to write to the repository, and must never be cancelled half way. A
 # run that stops after creating the release but before attaching three artifacts
@@ -13,12 +21,13 @@ name: release
 # deliberately a read-only gate.
 #
 # What this workflow does not do, on purpose: it does not run the test suite. The
-# tagged commit is `main`'s tip, which is a promotion's merge commit, and `ci.yml`
-# has already run the full matrix on that commit: the promotion pull request runs
-# it, and so does the push to `main` that the merge produces
-# (docs/development.md section 5, "The promotion"). What this workflow does do is
-# refuse to publish a release whose notes are missing, unfilled or incomplete:
-# see the "Assemble and check the release notes" step.
+# guard has established that the tagged commit is on `main`; that `ci.yml` has
+# already run the full matrix on that commit follows from how a commit reaches
+# `main` (the promotion pull request and the push to `main` its merge produces
+# both run the matrix, docs/development.md section 5), and is not a check this
+# workflow makes. What this workflow does do is refuse to publish a release whose
+# notes are missing, unfilled or incomplete: see the "Assemble and check the
+# release notes" step.
 #
 # Rules this file obeys, from docs/development.md:
 # - every action is pinned to a full commit SHA, never a tag or a branch, so an
