@@ -99,7 +99,12 @@ impl Effective {
         };
 
         create_private_dir(&state_dir)?;
-        create_private_dir(&cache_dir)?;
+        // 8.4: the cache root is probed rather than refused. A cache that cannot
+        // be written is a degraded daemon (`cache_writable: 0`, 8.5), not a
+        // daemon that does not start: only the state directory refuses (1.5).
+        if let Err(message) = create_private_dir(&cache_dir) {
+            eprintln!("whirld: warning: {message}");
+        }
         writable(&state_dir)?;
 
         Ok(Effective {
@@ -191,6 +196,24 @@ fn restrict(path: &Path, mode: u32) -> Result<(), String> {
 #[cfg(not(unix))]
 fn restrict(_path: &Path, _mode: u32) -> Result<(), String> {
     Ok(())
+}
+
+/// 8.4: "attempt to create and remove `tmp/<run>-probe.part`", taken at start and
+/// again at each rotation rather than cached, because a cache directory can
+/// become unwritable while the daemon runs (a remount, a full disk, a chmod).
+///
+/// This is the only thing that writes into the cache root before the cache card
+/// lands, and it writes nothing that outlives the call.
+pub(crate) fn probe_cache_writable(cache_dir: &Path, run: u64) -> bool {
+    let tmp = cache_dir.join("tmp");
+    if create_private_dir(&tmp).is_err() {
+        return false;
+    }
+    let probe = tmp.join(format!("{run}-probe.part"));
+    if std::fs::write(&probe, b"").is_err() {
+        return false;
+    }
+    std::fs::remove_file(&probe).is_ok()
 }
 
 /// 1.5 step 2: refuse to start when the state directory cannot be written, and
