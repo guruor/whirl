@@ -219,12 +219,16 @@ either side can see the whole interface:
   adapters need named session variables rather than the whole environment:
   `PATH`, `HOME`, `WHIRL_CONFIG`, `WHIRL_BACKEND`, `WHIRL_WALLHAVEN_API_KEY` (only when set in the
   daemon's own environment, which is one of the three places a key may come from
-  `[D 5 §2.4]`), and, on Linux only, the variables `[D 3 §Detecting the environment]` names as the
-  decisive ones: `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, `XDG_RUNTIME_DIR`,
-  `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `DISPLAY`, `SWAYSOCK`, `I3SOCK`,
-  `HYPRLAND_INSTANCE_SIGNATURE`. Without those the worker cannot tell a GNOME session from a KDE
-  one, and `[D 3 §Detecting the environment]` is explicit that `gsettings` being on `PATH` is not
-  a GNOME signal.
+  `[D 5 §2.4]`), and, on Linux only, nine variables: the four signals
+  `[D 3 §Detecting the environment]` names as decisive (`XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`,
+  `SWAYSOCK` with `I3SOCK`, `HYPRLAND_INSTANCE_SIGNATURE` - five variables, because sway and i3
+  share a row), plus four more that a session bus or a display connection needs and that the same
+  section does not call decisive (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`,
+  `DISPLAY`). The four are the ones the section calls the signals "a compositor sets for its own
+  children"; the other four are what talking to that compositor requires, and the document cites
+  them as such rather than as detection signals. Without them the worker cannot tell a GNOME
+  session from a KDE one, and `[D 3 §Detecting the environment]` is explicit that `gsettings` being
+  on `PATH` is not a GNOME signal.
 - **stdout:** at most two lines. `downloaded: <digest> <abs path>` after the rename, and
   `set: <digest> <origin_key> <abs path>` after the setter returned success. The daemon parses the
   last non-empty line as the result and keeps the whole capture for the log
@@ -408,10 +412,14 @@ and the two ways to change the path (`socket` in the config, or `WHIRL_SOCKET`).
 The greeting is the version announcement and it is mandatory:
 
 ```
-<-- OK whirl <daemon-version> protocol <n>
+<-- OK whirl <semver> protocol <n>
 ```
 
-`n` is an integer. This document defines `n = 2`. A client may then send:
+`n` is an integer. This document defines `n = 2`. `<semver>` is the **bare** version, `0.1.0`: the
+product name appears exactly once, in the leading `whirl`, so the greeting is
+`OK whirl 0.1.0 protocol 2`. The two-token form `whirl 0.1.0` is what the `daemon_version` status
+key carries (2.10); it is never a token of the greeting, and a client can split the greeting on
+spaces and read the version from the third field. A client may then send:
 
 ```
 --> hello <n> [<client-name>/<client-version>]
@@ -479,6 +487,34 @@ new candidate rather than a silent dedupe miss `[D 6 §4.1]`. `[D 6 §4.1]`'s JS
 two `wallhaven` sources must not collide on a candidate they both returned and because the same
 section's prose calls it "the source-scoped candidate id". Recorded in 10.14.
 
+`prev` selects by walking the ring, and it mutates nothing. History is newest first (2.6 records the
+`entry:` form), and the selection rule is stated here so that a client can predict the second
+`prev`, which is the question the prototype's answer leaves open:
+
+1. find the newest history entry whose `digest` equals the current `anchor_digest`;
+2. walk older from there and stop at the first entry whose `digest` differs;
+3. if step 1 finds nothing (an `external` image, or a ring that has rolled past the anchor), start
+   from the newest entry and apply step 2;
+4. if no entry passes step 2, the answer is `ERR no_prev`.
+
+`prev` removes nothing and appends nothing: the ring a client read with `history` is the ring the
+next `prev` walks, so repeated `prev`s step one entry older each time, and `history_count` does not
+change. The set itself changes the anchor, its timestamp and `last_via: prev`. Recording a `prev`
+set as a history entry would put the walk inside the ring it walks, and the second `prev` would
+become a function of the first that no client can predict without knowing the implementation. Any
+rotation (`next`, `set path`, `set id`, a scheduled or startup rotation) appends an entry and
+therefore restarts the walk from the newest entry. A `prev` whose entry has no bytes left
+re-materialises it from the entry's `origin` before setting it, which is why the response carries
+`queued` and a `set:` line exactly as `next` does `[D 6 §6.1]`. The prototype's `pop_back`
+(`whd.rs:336`) is rejected, not adopted: 2.12.
+
+`pause` freezes the schedule and `resume` re-arms it from now. While `paused: 1`, no rotation starts
+and `next_at` is left where it is, so an hour of pause is not an hour of missed slots; `resume` sets
+`next_at = now + schedule.interval_seconds`, persists it before answering, and the next rotation is
+therefore one full interval away `[D 5 §F4]`, the rule the prototype already implements
+(`whd.rs:377`). While `paused: 1`, `status` prints `next_in_s: -` (2.10), because there is no live
+deadline to count down to. 5.5 rule 8 states both halves.
+
 Argument counts are exact: a verb given more or fewer arguments than its row allows is
 `ERR bad_args`. `set path` requires an absolute path (leading `/`, `~`, a drive letter, or a UNC
 `\\`); a relative path is `ERR bad_args` and is never resolved against the daemon's cwd, which is
@@ -513,10 +549,13 @@ client; `close` is a clean shutdown of one connection; `subscribe` is the fronte
 protocol verb exists only for the CLI, and no CLI verb needs a protocol verb of its own.
 
 `decision:` `whirl idle` is `subscribe` plus one event, not a server-side one-shot verb.
-`[D 5 §F10]` wants "block until state changes, so none of them polls", and a stream narrowed by the
-client to its first event satisfies that with one mechanism instead of two. Consequences worth
-stating: `whirl idle` prints one `event:` line and exits 0 when a change arrives; it has no 60 s
-timeout of its own, because heartbeats keep the subscribed connection alive (2.8), and a script that
+`[D 5 §1.1]`'s verb table wants "Block until state changes. For frontends, so none of them polls."
+(the `whirl idle` row), and a stream narrowed by the client to its first event satisfies that with
+one mechanism instead of two. `[D 5 §F10]` is the other half and is not this rule: F10 is `status`
+and `sources` introspection, and it is cited for the stability of the `status` key set (2.10), not
+for the no-polling rule. Consequences worth stating: `whirl idle` prints one `event:` line and exits
+0 when a change arrives; it has no 60 s timeout of its own, because heartbeats keep the subscribed
+connection alive (2.8), and a script that
 wants a bound wraps it in `timeout(1)`; and the prototype's `idle` timeout line, which `whctl watch`
 needed to keep its own loop alive, is gone with that loop `[M 13]`.
 
@@ -674,8 +713,8 @@ stream. It is a mode, not a verb with an answer:
 | `rotate_start` | `<run>` | a rotation began; `run` is the daemon's monotonic slot counter |
 | `rotate_ok` | `<digest> <origin_key> <via> <path>` | the wallpaper changed; `path` takes the rest of the line |
 | `rotate_failed` | `<code> <message>` | the rotation produced nothing; `code` is from 2.7 |
-| `paused` | - | the schedule is suspended, so no rotation will start |
-| `resumed` | - | the schedule is live again |
+| `paused` | - | the schedule is suspended, so no rotation will start, and `next_at` is frozen (5.5 rule 8) |
+| `resumed` | - | the schedule is live again, with `next_at` re-armed from now (2.5, 5.5 rule 8) |
 | `favorite_added` | `<digest> <origin_key>` | a pin was written |
 | `favorite_removed` | `<digest>` | a pin was removed |
 | `cache_swept` | `<removed> <reclaimed_bytes> <hidden>` | a sweep completed; `hidden` is how many entries were kept only because they are pinned `[D 6 §5.3]` |
@@ -694,7 +733,7 @@ are checked against them, and the third column below says where each name comes 
 
 | Key | Example | Name comes from | Meaning |
 |---|---|---|---|
-| `daemon_version` | `whirl 0.1.0` | prototype | the daemon's version, its own crate's |
+| `daemon_version` | `whirl 0.1.0` | prototype | the daemon's version as `<product> <semver>` on one line; the greeting carries the bare semver and the name once 2.4 |
 | `protocol` | `2` | prototype | the protocol version, the client's only compatibility check 2.1 |
 | `platform` | `macos` | here | `macos` \| `linux` \| `windows`; the client may branch on it |
 | `pid` | `4711` | prototype | the daemon's pid, so a script can check it is alive |
@@ -706,7 +745,7 @@ are checked against them, and the third column below says where each name comes 
 | `rotation_count` | `128` | prototype | rotations completed since the state file was created |
 | `interval_s` | `1800` | prototype | the effective `schedule.interval_seconds` |
 | `next_at` | `2026-09-25T08:11:12Z` | prototype | the persisted deadline, wall clock, RFC 3339 UTC 5.5 |
-| `next_in_s` | `1764` | `[D 6 §8.6]` | seconds until `next_at`, computed when the response is written 8.6 |
+| `next_in_s` | `1764` | `[D 6 §8.6]` | seconds until `next_at`, computed when the response is written 8.6; `-` while `paused: 1`, because a suspended schedule has no deadline to count down to 5.5 rule 8 |
 | `last_digest` | `d435840ce84fbb8d...` | prototype | content digest of the displayed image |
 | `last_origin_key` | `space:ab12cd` | prototype | where it came from 2.5 |
 | `last_via` | `source` | prototype | the closed `via` vocabulary of 2.6 |
@@ -719,7 +758,7 @@ are checked against them, and the third column below says where each name comes 
 | `display_mode_effective` | `all` | `features 1.3` | what the platform actually gets; features.md 1.3 names this key for the `per-display` fallback |
 | `display_mode_reason` | `-` | here | why, when they differ: `unverified_platform`, `impossible_on_this_desktop`, `out_of_scope_on_this_desktop`, `no_displays` 3.7 |
 | `anchor_digest` | `d435840ce84fbb8d...` | `[D 6 §9]` | what whirl believes is on screen; `-` before the first verified rotation 1.7.3 |
-| `anchor_path` | `sha256/3f/9c/d43...` | `[D 6 §9]` | the path the platform was given, `-` for a reference-mode set |
+| `anchor_path` | `sha256/d4/35/d43584...` | `[D 6 §9]` | the path the platform was given, `-` for a reference-mode set |
 | `anchor_verified` | `1` | here | 1 once a rotation's readback agreed with the set; 0 while unverified 1.7.3 |
 | `cache_dir` | `/Users/govind.rajpurohit/Library/Caches/whirl` | `[D 6 §9]` | which cache this daemon owns 3.1 |
 | `cache_root_id` | `9d1f0c2e-5b6a-4d7e-8f11-0c2b4a6d9e01` | `[D 6 §9]` | the cache root's identity file, so `status` can tell two daemons apart 3.1 |
@@ -728,9 +767,9 @@ are checked against them, and the third column below says where each name comes 
 | `cache_files_cap` | `500` | `[D 6 §9]` | `cache.max_files` (alias `keep`) |
 | `cache_bytes_cap` | `2147483648` | `[D 6 §9]` | `cache.max_bytes` |
 | `cache_over_cap` | `0` | `[D 6 §9]` | 1 after a sweep driven by contention rather than by a timer 5.2 |
-| `cache_over_reason` | `-` | `[D 6 §9]` | `pinned_over_cap`, `grace_over_cap` or `-` 5.2 |
+| `cache_over_reason` | `-` | `[D 6 §9]` | `single_file`, `pinned`, `sweep_error` or `favorites_degraded`, the four causes `[D 6 §5.4]` makes exhaustive, or `-` |
 | `cache_writable` | `1` | `[D 6 §9]` | 0 when the daemon has had to continue without a writable cache 8.4 |
-| `sweep_deferred` | `0` | `[D 6 §9]` | 1 when the cache root showed another user 5.2 |
+| `sweep_deferred` | `0` | `[D 6 §9]` | 1 when the sweep could not take the rotation lock because another holder had it, which is the only trigger `[D 6 §5.5]` step 1 gives this key; a sweep that ran and failed is a different fact and reports `cache_over_reason: sweep_error` instead |
 | `lock_mode` | `flock` | `[D 6 §9]` | `flock` \| `excl_file` \| `none`, reported because a weaker lock is a weaker guarantee 8.7 |
 | `state_dir` | `/Users/govind.ra...` | `[D 6 §9]` | where the state files are 1.1 |
 | `state_corrupt` | `-` | `[D 6 §9]` | the state file that failed to parse, if any 6.4 |
@@ -751,9 +790,12 @@ Legend for the third column: `[D 6 §9]` and `[D 6 §8.6]` name that key exactly
 Values are consistent across all three transcripts: every digest is a real `sha256` of the string it
 names (the `origin_key`, or the path for an external entry), computed when this document was built,
 so the fields are the right shape and length; the local origin key is `sha256` of the absolute path
-(2.5); and paths under `cache/sha256/` follow the two-level fan-out of `[D 6 §3]`. `-->` is the
-client, `<--` is the daemon. The status block in A is generated from the same list as the table in
-2.10, so the two cannot drift.
+(2.5); and paths under `cache/sha256/` follow the two-level fan-out of `[D 6 §3]`:
+`sha256/<first two hex characters of the digest>/<next two characters>/<digest>.<ext>`, so a file
+whose digest begins `d435840c` lives at `sha256/d4/35/<digest>.<ext>`. Every `sha256/` path in the
+three transcripts below recomputes that way from its own digest, and the two in transcript B start
+with `26`, so they read `sha256/26/b8/`. `-->` is the client, `<--` is the daemon. The status block
+in A is generated from the same list as the table in 2.10, so the two cannot drift.
 
 **A. A normal session: version negotiation, a rotation, pins, history, plan.**
 
@@ -796,7 +838,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- display_mode_effective: all
 <-- display_mode_reason: -
 <-- anchor_digest: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f
-<-- anchor_path: sha256/3f/9c/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
+<-- anchor_path: sha256/d4/35/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
 <-- anchor_verified: 1
 <-- cache_dir: /Users/govind.rajpurohit/Library/Caches/whirl
 <-- cache_root_id: 9d1f0c2e-5b6a-4d7e-8f11-0c2b4a6d9e01
@@ -823,7 +865,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- OK
 --> next
 <-- queued
-<-- set: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f space:ab12cd source sha256/3f/9c/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
+<-- set: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f space:ab12cd source sha256/d4/35/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
 <-- OK
 --> favorite
 <-- favorited: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f space:ab12cd
@@ -834,13 +876,13 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- OK
 --> history 3
 <-- count: 3
-<-- entry: 2026-09-25T07:41:12Z source wallhaven space:ab12cd d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f sha256/3f/9c/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
+<-- entry: 2026-09-25T07:41:12Z source wallhaven space:ab12cd d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f sha256/d4/35/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
 <-- entry: 2026-09-25T07:11:09Z source local pictures:401df7171a5e52d88b2f7f9e9d201308f9600e7034916d7865c883f33ec64dcd 3b29b61764d0a17238f7a51d2585eccf538171d638f210e810f4e8eab970387a /Users/govind.rajpurohit/Pictures/Wallpapers/valley.jpg
 <-- entry: 2026-09-25T06:58:02Z startup external external:d25a845d3a284ed719022916037cde61995e9d3c31b96253e87c0c2d3032e35d - /System/Library/Desktop Pictures/Mac Yellow.heic
 <-- OK
 --> favorites
 <-- count: 1
-<-- entry: 2026-09-25T07:42:01Z wallhaven space:ab12cd d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f present sha256/3f/9c/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
+<-- entry: 2026-09-25T07:42:01Z wallhaven space:ab12cd d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f present sha256/d4/35/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
 <-- OK
 --> unfavorite d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f
 <-- unfavorited: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f
@@ -858,7 +900,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- OK
 --> prev
 <-- queued
-<-- set: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f space:ab12cd prev sha256/3f/9c/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
+<-- set: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f space:ab12cd prev sha256/d4/35/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
 <-- OK
 --> pause
 <-- OK
@@ -895,9 +937,9 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
                                                         --> next
                                                         <-- queued
 <-- event: 184 rotate_start 4211
-                                                        <-- set: 26b885cbb8096ddac7173f80fcd852b783949d658bb8a9e19bda874bf1c31dc6 pictures:1cc438356245b4cc61935af265cf3e8efc90425c6eb03b05ac886666e1fe9724 source sha256/ab/12/26b885cbb8096ddac7173f80fcd852b783949d658bb8a9e19bda874bf1c31dc6.jpg
+                                                        <-- set: 26b885cbb8096ddac7173f80fcd852b783949d658bb8a9e19bda874bf1c31dc6 pictures:1cc438356245b4cc61935af265cf3e8efc90425c6eb03b05ac886666e1fe9724 source sha256/26/b8/26b885cbb8096ddac7173f80fcd852b783949d658bb8a9e19bda874bf1c31dc6.jpg
                                                         <-- OK
-<-- event: 185 rotate_ok 26b885cbb8096ddac7173f80fcd852b783949d658bb8a9e19bda874bf1c31dc6 pictures:1cc438356245b4cc61935af265cf3e8efc90425c6eb03b05ac886666e1fe9724 source sha256/ab/12/26b885cbb8096ddac7173f80fcd852b783949d658bb8a9e19bda874bf1c31dc6.jpg
+<-- event: 185 rotate_ok 26b885cbb8096ddac7173f80fcd852b783949d658bb8a9e19bda874bf1c31dc6 pictures:1cc438356245b4cc61935af265cf3e8efc90425c6eb03b05ac886666e1fe9724 source sha256/26/b8/26b885cbb8096ddac7173f80fcd852b783949d658bb8a9e19bda874bf1c31dc6.jpg
                                                         --> pause
                                                         <-- OK
 <-- event: 186 paused
@@ -942,7 +984,7 @@ Two connections, one rotation: the second is refused rather than queued.
 connection 1                                            connection 2
 --> next                                                --> next
 <-- queued                                              <-- ERR busy a rotation is in flight (run 4212)
-<-- set: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f space:ab12cd source sha256/3f/9c/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
+<-- set: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f space:ab12cd source sha256/d4/35/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
 <-- OK
 
 C2. A broken frame is fatal for that connection, and the `ERR` is the last line on it.
@@ -998,6 +1040,7 @@ was not carried over is on the right.
 | one-shot `idle`, blocks 60 s, returns on any change | `subscribe` stream, 30 s heartbeat, monotonic `seq` | a frontend needs events, not a 60 s poll loop; `[D 6 §7.3]` wants one notification per transition, not a wake per poll |
 | `-set <path>` | `set path <path>`, `set id <id>` | the daemon never guesses whether an argument is a path or an id; the guess lives in the CLI, where a wrong guess costs one exit code 3, not a wall of state |
 | `log` verb (last 15 lines) | dropped | `[D 5 §1.1]`'s verb set is closed and the log is a file for humans `[D 6 §7.2]`; a protocol verb no CLI verb maps to is surface with no owner |
+| `prev` pops the newest entry out of the ring (`whd.rs:336`) | `prev` walks the ring and mutates nothing 2.5 | the pop destroys the entry the user just rejected, and it is the ring it walks: `[D 6 §6.2]` keeps every set as an entry, and "step back" that silently deletes cannot be undone or predicted from `history` |
 | `status` reports `gen` | `status` reports `seq`, and `subscribe` carries the same number | the same counter, named for the thing a client actually compares |
 | exit codes 0, 1, 2 | 0, 1, 2 and 3 | 1 keeps exactly one meaning, "the daemon refused, and the `ERR` code says why"; a usage error is not a failure of the daemon `[M 13]` |
 | `remove_file(socket)` unconditionally at startup | connect-probe, unlink only on `ECONNREFUSED`/`ENOENT` | `[M 15]`: unlinking a live daemon's socket leaves the daemon running and unreachable, then lets a second daemon bind the freed path |
@@ -1044,7 +1087,7 @@ Three qualifications, all of them platform facts rather than design choices:
 | Read back the current image | yes, `desktopImageURLForScreen:` `[D 1 §3]` | yes, `GetWallpaper` per monitor `[D 2 §1]` | per environment, not for generic X11 `[D 5 §1.5]` |
 | Call cost | one call per screen, in-process, `NO` + `NSError` on failure `[D 1 §3]` | one out-of-process COM call per monitor, cheap at rotation frequency but not in a hot loop `[D 2 §1]` | one process spawn per call (`gsettings`, `plasma-apply-wallpaperimage`), or one IPC round trip (`swaymsg`, `hyprctl`) `[D 3 §The decisive column]` |
 | Slideshow / rotation built in | no | yes (OS slideshow, and mixing with it is undefined) `[D 2 §5]` | yes on KDE (`org.kde.slideshow`), and it owns the config key `[D 3 §KDE 2]` |
-| Distribution friction | Developer ID + notarisation for a distributable binary; ad-hoc signed binaries break under a sandbox entitlement `[D 1 §7]` | none beyond the `windows` crate's two feature flags for COM `[D 2 §1]` | none: package sizes for the helpers we do not ship are `swaybg` 15.3 KB package / 33.6 KB installed, `hyprpaper` 160.1 KB / 478.8 KB `[D 3 §The resident helper]` |
+| Distribution friction | Developer ID + notarisation for a distributable binary; ad-hoc signed binaries break under a sandbox entitlement `[D 1 §7]` | none beyond the `windows` crate's four Win32 feature flags, COM plus three more (`Win32_Foundation`, `Win32_System_Memory`, `Win32_UI_Shell`) `[D 2 §1]` | none: package sizes for the helpers we do not ship are `swaybg` 15.3 KB package / 33.6 KB installed, `hyprpaper` 160.1 KB / 478.8 KB `[D 3 §The resident helper]` |
 | Minimum version | macOS Sonoma 14.0 `[D 1 §3]` | Windows 8 / Server 2012 for `IDesktopWallpaper` `[D 2 §1]` | no single floor; the floor is per environment `[D 3 §The decisive column]` |
 
 ### 3.2 macOS, stated precisely
@@ -1072,10 +1115,16 @@ Consequences the architecture has to absorb:
   `System Events` loses the placement and needs the Automation TCC grant; the Finder path works
   and is what `[D 1 §4]` measured, but neither is the API, and the prototype's `/wh-commons.jpg`
   incident is a cwd bug that a relative path in an AppleScript string hides `[D 1 §4]`.
-- **A sandbox would break it, and whirl is not sandboxed.** The measured failure is an ad-hoc
-  signed binary with `com.apple.security.app-sandbox` unable to write the store `[D 1 §7]`.
-  Distribution is therefore Developer ID plus notarisation, and that is a v1.0 concern, not a
-  v0.1 one.
+- **A sandbox breaks the probe at launch, and whirl is not sandboxed.** What `[D 1 §7]` measured is
+  a trap before any of the probe's code ran: a binary carrying `com.apple.security.app-sandbox` and
+  signed ad-hoc dies with `Trace/BPT trap: 5` (exit 133), AMFI rejecting the ad-hoc signature
+  (`amfid: ... AppleMobileFileIntegrityError Code=-423`) and `AppSandbox` in `libsystem_secinit`
+  `[D 1 V9]`. The same binary without the entitlement runs and sets the wallpaper, so the trap is
+  the entitlement and not ad-hoc signing as such. The binary never reached a store write, so
+  "cannot write the store" is not what was measured; and the research's own caveat is the one to
+  carry, listed in 3.7: whether a *correctly signed* sandboxed build can call
+  `setDesktopImageURL` at all is **unverified** `[D 1 §7, §8]`. Distribution is therefore Developer
+  ID plus notarisation, and that is a v1.0 concern, not a v0.1 one.
 - **Focus is not integrated and will not be** `[D 1 §8]`.
 
 Cost: the LaunchAgent adds no process of its own; the floor is the daemon's 1.8 MB `[M 1]`.
@@ -1083,7 +1132,8 @@ Cost: the LaunchAgent adds no process of its own; the floor is the daemon's 1.8 
 ### 3.3 Windows, stated precisely
 
 `IDesktopWallpaper` is an out-of-process shell COM object (`CLSCTX_LOCAL_SERVER`), reached from the
-`windows` crate with two feature flags beyond COM `[D 2 §1]`. It sets per monitor, reports the
+`windows` crate with four Win32 feature flags, COM plus three more (`Win32_Foundation`,
+`Win32_System_Memory`, `Win32_UI_Shell`) `[D 2 §1]`. It sets per monitor, reports the
 current image per monitor, and can enable, disable and position the wallpaper. Three traps the
 architecture has to handle:
 
@@ -1541,6 +1591,14 @@ The rules, all of which follow from `[D 4 §Part 3 macOS]`'s wall-clock rule and
 7. **Logout stops it, on purpose.** A `LaunchAgent` stops at logout, an interactive-only task stops,
    and a `systemd --user` service stops without linger; none of the three wallpaper APIs works
    without a session, so this is the correct behaviour rather than a gap `[D 4 §Part 2]`.
+8. **A pause freezes the deadline, and a resume re-arms it from now.** While `paused: 1` no rotation
+   starts and `next_at` is not advanced, so a pause is not a pile of missed slots waiting at the end
+   of it. `resume` writes `next_at = now + interval` and persists it before answering, which is
+   `[D 5 §F4]`'s rule ("`resume` re-arms the next slot from now") and what the prototype already
+   implements (`whd.rs:377`). Rule 4's whole-interval advance does not apply here: the user asked
+   for a slot from now, not for the old grid to be honoured. The consequence a client can see:
+   `next_in_s` is `-` while `paused: 1` (2.10), because no deadline is running, and after `resume`
+   it is the full interval.
 
 ## 6. Security model
 
@@ -1630,7 +1688,7 @@ Every row is a complete answer: what the daemon does, and what the user sees. Th
 | 1 | **The daemon is not running when a client calls** | Nothing; it does not exist. The CLI does not start it `[D 5 §1.1]` | `whirl: cannot reach the daemon at <path>` on stderr, exit 2. If the socket file exists, the message adds `(stale socket; the daemon is not running)`. A stale socket is never unlinked by the client, only by the daemon after a connect probe `[M 15]` |
 | 2 | **The worker cannot set the wallpaper** | The failed candidate is counted, one further candidate from the same or the next source is tried within the same slot `[D 5 §1.4]`, the slot is consumed either way (5.5 rule 4), and the cache entry from the failed attempt stays until the next sweep | `ERR set_failed <platform message>` to the client, `last_error: set_failed`, and the previous wallpaper is still on screen. On macOS the message is the platform's own, e.g. `The file doesn't exist.` `[D 1 V5c]`; on KDE a non-empty DBus error is reported verbatim `[D 3 §KDE 1]` |
 | 3 | **No candidates** (empty folders, everything filtered out, every source disabled) | Every configured source is tried once for that slot; nothing is downloaded and nothing is set; the slot is consumed; no backoff timer is invented. `whirl config check` is the diagnostic, and it names the stage that removed the candidates `[D 5 §2.5]` | `ERR no_candidates no source produced an admissible image`, exit 1, `last_error: no_candidates`, and `source: ... reason=...` lines in `status` explaining which source was empty and why |
-| 4 | **Disk full** | The download dies at `enospc`, the part file is removed if the filesystem allows it at all, `cache_writable: 1` stays true, and the sweep is deferred rather than run (`sweep_deferred: 1`), because a sweep on a full disk reclaims nothing and can only fail | `ERR enospc <path>` once, exit 1. A state write that fails leaves the previous state file intact (temp + rename `[R5]`) and logs `state write failed: <errno>`; the daemon keeps running with the last good state rather than refusing to serve. Nothing is deleted to make room: the caps are not raised, and no user file outside the cache is touched |
+| 4 | **Disk full** | The download dies at `enospc`, the part file is removed if the filesystem allows it at all, and `cache_writable: 1` stays true. The sweep still runs, because deletions free space even on a full disk, and a sweep that cannot rewrite `index.json` reports `cache_over_reason: sweep_error` and retries at the next rotation `[D 6 §8.1]`. `sweep_deferred` is not this key: it has exactly one meaning, the rotation lock was already held by someone else `[D 6 §5.5]` step 1 | `ERR enospc <path>` once, exit 1. A state write that fails leaves the previous state file intact (temp + rename `[R5]`) and logs `state write failed: <errno>`; the daemon keeps running with the last good state rather than refusing to serve. If the sweep could not rewrite the index, `status` carries `cache_over_reason: sweep_error` until one succeeds, and `cache_over_cap` reports the overshoot. Nothing is deleted to make room: the caps are not raised, and no user file outside the cache is touched |
 | 5 | **Network down** | `wallhaven` sources fail at connect; local sources are still tried in the same slot, and if a local source wins, the rotation succeeds. If every source is network-dependent, the slot is consumed and the next one retries | `ERR offline` if nothing could be served, exit 1, `last_error: offline`. With a local source present: a normal successful rotation and `source: <id> wallhaven ... last=offline reason=connect: Network is unreachable` in `status` |
 | 6 | **A display is disconnected mid-rotation** | The worker enumerates displays at the start of the setter step and keys them by identity, not index: display UUID on macOS `[D 1 §2]`, device path string on Windows `[D 2 §1]`, output name on sway `[D 3 §The decisive column]`. A display that vanished between the fetch and the set fails that display's call and nothing else; the remaining displays are set; there is no index-based retry | `ERR set_failed` only if every display failed; otherwise a successful rotation whose `set:` line names the path, plus a per-display failure line in the log. A display connected later gets the image at the next rotation `[D 5 §1.3]` |
 | 7 | **The worker hangs** | 300 s deadline, `SIGTERM`, 5 s, `SIGKILL` (1.7.1); `rotate.lock` is released by the kernel on exit `[D 6 §7.2]`; the slot is consumed | `ERR timeout`, exit 1, `last_error: worker_timeout`, and the daemon is still answering `status` while all of this happens |
@@ -1641,6 +1699,7 @@ Every row is a complete answer: what the daemon does, and what the user sees. Th
 | 12 | **Two clients ask for a rotation at once** | The first takes the slot; the second gets `ERR busy` immediately (1.8). Nothing is queued | `whirl next` prints `whirl: busy: a rotation is already in flight` and exits 1; the first client's rotation completes normally |
 | 13 | **The config is invalid** | At startup, a refusal to start naming the key `[D 6 §8.7]`. On re-read, the previous config stays in force, the failure is logged, and the daemon keeps rotating | `status` shows the old values; the log has `<key>: <value> is out of range`; `whirl config check` prints the same and exits 1 |
 | 14 | **`per-display` is not reachable on this platform** | Honoured where the research found a documented per-display setter (Windows), accepted and run as `all` where the answer is unverified (macOS, and sway and generic X11 honour it per output and per `--output`), refused at `config check` where it is impossible (GNOME) or out of scope (KDE) `[D 5 §1.3]`, `[D 2 §1]`, `[D 1 §2]`, `[D 3 §GNOME 2]`, `[D 3 §KDE 2]` | `status` shows `display_mode`, `display_mode_effective` and `display_mode_reason`: `unverified_platform` on macOS, `impossible_on_this_desktop` on GNOME, `out_of_scope_on_this_desktop` on KDE; `whirl config check` prints the same reason and exits 1 on the two that are refusals |
+| 15 | **Windows, with per-virtual-desktop wallpapers active** | Nothing it can detect, and nothing it can query. `IDesktopWallpaper` does not model virtual desktops, and Windows treats per-desktop background mode and per-monitor wallpaper mode as mutually exclusive, so a set made while the user has several desktops open either lands on the desktop that is active at that moment or is silently reverted by the shell. The call returns success and the readback agrees for the desktop the daemon can see, so there is no `ERR`, no `last_error` and no `anchor_verified: 0`; the rotation is logged as an ordinary success `[D 2 §3]`, whose sources are [19], [30] and [35] (the [35] report is an open proposal, cited there only as corroboration of the shape, not as proven behaviour) | The new image appears on the desktop the user is on when the rotation runs; after switching desktops the previous image is back, or the change reverts on its own, with no error anywhere: `whirl next` exits 0, `status` shows `last_error: -`, and the log has nothing to say. `whirl config check` cannot warn either, because the mode lives in the shell and not in the config. v0.1 cannot detect it and does not pretend to; the check that would settle it is `[D 2 §3]`'s "switch between desktops" step on a real Windows machine |
 
 ## 8. Frontend contract
 
@@ -1692,8 +1751,9 @@ source, and so that the daemon can be changed without breaking them.
 8. **Assume any identifier is unique across sources.** A source's `id` is unique in the config, and
    `origin_key` is unique within a source; the unit that is stable across everything is the content
    `digest` `[D 6 §4.3]`.
-9. **Poll.** `subscribe` exists so that nothing polls `[D 5 §F10]`; a 1-second poll loop from a
-   frontend is the thing this protocol was designed to avoid.
+9. **Poll.** `subscribe` exists so that nothing polls: `[D 5 §1.1]`'s `whirl idle` row is the rule
+   ("Block until state changes. For frontends, so none of them polls.") and a 1-second poll loop from
+   a frontend is the thing this protocol was designed to avoid.
 
 ## 9. Rules for the resident process
 
@@ -1740,27 +1800,42 @@ answers in one round trip.
 ## 10. Where this document diverges from, or narrowly reads, the specs
 
 The card's rule: if I disagree with a spec, say so here and flag it in the handoff rather than
-diverging silently. Each row quotes the sentence it disagrees with.
+diverging silently. Each row quotes the sentence it disagrees with. **This section is re-based
+against the current spec text.** Rows 10.1, 10.2 and 10.3 are marked `resolved by 0382364` rather
+than deleted: the round-1 spec fixes ("docs: fix the four defects from the research and spec
+review", `0382364`) rewrote the sentences those rows quoted, so the disagreements are gone, and a
+resolved row quotes the sentence that settled it so a reader who saw the earlier draft can check
+that the disagreement really closed. Every quote below was checked by substring search against
+`docs/spec/features.md` and `docs/spec/state-and-cache.md` when this revision was written, and 10.8's
+quote was corrected rather than re-framed: it was a mis-transcription, not a resolved row.
 
-**10.1 macOS per-Space setting.** `docs/spec/features.md` §1.3 says: *"The spike reports per-Space
-setting on macOS via `NSWorkspace.setDesktopImageURL` with the `allSpaces` option."* Falsified by
-`docs/research/macos.md` §2 and its [V3] row: with and without the option exactly the same two
-nodes are written, the option is undocumented and inert, and the write lands on the live Space. The
-architecture follows the research (3.2, 3.6), and the sentence should be struck from features.md
-rather than softened.
+**10.1 macOS per-Space setting. Resolved by 0382364.** This row used to quote features.md §1.3 as
+saying "The spike reports per-Space setting on macOS via `NSWorkspace.setDesktopImageURL` with the
+`allSpaces` option", and asked for that sentence to be struck from the spec. The fix did more than
+strike it: the paragraph states what `docs/research/macos.md` §2 and §3 measured, in the research's
+own terms, including "with and without the undocumented `allSpaces` option the same two `Index.plist`
+nodes are written, the write lands on the Space that is frontmost at that moment, and no parameter in
+the public API names a Space". It also fixes the option's status rather than softening it:
+"`allSpaces` is undocumented" and inert, and must not be used. The architecture follows the research
+in 3.2 and 3.6, and there is nothing left to disagree with.
 
-**10.2 "one call on macOS".** features.md §1.3 says: *"`"all"` is the default because it needs one
-call on macOS and Windows."* On macOS it is one call **per screen** `[D 1 §3]`, and the reach is one
-Space, not all of them. The Windows half of the same paragraph is right about the conclusion
-(no per-virtual-desktop API, one image everywhere) but names the wrong API: `SystemParametersInfoW`
-is the single-image path, and `IDesktopWallpaper` is the interface that does per-monitor
-`[D 2 §1, §3]`. Corrected in 3.1 and 3.3.
+**10.2 "one call on macOS". Resolved by 0382364.** This row used to quote features.md §1.3 as saying
+`"all"` "is the default because it needs one call on macOS and Windows". The replacement sentence
+drops both the call count and the platform claim: `"all"` "is the default because it is reachable
+from a short-lived worker on every platform the spike touched", and the paragraph below it gives the
+per-platform reach in three bullets (macOS: the frontmost Space only, `allSpaces` inert; Windows:
+`SystemParametersInfoW` for one image everywhere and no per-virtual-desktop wallpaper API; Linux: per
+environment). That is the reading 3.1, 3.3 and 3.4 implement, and it now names the API the
+architecture uses: the old misattribution is gone, because the same section names
+`IDesktopWallpaper` for per-monitor, as `[D 2 §1, §3]` does.
 
-**10.3 The research is no longer "in flight".** features.md §1.3's assumption block says the four
-research cards *"are in flight and have produced no output yet"*. All four documents exist and this
-card is their consumer `[D 1]`-`[D 4]`. Consequence: the spec's "on a platform where the research
-has not answered yet" fallback now has answers per platform, which 3.1, 3.7 and 7.14 apply instead
-of treating every platform as unanswered.
+**10.3 The research is no longer "in flight". Resolved by 0382364.** This row used to quote
+features.md §1.3's assumption block as saying the four research cards "are in flight and have
+produced no output yet". The block now says the question "is now answered by the four research notes,
+which landed after the first draft of this spec", gives the per-platform answer, and keeps the old
+board query explicitly as history rather than as a current claim. Consequence, which 3.1, 3.7 and
+7.14 apply: the spec's "on a platform where the research has not answered yet" fallback has answers
+per platform now, so it is the safety net rather than the expected path.
 
 **10.4 "fully commented when generated" (F1) in JSON.** JSON has no comment syntax. Resolved with
 the `_` key convention (4.1), not with a second file and not with a non-standard dialect: the file
@@ -1774,13 +1849,15 @@ lever if it must be sooner.
 
 **10.6 The config validation split.** `docs/spec/state-and-cache.md` §8.7 says: *"`config.json`
 parses but fails `whirl config check`: a value out of range, or an ordering rule ... The daemon does
-not start either."* `docs/spec/features.md` §2.0 says: *"the daemon parses only the top-level
-scalars it needs ... the sources array is interpreted only by the worker."* Those two cannot both
-hold for a source with an unknown `kind`. 4.3 splits it: structural source facts are the daemon's
-and refuse startup, semantic and environmental ones are the worker's and disable one source. This
-narrows 2.0's "only the scalars it needs" to mean the daemon does not interpret sources for
-selection, while still validating their shape, because 8.7's requirement that `config check` and
-startup agree is the one that keeps a config from being legal on demand and illegal at boot.
+not start either, and the message names the failing key and both values."* `docs/spec/features.md`
+§2.0 says: *"The daemon parses only the top-level scalars it needs"*, and its validation policy says
+*"an unknown field is a warning; an unknown `kind` or a missing required field is an error naming the
+known kinds and the offending source `id`"*. Those cannot all hold unless the daemon knows the source
+kinds and their required fields. 4.3 splits it: structural source facts are the daemon's and refuse
+startup, semantic and environmental ones are the worker's and disable one source. This narrows 2.0's
+"only the scalars it needs" to mean the daemon does not interpret sources for selection, while still
+validating their shape, because 8.7's requirement that `config check` and startup agree is the one
+that keeps a config from being legal on demand and illegal at boot.
 
 **10.7 The prototype README's macOS claims.** `prototype/README.md`'s "Corrected by later research"
 section already retracts the `allSpaces` and AppleScript claims, and this document cites the research
@@ -1791,16 +1868,24 @@ an HTTP control surface, `/status` fields `inproc` and `goroutines`) is not comm
 states the caveat and what would settle it.
 
 **10.8 The double wake.** `prototype/README.md` calls the duplicate `idle` notification *"Cosmetic,
-unfixed here."* `docs/spec/state-and-cache.md` §7.3 step 5 requires *"one notification, and only
-once"*. The spec wins: 2.9 defines one event per state transition, and the `rotating` key covers the
-intermediate state for a client that wants it.
+unfixed here."* (that line is still there). This row used to quote
+`docs/spec/state-and-cache.md` §7.3 step 5 as requiring *"one notification, and only once"*; that
+sentence was never in the document. What step 5 does say is *"The daemon notifies `idle` subscribers
+once, and only once."*, and then, about the prototype's wart, *"with R2 in force there is one state
+transition, so there is one notification"*. So the spec already agrees with this document, and the
+only disagreement left is with the prototype: 2.9 defines one event per state transition, and the
+`rotating` key covers the intermediate state for a client that wants it. Corrected here, not in the
+spec.
 
-**10.9 `whirl idle` has no protocol verb of its own.** `features.md` F10 requires *"Block until state
-changes. For frontends, so none of them polls."* Met by `subscribe` plus a client-side first-event
-exit (2.5.1), which also drops the prototype's 60 s timeout line and `whctl watch`'s 200-iteration
-cap with it. The requirement stands; the mechanism is one verb shorter.
+**10.9 `whirl idle` has no protocol verb of its own.** `features.md` §1.1's verb table, the
+`whirl idle` row, requires *"Block until state changes. For frontends, so none of them polls."* (The
+requirement is not in F10: that row is `status` and `sources` introspection, cited in 2.10 for the
+stability of the key set.) Met by `subscribe` plus a client-side first-event exit (2.5.1), which also
+drops the prototype's 60 s timeout line and `whctl watch`'s 200-iteration cap with it. The
+requirement stands; the mechanism is one verb shorter.
 
-**10.10 A charset for source ids.** features.md §2.1 says only "stable name". 2.2 adds
+**10.10 A charset for source ids.** features.md §2.1 says only "Stable name for status, history and
+error messages." 2.2 adds
 `[A-Za-z0-9._:-]+` and a 64-byte bound, because an `id` is a non-final field in the `source:` and
 `entry:` records and a space in it would make the framing ambiguous.
 
@@ -1821,7 +1906,12 @@ never-advance-on-failure path `[M 17]`.
 **10.13 No other unresolved conflicts.** I checked the two spots where `docs/spec/state-and-cache.md`
 §9 records a reconciliation with `features.md` (the dedupe window decoupled from the history ring,
 and the config aliases): both are consistent as written and this document adopts them without
-comment.
+comment. One narrow reading is named here rather than hidden, because it is the kind of thing an
+implementer would otherwise discover by surprise: §6.2 lists `prev` among the `via` values a history
+entry can carry, and 2.5 has a `prev` set write no history entry at all, so that value appears in the
+`set:` response and in `last_via` (2.10) and never in `history`. The spec is not contradicted, a
+value it permits is simply not produced, and 2.5 gives the reason (a walk that appends to the ring it
+walks cannot be predicted twice). This is the same shape as 10.6's narrowing.
 
 **10.14 The `origin_key` prefix.** `docs/spec/state-and-cache.md` §4.1's JSON example writes
 `"origin_key": "wallhaven:ab12cd"`, prefixing the source *kind*; 2.5 uses the source `id`
@@ -1874,6 +1964,7 @@ directory.
 | `[L 8]` | `command -v whirl whirld whirl-worker` | none of the three names exists in `PATH` on this machine |
 | `[L 9]` | the mechanical check described in 2.11: every verb defined in 2.5 and 2.9 appears in a transcript, and every verb in a transcript is defined | all 19 verbs defined in 2.5 and 2.9 appear in transcripts A, B or C; the only verb-shaped tokens in those transcripts that are not defined are the two deliberate error cases in C (frobnicate, status\0); nothing defined is left unexercised |
 | `[L 10]` | scanned the finished document for em dashes and typographic quotes, which this repo's docs do not use | em dash: 0; en dash: 0; typographic double quote: 0; typographic single quote: 0 (none present) |
+| `[L 11]` | the checks this revision (`fix the ten review defects`) ran with `python3` against the edited files, in the task's scratch directory: every `sha256/xx/yy/<digest>.<ext>` path in this document tested against its own digest, every sentence section 10 quotes tested as a whitespace-normalized substring of the document it is attributed to, the four sentences section 10 says were removed or mis-transcribed tested for absence, the ten defects each re-tested as a positive assertion on the new text, and the dash/typographic scan of `[L 10]` re-run on this file and on `docs/development.md` | 8 of 8 cache paths recompute (`xx` is the digest's first two characters, `yy` the next two); 14 of 14 quoted sentences exist where they are attributed and the 4 removed or mis-transcribed ones are gone; 61 of 61 defect assertions hold, 0 failures; em dash 0, en dash 0, typographic quotes 0 in both files |
 
 ## 12. Checklist for the reviewer
 
