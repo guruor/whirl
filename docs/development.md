@@ -17,6 +17,7 @@ decision.
 | `docs/`, `prototype/` | exist |
 | the Cargo workspace (`crates/`) | exists on pull request #1: `whirl-core`, `whirld`, `whirl-cli`, `whirl-worker`, four members and no third-party dependency |
 | `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36126085459`, twelve jobs |
+| `.github/workflows/release.yml` | written here, lints clean, and **has run**: a throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag |
 | a running daemon reachable from a checkout | yes: the section 7 sequence below, driven from a fresh clone of pull request #1 on a scratch socket, no wallpaper touched |
 | anything that sets a real wallpaper in CI | never, by design (see "What CI cannot prove") |
 
@@ -332,7 +333,7 @@ them (the pull request's base commit and `github.sha`); it passes them in throug
 `env:`, never as script text, and the script refuses any value that is not hex
 before it is used as a range.
 
-### What has and has not been verified about the workflow
+### What has and has not been verified about the workflows
 
 - **Verified on this machine:** `actionlint` (1.7.11) reports no problems for this
   file and for `.github/workflows/release.yml`, and a real YAML parse finds 7 jobs
@@ -361,6 +362,34 @@ before it is used as a range.
   scanned`, `no leaks found`. The probe commit was dropped from the branch rather
   than reverted, because a revert leaves the commit that adds the value inside the
   scanned range and the job stays red (section 6, `Secrets`).
+- **The release workflow was made to publish, and to clean up after itself, before
+  it was trusted.** A throwaway prerelease tag `v0.0.1-rc.test` at commit
+  `86d90319b4bb`: run `36140056903`, four jobs green (`build` on `ubuntu-latest`,
+  `macos-latest` and `windows-latest`, then `release`). `gh release view
+  v0.0.1-rc.test` reported `prerelease: true` and three assets; the linux archive
+  was downloaded *from the release*, and it holds `./whirld`, `./whirl` and
+  `./whirl-worker`, ELF 64-bit x86-64 binaries. The release and the tag were then
+  deleted, and both are verified gone: `gh release view v0.0.1-rc.test` fails with
+  `release not found`, `gh release list` is empty and `git ls-remote --tags origin`
+  prints nothing. Two things about that proof are stated rather than implied: the
+  tag was pushed at the commit that carries the workflow, on the card's branch,
+  because the workflow reaches `main` only through the promotion that card opens,
+  and a tag on `main` today would run nothing; and the rendered notes carry the
+  template's "on `main`" line, which a tag at a branch head does not satisfy, which
+  is a second reason the throwaway tag was deleted rather than kept.
+- **The release notes gate was exercised outside CI, against the step's own
+  python,** in six cases before the tag was pushed: a prerelease with no notes file
+  (renders the template and publishes), a prerelease whose template is missing a
+  required section (fails), a final release with no notes file (fails), a final
+  release with a filled notes file (publishes), a final release with a placeholder
+  left (fails, naming it), and a tag that is not release-shaped (fails). The probe,
+  its output and the case list are in the card's handoff note.
+- **One annotation on both runs, recorded because it is not a failure:** `Node.js
+  20 is deprecated. The following actions target Node.js 20 but are being forced to
+  run on Node.js 24: actions/checkout@11d5960a, actions/upload-artifact@ea165f8d`.
+  `ci.yml` uses `actions/checkout@v4`, which resolves to the same commit today, so
+  the annotation is not new to the release workflow. The pins move to v5 by a
+  deliberate pull request when the v4 line stops running (the table below).
 
 ### What rots, and where the single copy of it lives
 
