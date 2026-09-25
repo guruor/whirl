@@ -1,0 +1,23 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Go (prototype only)
+*.test
+prototype/**/dist/
+prototype/**/wh-rotate
+prototype/**/*.log
+
+# local state and caches produced by any prototype run
+prototype/**/wh-cache/
+prototype/**/state/
+prototype/**/wallpaper_downloads/
+
+# macOS
+.DS_Store
+
+# editors
+.idea/
+.vscode/
+*.swp
