@@ -43,7 +43,7 @@ Serialises a `cache/index.json` in the shape of section 2.1 with 500 synthetic
 entries. Observed: 170 607 bytes compact, 220 135 bytes indented, 341 bytes per
 entry.
 
-## `size_stats.py` (evidence `[L 6]`)
+## `size_stats.py` (evidence `[L 6]`, `[L 8]`, `[L 9]`)
 
 ```sh
 curl -sS -A "whirl-spec-probe" \
@@ -57,8 +57,18 @@ python3 size_stats.py p1.json p2.json
 
 Reads `file_size` out of the saved responses and prints the distribution. The
 endpoint is the one `docs/spec/features.md` 2.3 specifies, and no API key is
-needed for `purity=100`. Observed over 48 images: 0.05 MB minimum, 2.25 MB
-median, 20.34 MB maximum, 3.83 MB mean, and a per-file spread of 378x.
+needed for `purity=100`. `sorting=random` returns a different 48 images on every
+request, so this probe is not reproducible by construction and every run is a
+sample rather than a re-measurement. Three draws are recorded, all 48 images:
+
+| Draw | Source | Min | Median | Max | Mean | Spread |
+|---|---|---|---|---|---|---|
+| 1 (`[L 6]`) | the original run for this document | 0.05 MB | 2.25 MB | 20.34 MB | 3.83 MB | 378x |
+| 2 (`[L 8]`) | re-run while applying review round 1 | 0.19 MB | 2.11 MB | 16.03 MB | 3.23 MB | 82x |
+| 3 (`[L 9]`) | re-drawn by the round-1 reviewer | 0.23 MB | 2.59 MB | 14.02 MB | 2.90 MB | 60x |
+
+The conclusion the document draws from them rests on the tightest draw, not the
+widest: even 60x leaves a count-only cap of 40 spanning roughly 9 MB to 560 MB.
 
 A User-Agent is sent because the API is a public service; do not hammer it. Two
 pages is the whole sample this document needs, and the card's own default

@@ -1,6 +1,13 @@
 # whirl: state, cache layout, and eviction
 
-Status: draft for review. Specification only, no production code.
+Status: draft, review round 2. Specification only, no production code. Round 1's
+two blocking defects are fixed: the INV-CACHE-2 check is now stated on a config
+that 5.1 declares legal and that a daemon will actually start with (5.4), and the
+degraded-favorites case is now named as a fourth permitted overshoot cause with
+the sweep's behaviour spelled out instead of a hidden exemption (5.3, 5.5, 6.4,
+8.7). Round 1's non-blocking caveats are also applied: the byte-cap sample is
+reported as three draws rather than one (5.1, [L 6], [L 8], [L 9]), and three
+citation imprecisions and one wrong section number are corrected.
 
 This document fixes where whirl keeps its files, what each file contains, what
 gets deleted and when, and which process is allowed to write what. It is written
@@ -56,7 +63,7 @@ not go in `Caches`. The XDG spec says the same thing in different words:
 `$XDG_STATE_HOME` "contains state data that should persist between (application)
 restarts, but that is not important or portable enough to the user that it
 should be stored in `$XDG_DATA_HOME`", and it names "actions history (logs,
-history, recently used files)" as its content [3]. On Windows the same split
+history, recently used files, …)" as its content [3]. On Windows the same split
 exists in the folder set itself: `FOLDERID_RoamingAppData` (display name
 "Roaming", default `%APPDATA% (%USERPROFILE%\AppData\Roaming)`) against
 `FOLDERID_LocalAppData` (display name "Local", default `%LOCALAPPDATA%
@@ -112,7 +119,8 @@ problem can delete logs without wondering whether they were state.
   tmpfs that the session cleans up. If it is unset, the socket falls back to
   `$XDG_STATE_HOME/whirl/whirl.sock`.
 - `decision:` the log lives under `$XDG_STATE_HOME`, which the spec explicitly
-  lists as a home for "actions history (logs, history, recently used files)" [3].
+  lists as a home for "actions history (logs, history, recently used files, …)"
+  [3].
   XDG has no log directory, and inventing one would be worse than using the
   documented one.
 - `assumption:` whirl does not write anything into `~/.config/dconf/user`, which
@@ -133,8 +141,11 @@ problem can delete logs without wondering whether they were state.
 
 - `decision:` the config is the only thing in the roaming folder, and it is
   small. History, favorites and the cache are local. The reason is the folder
-  names: the roaming folder "roams with the user" [6] and the local one is the
-  "data repository for local (nonroaming) applications" [6]. History, favorites
+  names: the roaming folder is Microsoft's "common repository for
+  application-specific data" [6] and is the one whose contents are documented as
+  roaming ("it will roam with the user", said on the same page of another CSIDL,
+  `CSIDL_ADMINTOOLS`), while the local one is the "data repository for local
+  (nonroaming) applications" [6]. History, favorites
   and the cache all reference this machine's absolute paths and this machine's
   cache bytes, so roaming them would sync a set of broken references and move
   megabytes across the profile for nothing. That is an inference from the folder
@@ -354,7 +365,7 @@ failure path; `-set` no longer downloads at all, so it has nothing to prune.
 | Candidate identity | What it gets right | What it gets wrong | Verdict |
 |---|---|---|---|
 | Content hash (SHA-256 of the stored bytes) | Filename is identity; dedupe is a `stat`; the name verifies the bytes; a re-materialised file returns to a stable path, so pins survive | Costs a hash pass; two byte-identical images from different sources collapse, which is the point but must be a stated decision | **Chosen** as the primary identity |
-| Source-scoped ID (Wallhaven `id`, Wikimedia pageid, local path) | Free: the source already returned it; a cheap pre-download filter | Names are not identity: the same image from two sources has two ids and lands twice; a `local` id built from a filename (as `main.go:246` does) changes under a rename | **Kept as a secondary key**, `origin_key`, for the pre-download window check only |
+| Source-scoped ID (Wallhaven `id`, Wikimedia pageid, local path) | Free: the source already returned it; a cheap pre-download filter | Names are not identity: the same image from two sources has two ids and lands twice; a `local` id built from a filename (as `main.go:246-247` does) changes under a rename | **Kept as a secondary key**, `origin_key`, for the pre-download window check only |
 | Canonical URL | Free; human readable; it is what a re-download needs | Same URL can serve different bytes (re-encode, a `?cb=` query), and different URLs serve identical bytes (mirrors, thumbnails, a local copy of something downloaded earlier) | **Kept as the re-materialisation hint only**, field `origin`, never as identity |
 
 `decision:` because the two secondary keys are kept, the pipeline has both a
@@ -416,15 +427,21 @@ means "dedupe by hash" is precisely "dedupe by hash for bytes whirl stores".
 - Only a count cap, which is what the prototype ships (`keep: 40`): the disk
   total is unknown until the images arrive.
 
-`evidence:` a count cap does not bound bytes, measured rather than asserted. Two
-pages of a real Wallhaven search at the spec's own admission floor
-(`atleast=2560x1440`, `ratios=16x9`, `purity=100`, 48 images, [L 6]) gave a
-per-file spread of 378x: 0.05 MB minimum, 2.25 MB median, 9.57 MB at p90, 20.34
-MB maximum. That makes a count cap of 40 files somewhere between 2.2 MB and 813.6
-MB, and the prototype's `keep: 40` a number with a factor-of-370 uncertainty
-attached. At the sample mean of 3.83 MB, 500 files is 1.9 GB, which is why the
-two defaults sit where they do: they bind at roughly the same working set, so a
-user who accepts the default sees one bound, not two.
+`evidence:` a count cap does not bound bytes, measured rather than asserted. The
+rows below are single `sorting=random` draws of two pages of a real Wallhaven
+search at the spec's own admission floor (`atleast=2560x1440`, `ratios=16x9`,
+`purity=100`), so they are samples and not a reproducible distribution: the same
+query returns a different 48 images every time, and this document reports each
+draw for what it is. Three independent draws of 48 images each ([L 6], [L 8],
+[L 9]) gave per-file minimums of 0.05 / 0.19 / 0.23 MB, medians of 2.25 / 2.11 /
+2.59 MB, maxima of 20.34 / 16.03 / 14.02 MB, means of 3.83 / 3.23 / 2.90 MB, and
+per-file spreads of 378x / 82x / 60x. The number that matters is the tightest
+draw, not the widest: a count cap of 40 files spans 9.2 MB to 560.8 MB on draw 3,
+7.8 MB to 641.3 MB on draw 2, and 2.2 MB to 813.6 MB on draw 1, so the
+prototype's `keep: 40` carries a factor-of-60 uncertainty at best. At the three
+sample means, 500 files is 1.9 / 1.6 / 1.45 GB, which is why the two defaults sit
+where they do: they bind at roughly the same working set, so a user who accepts
+the default sees one bound, not two.
 
 `decision:` the caps are ordered against the admission cap that already exists in
 features.md 2.5 (`filters.max_bytes`, default 40 MB): `whirl config check` fails
@@ -439,10 +456,13 @@ Three cases, and each has one answer:
 1. Larger than `filters.max_bytes` (40 MB default): rejected before the download
    where the source gave a size, and mid-stream where it did not (section 3, step
    4). It never enters the cache, so the question does not arise.
-2. Larger than `cache.max_bytes`: only reachable by lowering `cache.max_bytes`
-   below `filters.max_bytes` after the fact, or by the user dropping a file into
-   the cache. The sweep keeps it (it cannot be evicted without violating
-   INV-CACHE-2 if it is the anchor) and reports the overshoot. See 5.3.
+2. Larger than `cache.max_bytes`: not reachable by a download, because 5.1
+   requires `cache.max_bytes >= filters.max_bytes` (a config that breaks the
+   ordering does not start, 8.7), and the admission filter already rejects
+   anything above `filters.max_bytes`. It is reachable only by a file the user or
+   another tool drops into the cache directory by hand. The sweep keeps it if it
+   is protected (it cannot be evicted without violating INV-CACHE-2 when it is
+   the anchor) and reports the overshoot; see 5.3.
 3. Equal to the cap: it fits. It is admitted, and it evicts everything else,
    which is the correct reading of "the cap is the cap".
 
@@ -458,8 +478,20 @@ Three cases, and each has one answer:
   file created within `cache.grace_seconds` (default 600) in case a second
   process, such as a hand-run worker, is between rename and report.
 
-Protection is absolute, and it outranks the caps. If the protected set alone
-exceeds both caps, whirl deletes nothing and reports it:
+`decision:` while `favorites_degraded: 1` (6.4), the protected set is the whole
+cache. The daemon has quarantined an unreadable `favorites.json`, so it cannot
+know which files are pinned, and any file under `sha256/` could be the file
+behind a pin. Nothing under `sha256/` is removed for as long as the state lasts;
+`tmp/` is still cleaned, because a part file is never a pin. The cost is stated:
+while degraded the cache can only grow, and the status line reports
+`cache_over_reason: favorites_degraded` rather than a bound that is not being
+enforced. That is the same trade 8.5 makes in the harder case, and 6.4 records
+why the two cases land differently.
+
+Protection is absolute, and it outranks the caps: the sweep removes unprotected
+entries until both caps are satisfied or there are none left, and if the
+protected set alone exceeds a cap it removes nothing further (the `pinned` cause
+in 5.4) and reports the overshoot rather than hiding it:
 
 ```text
 cache_bytes: 3221225472
@@ -507,10 +539,14 @@ the unprotected cache is at or under both caps. Formally: let `U` be the cache
 files minus the protected set (5.3). Then `sum(bytes of U) <= cache.max_bytes`
 and `|U| <= cache.max_files`, unless `whirl status` reports
 `cache_over_cap:` with a non-zero value, in which case the surplus is
-attributable to one of exactly three causes, each of which the status line names:
+attributable to one of exactly four causes, each of which the status line names:
 a single file larger than `cache.max_bytes` (`cache_over_reason: single_file`),
-the protected set itself (`cache_over_reason: pinned`), or a sweep that failed
-(`cache_over_reason: sweep_error`, with the error in the log).
+the protected set itself (`cache_over_reason: pinned`), a sweep that failed
+(`cache_over_reason: sweep_error`, with the error in the log), or a quarantined
+`favorites.json` whose pin set the daemon cannot read, which makes the whole
+cache protected (`cache_over_reason: favorites_degraded`, 5.3, 6.4). Those four
+are exhaustive: a sweep that cannot run, or a pin set that cannot be read, is
+reported as one of them rather than silently exempted.
 
 Check: read `cache_dir:` from `whirl status`, then
 `du -sk "$CACHE/sha256"` against `cache.max_bytes`, and
@@ -522,22 +558,49 @@ modified by whirl for as long as it is the anchor. This holds across cap
 changes, cache clears (which must restore it, section 8.2), and rotations that
 happen to pick the same image again.
 
-Check, the adversarial form: set `cache.max_bytes` to 1 and `cache.max_files` to
-1, force a rotation with `whirl next`, and confirm that (a) the image on screen
-is unchanged, (b) the anchor's file is still present, (c) `whirl status` reports
-`cache_over_cap` rather than pretending the cache is within budget.
+Check, the adversarial form, on a config that is legal under 5.1: leave
+`cache.max_bytes` at its default and set `cache.max_files` to 1, so the ordering
+rule (`cache.max_bytes >= filters.max_bytes`) still holds and the daemon starts.
+
+1. Run `whirl next` once. Record `anchor_path` and `anchor_digest` from
+   `whirl status`, then pin that image with `whirl favorite`, so it is protected
+   by two independent rules.
+2. Run `whirl next` again. The cache now holds two protected files (the pin and
+   the new anchor) against a count cap of 1, and the sweep runs at the end of
+   that rotation.
+3. Confirm that (a) the image on screen is the second one, (b) the file recorded
+   in step 1 is still present and still matches its digest, and `whirl favorites`
+   still lists it, (c) the current `anchor_path` exists and still matches
+   `anchor_digest`, and (d) `whirl status` reports `cache_over_cap` with
+   `cache_over_reason: pinned` rather than pretending the cache is within budget.
+4. Run `whirl next` once more. The unprotected file (the second image) must now
+   be evicted, because the sweep removes unprotected entries until the caps are
+   satisfied or there are none left (5.3), while the pin and the new anchor
+   survive.
+
+`decision:` the check deliberately does not set `cache.max_bytes` to 1. 5.1 makes
+that config invalid, the daemon refuses to start on a config that fails
+`whirl config check` (8.7), and a check that depends on a config the document
+declares illegal is not a check a reviewer can run. There is no test-only
+override that lets an illegal config through, so every runnable check has to be
+legal. The check also drives the cache through rotations and `whirl favorite`
+rather than dropping a file into `cache/sha256/` by hand, because a hand-placed
+file with no index entry is an orphan, and step 3 of the sweep removes it once it
+is past `cache.grace_seconds`, for a reason that has nothing to do with the cap
+being tested.
 
 **INV-CACHE-3 (pins).** No pinned file is removed by the sweep, and every
 favorites entry is either present with a matching digest, or re-materialisable
 from its `origin`, or reported as unrecoverable. `whirl favorites` prints
 `missing` next to an entry whose file is absent, so the state cannot be invisible.
 
-Check: favourite something, evict everything else by lowering the caps, restart,
-and confirm the file survived and `whirl favorites` still lists it.
+Check: favourite something, evict everything else by lowering `cache.max_files`
+(never below 1) and leaving `cache.max_bytes` legal, restart, and confirm the
+file survived and `whirl favorites` still lists it.
 
 ### 5.5 The sweep
 
-`decision:` one sweep implementation, four trigger points, and it always runs
+`decision:` one sweep implementation, three trigger points, and it always runs
 while holding the rotation lock (7.2), which is what makes it unable to race a
 download.
 
@@ -558,11 +621,23 @@ Steps:
    300), whatever they are, because a part file has no other owner.
 5. While over either cap: take the unprotected entry with the oldest
    `last_used` and remove its file and its index entry. Stop when both caps are
-   satisfied.
+   satisfied, or when no unprotected entries remain (the protected set alone
+   exceeds a cap; 5.3), whichever comes first.
 6. Write `index.json` (atomically, section 6.2) even if nothing changed, so that
    `seq` and `written_at` are honest about the last time the sweep ran.
 7. Release the lock and log one line: `sweep files=312 bytes=180224512
    removed=4 reclaimed=1 orphans=0 deferred=0`.
+
+`decision:` when `favorites_degraded: 1` (6.4), the sweep still runs on every one
+of those triggers. An exemption for the degraded state would be exactly the
+hidden hole this section exists to close, so the sweep runs and removes nothing
+that could be a pin instead: step 4 still removes `tmp/` part files, because a
+part file is never a pin; step 3 skips orphan removal for files under `sha256/`
+(an orphan could be the file behind a pin whose record was never written); and
+step 5 evicts nothing at all. It writes `index.json` as usual so `seq` and
+`written_at` stay honest about when it last ran, and the resulting overshoot is
+reported as `cache_over_reason: favorites_degraded` (5.4) rather than as a bound
+the daemon is not enforcing.
 
 Cost, stated: step 3 is the only part that can touch the whole cache, and the
 index makes it `stat` per entry, not a read of any image. At the 500-file default
@@ -698,11 +773,23 @@ favorites.
    - `favorites.json`: **do not start empty.** A corrupt favorites file is the
      one case where the safe move is to stop writing: the daemon loads an empty
      pin set, marks `favorites_degraded: 1`, refuses `whirl favorite` /
-     `unfavorite` with the quarantine path in the message, and leaves the pinned
-     files unprotected-but-untouched because no sweep will run against a
-     degraded favorites file. The user resolves it with
-     `whirl reset --favorites` (which is explicit) or by inspecting the
+     `unfavorite` with the quarantine path in the message, and treats the whole
+     cache as protected for as long as the state lasts. No sweep removes anything
+     under `sha256/` while `favorites_degraded: 1`, `whirl status` reports
+     `cache_over_reason: favorites_degraded` rather than a bound it is not
+     enforcing, and only `tmp/` is still cleaned (5.3, 5.5). The user resolves it
+     with `whirl reset --favorites` (which is explicit) or by inspecting the
      quarantine.
+     `decision:` this is a degraded mode and not a refusal to start, and it
+     differs from 8.5 deliberately. 8.5 is the state directory that cannot be
+     written at all: no durable record of anything is possible, so the daemon
+     exits. Here the directory works and exactly one file is unreadable, the user
+     can repair it in place while the daemon runs, and the cost of continuing is
+     bounded and visible: the cache grows until the file is resolved, no file is
+     guessed away, and the status line is the only thing that has to be believed.
+     A refusal to start would buy the same guarantee 8.5 buys (a daemon never runs
+     with a state it does not understand) at the price of an outage that a single
+     explicit verb can fix, which is not a trade worth making here.
 4. `schema` greater than the daemon's: a downgrade, not corruption. Quarantine is
    wrong here because the file is presumably fine and a newer whirl wrote it, so
    the file is left exactly as it is, that file becomes read-only for this
@@ -885,7 +972,9 @@ happen.
   forgets pins is worse than one that does not start. Exit message names the
   directory and the `errno`, and says which of the two roots is the problem
   (state, not cache, is the distinction the prototype's single `state_dir`
-  cannot make).
+  cannot make). This is the whole directory, not one file: a single unreadable
+  state file is the degraded case in 6.4, which carries on with the loss named in
+  `status` instead of refusing to run.
 
 ### 8.6 A clock jump
 
@@ -923,6 +1012,13 @@ happen.
   features.md F1 requires. `config.json` unparseable: the daemon does not start,
   and the message names the byte offset, because a config error is the one error
   a user must fix by hand.
+- `config.json` parses but fails `whirl config check`: a value out of range, or an
+  ordering rule such as `cache.max_bytes < filters.max_bytes` (5.1). The daemon
+  does not start either, and the message names the failing key and both values.
+  `config check` and the daemon's start-up validation are one implementation, so
+  a config the tool rejects on demand is a config it refuses to run: there is no
+  test-only override that admits an illegal config, which is what lets the checks
+  in 5.4 be written on legal configs only.
 - A second `whirl next` while a rotation is in flight: refused with `busy`, not
   queued (7.3).
 
@@ -981,10 +1077,12 @@ Against this card's criteria:
   6.1 and 6.2 (state schemas with every field), 6.3 (the write protocol, step by
   step), 9 (every config key this document adds, with its default).
 - **The eviction rule is a testable invariant that protects the displayed
-  image.** INV-CACHE-1 states the bound with its three permitted exceptions and
+  image.** INV-CACHE-1 states the bound with its four permitted exceptions and
   names the status keys that carry them; INV-CACHE-2 is stated in the adversarial
-  form (caps of 1 and 1) so a reviewer can attempt to break it in three commands;
-  section 5.3 is the protection rule; section 5.5 is the one sweep that
+  form on a config that is legal under 5.1 (`cache.max_files` of 1, byte cap at
+  its default) so a reviewer can attempt to break it in three steps without
+  needing a config the document refuses to run; section 5.3 is the protection
+  rule; section 5.5 is the one sweep that
   implements it. The "displayed image is never deleted out from under the
   platform" requirement is 5.3, and it is grounded in a measurement of the
   platform rather than in a belief: `[D 1]`'s deleted-path write failure and its
@@ -1007,8 +1105,8 @@ Against this card's criteria:
   the atomicity and durability claims underneath section 3 and 6.3.
 - **Specification only.** No production code, no `prototype/` edits, no
   credentials. The only files added are this document and the probe scripts and
-  their README under `docs/spec/probes/`, which exist to produce `[L 5]` and
-  `[L 6]` and are not part of the product.
+  their README under `docs/spec/probes/`, which exist to produce `[L 5]`, `[L 6]`
+  and `[L 8]` and are not part of the product.
 - **The review gate.** This document is completed with `kanban_request_review`,
   not `kanban_complete`, per the orchestrator's note on the card.
 
@@ -1023,8 +1121,10 @@ Local artifacts. `[L n]` is cited inline above.
 | [L 3] | `man 2 flock` | Exclusive and shared locks, `LOCK_NB` returns `EWOULDBLOCK` when held, `ENOTSUP` for an unsupported file type, locks are on files rather than descriptors and are released when the descriptor is closed. |
 | [L 4] | `grep -n -A12 "func rename" $(go env GOROOT)/src/os/file_windows.go`; `internal/syscall/windows/syscall_windows.go:357-367` | Go 1.26.1 on this machine: `os.Rename` on Windows is `windows.Rename`, which is `MoveFileEx(from, to, MOVEFILE_REPLACE_EXISTING)`. `MOVEFILE_COPY_ALLOWED` is not passed. |
 | [L 5] | `python3 docs/spec/probes/atomic_write_probe.py 400` (four runs), `python3 docs/spec/probes/hash_cost.py 20`, `python3 docs/spec/probes/index_size.py 500` | In-place rewrite: 3068 bad reads of 3508, 3054 of 3496, 3832 of 4270, 2387 of 2830, so 87.4%, 87.4%, 89.7% and 84.3% of concurrent reads saw a truncated or unparsable file. Temp-plus-`rename`: 0 bad reads of 971, 981, 949, 983. Hashing a 21.0 MB file: 14.4, 14.6 and 13.9 ms against 2.3, 1.6 and 1.5 ms for the read alone. A 500-entry `index.json` matching the section 2.1 schema: 170607 bytes compact, 220135 bytes indented, 341 bytes per entry. |
-| [L 6] | `curl -A "whirl-spec-probe" "https://wallhaven.cc/api/v1/search?sorting=random&purity=100&ratios=16x9&atleast=2560x1440&page={1,2}"` then `python3 docs/spec/probes/size_stats.py wallhaven-p1.json wallhaven-p2.json` | 48 images, `file_size` 0.05 MB to 20.34 MB, median 2.25 MB, mean 3.83 MB, per-file spread 378x. A count cap of 40 spans 2.2 MB to 813.6 MB. The endpoint is the one features.md 2.3 specifies; no key needed for `purity=100` [11]. |
+| [L 6] | `curl -A "whirl-spec-probe" "https://wallhaven.cc/api/v1/search?sorting=random&purity=100&ratios=16x9&atleast=2560x1440&page={1,2}"` then `python3 docs/spec/probes/size_stats.py wallhaven-p1.json wallhaven-p2.json` | Draw 1 of 3, 2026-09-25: 48 images, `file_size` 0.05 MB to 20.34 MB, median 2.25 MB, mean 3.83 MB, per-file spread 378x. A count cap of 40 spans 2.2 MB to 813.6 MB. The endpoint is the one features.md 2.3 specifies; no key needed for `purity=100` [11]. `sorting=random` returns a different 48 images on every request, so this row is one sample and not a reproducible distribution. |
 | [L 7] | `sw_vers; uname -m; python3 --version` | macOS 26.5.2 (25F84), arm64, Python 3.14.7, Go 1.26.1, rustc 1.94.0. Every local measurement above was taken on this machine. |
+| [L 8] | `curl -sS -A "whirl-spec-probe" "https://wallhaven.cc/api/v1/search?sorting=random&purity=100&ratios=16x9&atleast=2560x1440&page={1,2}"` into `/tmp/whirl-l6b/p1.json` and `p2.json`, then `python3 docs/spec/probes/size_stats.py /tmp/whirl-l6b/p1.json /tmp/whirl-l6b/p2.json` | Draw 2 of 3, re-run on this machine while applying this review round: 48 images, 0.19 MB to 16.03 MB, median 2.11 MB, p90 10.19 MB, mean 3.23 MB, total 154.9 MB, per-file spread 82x. A count cap of 40 spans 7.8 MB to 641.3 MB, 129.1 MB at this draw's mean; 500 files is 1.61 GB at this mean. |
+| [L 9] | the same query, re-drawn by the round-1 review of this document (recorded in this card's comment thread, 2026-09-25 13:21) | Draw 3 of 3: 48 images, 0.23 MB minimum, 2.59 MB median, 5.56 MB p90, 14.02 MB maximum, mean 2.90 MB, spread 60x. Not produced by the author of this document; included because it is an independent draw of the same query and it is the tightest of the three, which is why 5.1 quotes the 60x draw and not the 378x one. |
 
 Sibling research documents. `[D n]` is cited inline above.
 
@@ -1036,11 +1136,12 @@ Sibling research documents. `[D n]` is cited inline above.
 
 Grounding note: this is a specification, so most sentences are decisions this
 document owns rather than facts taken from elsewhere. The sourced fraction is
-deliberately the platform-convention layer plus the two measurements: the
+deliberately the platform-convention layer plus the measurements: the
 Apple, XDG and Microsoft citations are what make the paths correct rather than
-invented, `[L 5]` is the measurement under the atomicity rule, and `[L 6]` is the
-measurement under the byte-cap decision. Read anything without a citation as a
-decision, not as an observation.
+invented, `[L 5]` is the measurement under the atomicity rule, and `[L 6]`,
+`[L 8]` and `[L 9]` are the three draws under the byte-cap decision, quoted as
+samples rather than as a reproducible distribution. Read anything without a
+citation as a decision, not as an observation.
 
 ## Sources
 

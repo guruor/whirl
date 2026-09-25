@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """How large is cache/index.json at the default caps?
 
-Builds the index schema from section 2.2 with `n` synthetic entries (real-shaped
+Builds the index schema from section 2.1 with `n` synthetic entries (real-shaped
 digests, plausible origin URLs and byte counts) and prints the serialised size.
 
 Usage: python3 index_size.py [entries]
