@@ -2,6 +2,9 @@
 
 Status: architecture of record for v0.1. Written 2026-09-25 on macOS 26.5.2 (build 25F84,
 arm64) at `main` = `1261786`. Documentation only; no production code was written or changed.
+Revision: where this document touches the `excl_file` lock it now names the second refusal as well
+(1.5 step 1, 1.7.2, `lock_mode` in 2.10, failure mode 16), deferring to `[D 6 §8.8]` for the rule,
+which `docs/spec/state-and-cache.md` owns.
 
 This document answers three questions and leaves nothing open:
 
@@ -182,7 +185,9 @@ second supervisor competes with the first.
 `[D 6 §5.5]`, `[D 6 §7.2]` and `[D 6 §8.5]` add up to):
 
 1. Take `state/locks/daemon.lock` exclusively and non-blocking. Held, exit with the holder's pid
-   if not. `[D 6 §7.2]`.
+   if not. A lock file the daemon did not create is refused as well, never taken over: under the
+   `excl_file` fallback the message classifies the recorded holder (pid plus the platform's start
+   time for it) and names the one action that clears it `[D 6 §8.8]`. `[D 6 §7.2]`.
 2. Open the state directory and validate that it is writable; refuse to start if it is not, with
    the directory and the `errno` in the message `[D 6 §8.5]`.
 3. Parse and validate the config. A config that fails validation is a refusal to start, naming
@@ -263,9 +268,11 @@ client that asked), arms the next slot normally, and does not retry inside the s
 writes no state `[D 6 §7.1]`. What is left is a part file under `cache/tmp/` and, if the crash
 happened after the rename, a cache file with no index entry. Both are reclaimed by the next sweep
 (`[D 6 §5.5]` steps 3 and 4) after `cache.orphan_grace_seconds` (300) and
-`cache.grace_seconds` (600) respectively. `rotate.lock` needs no recovery logic: the kernel
-releases an `flock` when the holder exits, including on `SIGKILL` `[D 6 §7.2]`. The daemon logs
-one line, sets `last_error: worker_failed`, and the slot is consumed.
+`cache.grace_seconds` (600) respectively. `rotate.lock` needs no recovery logic where the kernel
+owns the lock: the kernel releases an `flock` when the holder exits, including on `SIGKILL`
+`[D 6 §7.2]`. Where the `excl_file` fallback of `[D 6 §8.7]` is in force there is no kernel
+release, and the daemon removes the lock file of the worker it has just reaped `[D 6 §8.8]`. The
+daemon logs one line, sets `last_error: worker_failed`, and the slot is consumed.
 
 **1.7.3 It dies between a successful setter call and its exit.** This is the interesting one and
 the reason for the two-line stdout contract. The wallpaper has changed and the daemon was not
@@ -784,7 +791,7 @@ are checked against them, and the third column below says where each name comes 
 | `cache_over_reason` | `-` | `[D 6 §9]` | `single_file`, `pinned`, `sweep_error` or `favorites_degraded`, the four causes `[D 6 §5.4]` makes exhaustive, or `-` |
 | `cache_writable` | `1` | `[D 6 §9]` | 0 when the daemon has had to continue without a writable cache 8.4 |
 | `sweep_deferred` | `0` | `[D 6 §9]` | 1 when the sweep could not take the rotation lock because another holder had it, which is the only trigger `[D 6 §5.5]` step 1 gives this key; a sweep that ran and failed is a different fact and reports `cache_over_reason: sweep_error` instead |
-| `lock_mode` | `flock` | `[D 6 §9]` | `flock` \| `excl_file`: the primitive actually holding `state/locks/daemon.lock`, which 1.5 step 1 takes at startup and holds for the daemon's lifetime, with `excl_file` where the filesystem cannot `flock` 8.7. Windows's `LockFileEx` reports `flock`, because it is that platform's own exclusive lock rather than a weaker one. There is no third value: a daemon that cannot take the lock does not run 1.5 step 1 |
+| `lock_mode` | `flock` | `[D 6 §9]` | `flock` \| `excl_file`: the primitive actually holding `state/locks/daemon.lock`, which 1.5 step 1 takes at startup and holds for the daemon's lifetime, with `excl_file` where the filesystem cannot `flock` 8.7. Windows's `LockFileEx` reports `flock`, because it is that platform's own exclusive lock rather than a weaker one. There is no third value: a daemon that cannot take the lock does not run 1.5 step 1, and a lock file left behind by a daemon that is gone is classified and refused at that same step, before there is a socket for `status` to answer on `[D 6 §8.8]` |
 | `state_dir` | `/Users/govind.ra...` | `[D 6 §9]` | where the state files are 1.1 |
 | `state_corrupt` | `-` | `[D 6 §9]` | the state file that failed to parse, if any 6.4 |
 | `state_quarantined` | `-` | `[D 6 §9]` | the path it was moved to before defaults were written 6.4 |
@@ -1705,7 +1712,7 @@ Every row is a complete answer: what the daemon does, and what the user sees. Th
 | 4 | **Disk full** | The download dies at `enospc`, the part file is removed if the filesystem allows it at all, and `cache_writable: 1` stays true. The sweep still runs, because deletions free space even on a full disk, and a sweep that cannot rewrite `index.json` reports `cache_over_reason: sweep_error` and retries at the next rotation `[D 6 §8.1]`. `sweep_deferred` is not this key: it has exactly one meaning, the rotation lock was already held by someone else `[D 6 §5.5]` step 1 | `ERR enospc <path>` once, exit 1. A state write that fails leaves the previous state file intact (temp + rename `[R5]`) and logs `state write failed: <errno>`; the daemon keeps running with the last good state rather than refusing to serve. If the sweep could not rewrite the index, `status` carries `cache_over_reason: sweep_error` until one succeeds, and `cache_over_cap` reports the overshoot. Nothing is deleted to make room: the caps are not raised, and no user file outside the cache is touched |
 | 5 | **Network down** | `wallhaven` sources fail at connect; local sources are still tried in the same slot, and if a local source wins, the rotation succeeds. If every source is network-dependent, the slot is consumed and the next one retries | `ERR offline` if nothing could be served, exit 1, `last_error: offline`. With a local source present: a normal successful rotation and `source: <id> wallhaven ... last=offline reason=connect: Network is unreachable` in `status` |
 | 6 | **A display is disconnected mid-rotation** | The worker enumerates displays at the start of the setter step and keys them by identity, not index: display UUID on macOS `[D 1 §2]`, device path string on Windows `[D 2 §1]`, output name on sway `[D 3 §The decisive column]`. A display that vanished between the fetch and the set fails that display's call and nothing else; the remaining displays are set; there is no index-based retry | `ERR set_failed` only if every display failed; otherwise a successful rotation whose `set:` line names the path, plus a per-display failure line in the log. A display connected later gets the image at the next rotation `[D 5 §1.3]` |
-| 7 | **The worker hangs** | 300 s deadline, `SIGTERM`, 5 s, `SIGKILL` (1.7.1); `rotate.lock` is released by the kernel on exit `[D 6 §7.2]`; the slot is consumed | `ERR timeout`, exit 1, `last_error: worker_timeout`, and the daemon is still answering `status` while all of this happens |
+| 7 | **The worker hangs** | 300 s deadline, `SIGTERM`, 5 s, `SIGKILL` (1.7.1); `rotate.lock` is released by the kernel on exit, or removed by the daemon where the `excl_file` fallback is in force `[D 6 §7.2]` `[D 6 §8.8]`; the slot is consumed | `ERR timeout`, exit 1, `last_error: worker_timeout`, and the daemon is still answering `status` while all of this happens |
 | 8 | **The worker is killed mid-rotation** (OOM, user, supervisor) | Part file or unreported cache file is reclaimed by the sweep after its grace window `[D 6 §5.5]`; the anchor is reconciled by 1.7.3 if the setter had already succeeded | `ERR worker_failed` (or `ERR timeout` if the deadline was the cause), exit 1; nothing on screen changes unless the setter had already run, in which case the wallpaper did change and `status` reports `last_via: recovered` |
 | 9 | **The state directory is not writable** | The daemon refuses to start, with the directory and the `errno` in the message `[D 6 §8.5]` | `launchctl`/`systemctl`/Task Scheduler log or the whirl log carries `state dir not writable: <path> (EACCES)`; every `whirl` verb exits 2 because there is no daemon |
 | 10 | **The cache directory is read-only** | The daemon starts, `cache_readonly: 1`; local sources in reference mode can still rotate to a file already present, and nothing new is admitted `[D 6 §8.4]` | `whirl next` gives `ERR cache_readonly <path>` if nothing usable is cached; `status` shows `cache_readonly: 1` and a reason |
@@ -1714,6 +1721,7 @@ Every row is a complete answer: what the daemon does, and what the user sees. Th
 | 13 | **The config is invalid** | At startup, a refusal to start naming the key `[D 6 §8.7]`. On re-read, the previous config stays in force, the failure is logged, and the daemon keeps rotating | `status` shows the old values; the log has `<key>: <value> is out of range`; `whirl config check` prints the same and exits 1 |
 | 14 | **`per-display` is not reachable on this platform** | Honoured where the research found a documented per-display setter (Windows), accepted and run as `all` where the answer is unverified (macOS, and sway and generic X11 honour it per output and per `--output`), refused at `config check` where it is impossible (GNOME) or out of scope (KDE) `[D 5 §1.3]`, `[D 2 §1]`, `[D 1 §2]`, `[D 3 §GNOME 2]`, `[D 3 §KDE 2]` | `status` shows `display_mode`, `display_mode_effective` and `display_mode_reason`: `unverified_platform` on macOS, `impossible_on_this_desktop` on GNOME, `out_of_scope_on_this_desktop` on KDE; `whirl config check` prints the same reason and exits 1 on the two that are refusals |
 | 15 | **Windows, with per-virtual-desktop wallpapers active** | Nothing it can detect, and nothing it can query. `IDesktopWallpaper` does not model virtual desktops, and Windows treats per-desktop background mode and per-monitor wallpaper mode as mutually exclusive, so a set made while the user has several desktops open either lands on the desktop that is active at that moment or is silently reverted by the shell. The call returns success and the readback agrees for the desktop the daemon can see, so there is no `ERR`, no `last_error` and no `anchor_verified: 0`; the rotation is logged as an ordinary success `[D 2 §3]`, whose sources are [19], [30] and [35] (the [35] report is an open proposal, cited there only as corroboration of the shape, not as proven behaviour) | The new image appears on the desktop the user is on when the rotation runs; after switching desktops the previous image is back, or the change reverts on its own, with no error anywhere: `whirl next` exits 0, `status` shows `last_error: -`, and the log has nothing to say. `whirl config check` cannot warn either, because the mode lives in the shell and not in the config. v0.1 cannot detect it and does not pretend to; the check that would settle it is `[D 2 §3]`'s "switch between desktops" step on a real Windows machine |
+| 16 | **`daemon.lock` was left behind by a daemon that is gone** (only where the `excl_file` fallback is in force, `[D 6 §8.7]`) | Refuses to start at 1.5 step 1 and does not touch the file: taking it over needs a compare-and-swap that a filesystem without `flock` cannot provide, and two daemons is the outcome 7.1 and R5 forbid. It classifies the recorded holder, pid plus the platform's own start time for it, so the message says whether that pid is a live holder, a recycled pid, or gone `[D 6 §8.8]` | The supervisor's stderr and the whirl log carry `state/locks/daemon.lock left by pid <p>, started <t>, which is not running; remove <path>`, and the daemon exits 1, which is the frontend contract's "the daemon refused". Every `whirl` verb exits 2 with row 1's message until the file is removed, and the supervisor keeps retrying on the cadence section 5 gives it. `status` says nothing about the condition and `lock_mode` gains no third value, because a daemon that refuses at 1.5 step 1 never binds the socket; a recycled pid is named as recycled rather than as a holder, so the operator is not told a live process is blocking them when the holder is gone |
 
 ## 8. Frontend contract
 
