@@ -1,0 +1,11 @@
+[package]
+name = "whirld"
+description = "the whirl daemon: the control socket, worker supervision and the resident state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+whirl-core = { workspace = true }

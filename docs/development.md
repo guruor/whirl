@@ -15,9 +15,9 @@ decision.
 | thing | state |
 |---|---|
 | `docs/`, `prototype/` | exist |
-| the Cargo workspace (`crates/`) | **does not exist yet.** The scaffold is a separate card. Until it lands, every `cargo` command below has nothing to build. |
-| `.github/workflows/ci.yml` | written here, lints clean, **has never run**: `gh run list -R guruor/whirl` returns an empty list |
-| a running daemon reachable from a checkout | possible only after the scaffold lands; see the verification note below |
+| the Cargo workspace (`crates/`) | exists on pull request #1: `whirl-core`, `whirld`, `whirl-cli`, `whirl-worker`, four members and no third-party dependency |
+| `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36126085459`, twelve jobs |
+| a running daemon reachable from a checkout | yes: the section 7 sequence below, driven from a fresh clone of pull request #1 on a scratch socket, no wallpaper touched |
 | anything that sets a real wallpaper in CI | never, by design (see "What CI cannot prove") |
 
 **How the commands in this document were verified.** The workspace did not exist
@@ -312,12 +312,16 @@ concurrency group and the artifact name) are not shell inputs.
 - **Verified on this machine:** `actionlint` (1.7.11) reports no problems for the
   file, and a real YAML parse finds 6 jobs and the three triggers. Both commands
   are in the handoff note.
-- **Verified:** `gh run list -R guruor/whirl --limit 5 --json ...` returns an empty
-  list, so **no CI run has ever executed.** Nothing in this repository may claim a
-  green pipeline, including this document.
+- **Verified when this guide was written, and now superseded:** `gh run list -R
+  guruor/whirl` returned an empty list, so no CI run had executed. **The first run
+  is pull request #1's:** run `36126085459`, green, twelve jobs. A run named by its
+  id is the only green-pipeline claim this repository may make, including this
+  document.
 - **Not verified, and marked as such:** that each job passes on its runner. The
-  equivalent commands were run locally on macOS only. Windows and Linux runner
-  behaviour is unverified until the first push.
+  equivalent commands were run locally on macOS only, and that held until the first
+  push. The first push is pull request #1's: run `36126085459` passed `fmt`,
+  `clippy`, `test`, `msrv`, `guards` and `artifacts` on `ubuntu-latest`,
+  `macos-latest` and `windows-latest`.
 - **Ordering, stated plainly:** the workflow goes green only once the Cargo
   workspace exists. Until the scaffold lands, a push of this file will fail
   `fmt`, `clippy`, `test`, `msrv`, `guards` and `artifacts` at the first `cargo`

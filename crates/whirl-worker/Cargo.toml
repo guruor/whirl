@@ -1,0 +1,11 @@
+[package]
+name = "whirl-worker"
+description = "the whirl worker: one process per rotation, the only crate that links a platform backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+whirl-core = { workspace = true }

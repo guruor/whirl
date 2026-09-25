@@ -1,0 +1,7 @@
+# The single source of the toolchain version (docs/development.md section 2).
+# Pinned rather than tracking `stable`, because rustfmt output changes between
+# releases and "my formatting is wrong on your machine" is not a review topic.
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
