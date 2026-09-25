@@ -591,10 +591,22 @@ terminator  := "OK" | "ERR " code " " message
     per-source accounting and one record form is enough to carry both cases
   - `set: <digest> <origin_key> <via> <path|->`
   - `plan: <config key>=<effective value> ...`, where the last field of the line is the rest, so it
-    uses the config's own dotted key paths, in file order: `plan: schedule.interval_seconds=1800
-    ... cache.max_bytes=2147483648 ... display.mode_effective=all backend=native`. A client can
-    print it, diff it against a config, or ignore it; it exists because "what did the daemon
-    actually adopt" must be answerable without reading the daemon's mind
+    uses the config's own key paths, in the order 4.2 writes them, and it is the whole rotation's
+    set of them: `min_width` and `min_height` sit between `display` and `filters`, and `startup.*`,
+    `filters.target_ratio` and `cache.root` appear like any other key. The two keys whose value is
+    resolved rather than written keep their file positions too: `backend` after 4.3's precedence,
+    `sources` as the count of enabled sources. `config_schema`, `socket` and `log_level` are absent,
+    because they are the daemon's own settings and not the rotation's. A key with no value prints
+    `-`, this document's rule everywhere else, which is how an unset `cache.root` or
+    `filters.target_ratio` reads. For the config 4.2 writes, the line is exactly
+    `plan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1
+    startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all
+    min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02
+    filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=-
+    cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600
+    cache.orphan_grace_seconds=300 backend=native sources=2`. A client can print it, diff it
+    against a config, or ignore it; it exists because "what did the daemon actually adopt" must be
+    answerable without reading the daemon's mind
 - **Two closed vocabularies**, so a client never has to interpret free text:
   - `via` is `source` (the pipeline chose the candidate), `manual` (a `set path`/`set id`
     request), `prev` (a `prev` request), `startup` (the startup rotation, including a manual change
@@ -920,7 +932,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- queued
 <-- source: pictures local weight=1 enabled=1 last=- candidates=412 admitted=97 rejected_resolution=203 rejected_ratio=41 rejected_size=0 rejected_type=71 rejected_dedupe=0 reason=-
 <-- source: space wallhaven weight=3 enabled=1 last=- candidates=24 admitted=3 rejected_resolution=0 rejected_ratio=0 rejected_size=0 rejected_type=0 rejected_dedupe=21 reason=-
-<-- plan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 display.mode=all display.mode_effective=all filters.max_bytes=41943040 filters.ratio_tolerance=0.02 min_width=1600 min_height=900 cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 state.history_entries=50 dedupe.recent_entries=50 backend=native sources_enabled=2
+<-- plan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1 startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02 filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=- cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 backend=native sources=2
 <-- OK
 --> close
 <-- OK
