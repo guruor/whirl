@@ -776,7 +776,7 @@ are checked against them, and the third column below says where each name comes 
 | `state_dir` | `/Users/govind.ra...` | `[D 6 §9]` | where the state files are 1.1 |
 | `state_corrupt` | `-` | `[D 6 §9]` | the state file that failed to parse, if any 6.4 |
 | `state_quarantined` | `-` | `[D 6 §9]` | the path it was moved to before defaults were written 6.4 |
-| `state_schema_newer` | `0` | `[D 6 §9]` | 1 when the file's schema is newer than this binary 6.4 |
+| `state_schema_newer` | `0` | `[D 6 §9]` | 1 when the file's schema is newer than this binary 6.4; the file's name and both schema numbers go to the log, not to this key, because the key is a typed flag like its neighbours and no client branches on the detail |
 | `history_lost` | `0` | `[D 6 §9]` | entries lost to a quarantine |
 | `favorites_degraded` | `0` | `[D 6 §9]` | 1 when a pin could not be honoured, so a favorite may be evicted 5.4 |
 | `clock_jump` | `0` | `[D 6 §9]` | how many clock jumps larger than two intervals have been seen 8.6 |

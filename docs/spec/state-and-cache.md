@@ -817,9 +817,12 @@ favorites.
 4. `schema` greater than the daemon's: a downgrade, not corruption. Quarantine is
    wrong here because the file is presumably fine and a newer whirl wrote it, so
    the file is left exactly as it is, that file becomes read-only for this
-   daemon, and `whirl status` reports `state_schema_newer: favorites.json
-   (found 2, this build understands 1)`. Overwriting it would be destructive and
-   silent; refusing is loud and reversible.
+   daemon, and `whirl status` reports `state_schema_newer: 1`. The key is typed
+   `0|1` (architecture.md 2.10) because it is a status key a client parses rather
+   than a message, and the file name and both numbers go to the log, which is
+   where 6.4 step 2 puts the detail: `favorites.json was written by schema 2 and
+   this build understands 1`. Overwriting it would be destructive and silent;
+   refusing is loud and reversible.
 
 ### 6.5 Resetting without losing the cache
 
