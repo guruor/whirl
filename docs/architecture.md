@@ -591,14 +591,28 @@ terminator  := "OK" | "ERR " code " " message
     per-source accounting and one record form is enough to carry both cases
   - `set: <digest> <origin_key> <via> <path|->`
   - `plan: <config key>=<effective value> ...`, where the last field of the line is the rest, so it
-    uses the config's own dotted key paths, in file order: `plan: schedule.interval_seconds=1800
-    ... cache.max_bytes=2147483648 ... display.mode_effective=all backend=native`. A client can
-    print it, diff it against a config, or ignore it; it exists because "what did the daemon
-    actually adopt" must be answerable without reading the daemon's mind
+    uses the config's own key paths, in the order 4.2 writes them, and it is the whole rotation's
+    set of them: `min_width` and `min_height` sit between `display` and `filters`, and `startup.*`,
+    `filters.target_ratio` and `cache.root` appear like any other key. The two keys whose value is
+    resolved rather than written keep their file positions too: `backend` after 4.3's precedence,
+    `sources` as the count of enabled sources. `config_schema`, `socket` and `log_level` are absent,
+    because they are the daemon's own settings and not the rotation's. A key with no value prints
+    `-`, this document's rule everywhere else, which is how an unset `cache.root` or
+    `filters.target_ratio` reads. For the config 4.2 writes, the line is exactly
+    `plan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1
+    startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all
+    min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02
+    filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=-
+    cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600
+    cache.orphan_grace_seconds=300 backend=native sources=2`. A client can print it, diff it
+    against a config, or ignore it; it exists because "what did the daemon actually adopt" must be
+    answerable without reading the daemon's mind
 - **Two closed vocabularies**, so a client never has to interpret free text:
   - `via` is `source` (the pipeline chose the candidate), `manual` (a `set path`/`set id`
     request), `prev` (a `prev` request), `startup` (the startup rotation, including a manual change
-    the daemon detected), or `recovered` (1.7.3).
+    the daemon detected), or `recovered` (1.7.3). This is the only list: a history entry written to
+    `history.json` records the same five values
+    (`docs/spec/state-and-cache.md` 6.2), so the file and the `entry:` record cannot disagree.
   - `kind` is `local`, `wallhaven` or `external`, and it names the origin, not the mechanism.
     For an `external` entry `origin_key` is `external:<sha256 of the absolute path>` and `digest`
     is `-` when the file could not be hashed, because an image the user set by hand has no source
@@ -719,7 +733,7 @@ stream. It is a mode, not a verb with an answer:
 | `favorite_removed` | `<digest>` | a pin was removed |
 | `cache_swept` | `<removed> <reclaimed_bytes> <hidden>` | a sweep completed; `hidden` is how many entries were kept only because they are pinned `[D 6 §5.3]` |
 | `clock_jump` | `<seconds>` | the wall clock moved more than one interval, so the deadline was recomputed `[D 4 §Part 2]` |
-| `config_reloaded` | - | the daemon re-read the config and it parsed `[D 5 §F0]` |
+| `config_reloaded` | - | the daemon re-read the config and it parsed `[D 5 §F0]`; no fields, because no digest of the config exists anywhere in the protocol for one to carry |
 | `anchor_unverified` | - | 1.7.3 step 3 took effect: the daemon does not know what is on screen and is protecting the whole grace window |
 | `shutdown` | - | the daemon is exiting; the connection closes immediately after |
 | `heartbeat` | `<unix_seconds>` | 30 s of quiet |
@@ -770,11 +784,11 @@ are checked against them, and the third column below says where each name comes 
 | `cache_over_reason` | `-` | `[D 6 §9]` | `single_file`, `pinned`, `sweep_error` or `favorites_degraded`, the four causes `[D 6 §5.4]` makes exhaustive, or `-` |
 | `cache_writable` | `1` | `[D 6 §9]` | 0 when the daemon has had to continue without a writable cache 8.4 |
 | `sweep_deferred` | `0` | `[D 6 §9]` | 1 when the sweep could not take the rotation lock because another holder had it, which is the only trigger `[D 6 §5.5]` step 1 gives this key; a sweep that ran and failed is a different fact and reports `cache_over_reason: sweep_error` instead |
-| `lock_mode` | `flock` | `[D 6 §9]` | `flock` \| `excl_file` \| `none`, reported because a weaker lock is a weaker guarantee 8.7 |
+| `lock_mode` | `flock` | `[D 6 §9]` | `flock` \| `excl_file`: the primitive actually holding `state/locks/daemon.lock`, which 1.5 step 1 takes at startup and holds for the daemon's lifetime, with `excl_file` where the filesystem cannot `flock` 8.7. Windows's `LockFileEx` reports `flock`, because it is that platform's own exclusive lock rather than a weaker one. There is no third value: a daemon that cannot take the lock does not run 1.5 step 1 |
 | `state_dir` | `/Users/govind.ra...` | `[D 6 §9]` | where the state files are 1.1 |
 | `state_corrupt` | `-` | `[D 6 §9]` | the state file that failed to parse, if any 6.4 |
 | `state_quarantined` | `-` | `[D 6 §9]` | the path it was moved to before defaults were written 6.4 |
-| `state_schema_newer` | `0` | `[D 6 §9]` | 1 when the file's schema is newer than this binary 6.4 |
+| `state_schema_newer` | `0` | `[D 6 §9]` | 1 when the file's schema is newer than this binary 6.4; the file's name and both schema numbers go to the log, not to this key, because the key is a typed flag like its neighbours and no client branches on the detail |
 | `history_lost` | `0` | `[D 6 §9]` | entries lost to a quarantine |
 | `favorites_degraded` | `0` | `[D 6 §9]` | 1 when a pin could not be honoured, so a favorite may be evicted 5.4 |
 | `clock_jump` | `0` | `[D 6 §9]` | how many clock jumps larger than two intervals have been seen 8.6 |
@@ -918,7 +932,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- queued
 <-- source: pictures local weight=1 enabled=1 last=- candidates=412 admitted=97 rejected_resolution=203 rejected_ratio=41 rejected_size=0 rejected_type=71 rejected_dedupe=0 reason=-
 <-- source: space wallhaven weight=3 enabled=1 last=- candidates=24 admitted=3 rejected_resolution=0 rejected_ratio=0 rejected_size=0 rejected_type=0 rejected_dedupe=21 reason=-
-<-- plan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 display.mode=all display.mode_effective=all filters.max_bytes=41943040 filters.ratio_tolerance=0.02 min_width=1600 min_height=900 cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 state.history_entries=50 dedupe.recent_entries=50 backend=native sources_enabled=2
+<-- plan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1 startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02 filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=- cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 backend=native sources=2
 <-- OK
 --> close
 <-- OK
@@ -946,7 +960,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
                                                         --> resume
                                                         <-- OK
 <-- event: 187 resumed
-<-- event: 188 config_reloaded e67d23e7820c49a8051dac2831f38290f5e72f66c8db5079eeb60d82f14894c0
+<-- event: 188 config_reloaded
 <-- event: 189 cache_swept 12 34816000 1
 <-- event: 190 clock_jump 7200
 <-- event: 191 anchor_unverified
