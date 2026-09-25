@@ -129,6 +129,34 @@ jobs:
               sys.exit("third-party dependencies appeared: " + ", ".join(extra))
           print(f"Cargo.lock holds {len(names)} entries, all ours: {sorted(set(names))}")
           PY
+      - name: Assert the daemon does not link the worker's platform crate
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          # docs/architecture.md R2: "whirld does not depend on the worker's platform
+          # crate, and its binary stays under a megabyte". The size cap below measures
+          # the second half; this measures the first, so that half is checked rather
+          # than remembered. Platform code lives in whirl-worker because it is the
+          # only crate allowed to grow it (docs/development.md, "Dependencies: zero").
+          metadata = json.loads(
+              subprocess.run(
+                  ["cargo", "metadata", "--format-version", "1"],
+                  capture_output=True, text=True, check=True,
+              ).stdout
+          )
+          daemon = next(p for p in metadata["packages"] if p["name"] == "whirld")
+          normal = sorted(d["name"] for d in daemon["dependencies"] if d.get("kind") is None)
+          if normal != ["whirl-core"]:
+              sys.exit(
+                  "whirld's normal dependencies are "
+                  + ", ".join(normal)
+                  + ", not exactly whirl-core: the daemon must not link a platform backend"
+              )
+          print("whirld depends on whirl-core only, so it links no platform backend")
+          PY
       - name: Build the release binaries
         run: cargo build --workspace --release
       - name: Assert the binary size caps
