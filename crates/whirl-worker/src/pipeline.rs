@@ -1743,18 +1743,28 @@ mod tests {
     /// raw, the config parser stops at `unknown escape '\U'`. On the Windows
     /// runner the temporary directory is `C:\Users\...`, which is how eleven
     /// pipeline tests failed there and nowhere else (run 36157542930 on
-    /// t_ddb890aa); this pins the escaping where every platform runs it, using
-    /// a path that is absolute on all three.
+    /// t_ddb890aa). This pins the escaping on the platform the test runs on.
     #[test]
     fn the_fixture_config_escapes_a_path_with_a_backslash_in_it() {
+        // Absolute where the test runs and carrying a backslash either way:
+        // `cache.root` must be absolute, and `/tmp/...` is only root-relative
+        // on Windows, so the Windows runner needs its own literal.
+        #[cfg(windows)]
+        let dir = PathBuf::from(r"C:\Users\whirl\worker-7");
+        #[cfg(not(windows))]
         let dir = PathBuf::from(r"/tmp/whirl\worker-7");
         let parsed = config(&dir, "");
         assert_eq!(parsed.cache.root, Some(dir.join("cache")));
-        let source = parsed.sources.first().expect("the fixture source");
-        assert_eq!(
-            source.local.as_ref().expect("local").paths,
-            vec![dir.join("pictures")]
-        );
+        let paths = parsed
+            .sources
+            .first()
+            .expect("the fixture source")
+            .local
+            .as_ref()
+            .expect("local")
+            .paths
+            .clone();
+        assert_eq!(paths, vec![dir.join("pictures").display().to_string()]);
     }
 
     #[test]
