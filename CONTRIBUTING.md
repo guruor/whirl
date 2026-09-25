@@ -39,7 +39,12 @@ result will send it back.
   `WHIRL_BACKEND=noop`, or `--backend noop`.
 - **Never commit a credential.** Not a key, not a token, not a `.env`, not an
   `auth.json`. The config stores credentials by reference to the platform's own
-  store (`docs/architecture.md` 6.3). No test may require a real key.
+  store (`docs/architecture.md` 6.3). No test may require a real key, and
+  `gitleaks git --config .gitleaks.toml --redact --log-opts="$(git merge-base
+  origin/main HEAD)..HEAD"` reproduces the `secrets` job locally (docs/development.md
+  section 6 has the details, including the one git setting that makes the scan read
+  nothing). An exemption in `.gitleaks.toml` needs a written reason and is printed
+  on every CI run.
 - **A decision change gets an ADR first.** `docs/decisions/NNNN-title.md` from
   `docs/decisions/0000-template.md`. When it is required is in
   `docs/development.md` section 6; when in doubt, write two paragraphs and be

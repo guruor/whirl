@@ -286,11 +286,20 @@ not the evidence.
 
 ## 4. Continuous integration
 
-`.github/workflows/ci.yml` is the gate. Six jobs: `fmt`, `clippy` (three OS),
-`test` (three OS), `msrv`, `guards`, `artifacts` (three OS). It runs on pushes to
-`main`, on every pull request, and by hand with `workflow_dispatch`. It declares
-`permissions: contents: read`, so a compromised step cannot write to the
-repository, and it cancels superseded runs on the same ref.
+`.github/workflows/ci.yml` is the gate. Seven jobs: `fmt`, `clippy` (three OS),
+`test` (three OS), `msrv`, `guards`, `secrets`, `artifacts` (three OS). It runs
+on pushes to `main`, on every pull request, and by hand with `workflow_dispatch`.
+It declares `permissions: contents: read`, so a compromised step cannot write to
+the repository, and it cancels superseded runs on the same ref.
+
+`secrets` runs gitleaks over the commits the change adds, not over the tree and
+not over the whole history: gitleaks' git mode reads a commit's added lines, so a
+change that *removes* a value cannot trip it, and a value already in history needs
+no exemption. It installs the release binary with the version and the sha256 both
+pinned in the workflow, and it fails when the scan reads no commits, because a
+scan that checked nothing and a scan that found nothing print the same `no leaks
+found`. The scanner's own rules stay on; `.gitleaks.toml` only adds exemptions,
+each with a reason that the job prints on every run.
 
 The rule that keeps it honest: **every command a contributor is expected to run
 before opening a pull request appears in the workflow, verbatim.** If a check is
@@ -304,8 +313,10 @@ toolchain download are the two costs that grow the first time a dependency or a
 platform backend arrives.
 
 No untrusted input reaches a shell: nothing in the workflow interpolates an event
-payload into a `run:` step, and the two places `github.*` values appear (the
-concurrency group and the artifact name) are not shell inputs.
+payload into a `run:` step. The `secrets` job is the one place that reads two of
+them (the pull request's base commit and `github.sha`); it passes them in through
+`env:`, never as script text, and the script refuses any value that is not hex
+before it is used as a range.
 
 ### What has and has not been verified about the workflow
 
@@ -327,6 +338,14 @@ concurrency group and the artifact name) are not shell inputs.
   `fmt`, `clippy`, `test`, `msrv`, `guards` and `artifacts` at the first `cargo`
   command, because there is no workspace to build. Merge the scaffold with, or
   before, the first push that triggers this workflow.
+- **The `secrets` job was made to fail before it was trusted.** Run `36137663507`
+  is that job red with the other twelve jobs green, on a single probe commit that
+  added a credential-shaped file: the log line is
+  `##[error]gitleaks rule generic-api-key matched ci-red-check.txt:5 in commit 8e133a179b8d`.
+  Run `36137447410` is the same job green on the change itself: `1 commits
+  scanned`, `no leaks found`. The probe commit was dropped from the branch rather
+  than reverted, because a revert leaves the commit that adds the value inside the
+  scanned range and the job stays red (section 6, `Secrets`).
 
 ### What rots, and where the single copy of it lives
 
@@ -337,7 +356,7 @@ does not repeat the value anywhere else:
 |---|---|---|
 | the toolchain version | `rust-toolchain.toml` | a one-line pull request; CI picks it up through `rustup show` |
 | the MSRV | `rust-version` in the workspace manifest, plus the `msrv` job | the four steps above, in one commit |
-| the pinned action versions | `.github/workflows/ci.yml` | Dependabot or a deliberate pull request, never a floating tag |
+| the pinned action versions, and the gitleaks version and its digest | `.github/workflows/ci.yml` | Dependabot or a deliberate pull request, never a floating tag |
 | the two vendor prices and their URLs | the Sources list at the end of this document, each with its retrieval date | re-fetch, and correct the date, before repeating the number as a fact |
 | the platform facts | `docs/research/*`, each with its own retrieval date and provenance | a research card, not an edit here |
 
@@ -571,6 +590,41 @@ variable (`docs/architecture.md` 6.3). A key in a config file is a key in every
 backup of that file, and the architecture refuses to start rather than accept one.
 No test in the repository may need a real credential: the Wallhaven tests run
 against fixtures, or are marked as requiring a key and skipped when it is absent.
+
+Run the scanner before you push. It is the same tool, the same config file and the
+same range the `secrets` job scans: the commits your branch adds to `main`.
+
+```sh
+git fetch origin main
+gitleaks git --config .gitleaks.toml --redact \
+  --log-opts="$(git merge-base origin/main HEAD)..HEAD"
+```
+
+`gitleaks` is not a build dependency; take it from the project's releases (CI pins
+8.30.1, and the job verifies the release digest) or from your package manager. If
+it prints `0 commits scanned` then it read nothing, its `no leaks found` means
+nothing, and the cause is your git config: `color.ui` or `color.diff` of `always`
+makes `git log -p` colourise a pipe, and gitleaks cannot read that. The CI job
+pins both off for this reason, and the same two overrides work locally:
+
+```sh
+git fetch origin main
+GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false \
+GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false \
+gitleaks git --config .gitleaks.toml --redact \
+  --log-opts="$(git merge-base origin/main HEAD)..HEAD"
+```
+
+An exemption from the scanner's rules lives in `.gitleaks.toml`, needs a
+`description` saying why the hit is not a secret, and is printed by the `secrets`
+job on every run. An exemption a reviewer cannot see is an unwritten rule, and the
+next person widens it.
+
+The scan reads the commits, not the tree, so removing a credential in a later
+commit does not clear it: the commit that added it is still in the range and the
+job stays red. That is the job working. Rotate the credential, then drop the
+commit from the branch (`git rebase --interactive`, or `git reset`) and push the
+rewritten branch.
 
 ## 7. Local development
 
