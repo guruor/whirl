@@ -1,0 +1,298 @@
+name: release
+
+# A release is a tag `vX.Y.Z` on `main`, and nothing else (docs/development.md
+# section 5). This workflow is what turns that tag into a published release: it
+# builds the same release artifacts the `artifacts` job of
+# `.github/workflows/ci.yml` builds, one archive per platform, and attaches them
+# to a GitHub Release whose notes come from a template in the repository.
+#
+# Why a second workflow rather than another job in `ci.yml`: this one runs on a
+# tag, needs to write to the repository, and must never be cancelled half way. A
+# run that stops after creating the release but before attaching three artifacts
+# is worse than one that takes a minute longer, and `ci.yml`'s job graph is
+# deliberately a read-only gate.
+#
+# What this workflow does not do, on purpose: it does not run the test suite. The
+# tagged commit is `main`'s tip, which is a promotion's merge commit, and `ci.yml`
+# has already run the full matrix on that commit: the promotion pull request runs
+# it, and so does the push to `main` that the merge produces
+# (docs/development.md section 5, "The promotion"). What this workflow does do is
+# refuse to publish a release whose notes are missing, unfilled or incomplete:
+# see the "Assemble and check the release notes" step.
+#
+# Rules this file obeys, from docs/development.md:
+# - every action is pinned to a full commit SHA, never a tag or a branch, so an
+#   action cannot change under the repository between two runs (section 4);
+# - the release is created with the `gh` the runner already has, so no
+#   third-party action is given the write token;
+# - no event payload is spliced into a `run:` step: the tag and the commit reach
+#   the scripts through `env:`, and the first script refuses a tag that is not
+#   release-shaped before anything uses it.
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancelled. A cancelled release run can leave a release with some of its
+  # artifacts, and the fix for that is deleting a tag that someone may already
+  # have fetched, which is exactly the manual repair this workflow exists to
+  # avoid.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The archive name says which platform and which architecture it holds.
+          # `arch` is what the runner must report, and the first step asserts it:
+          # a mislabelled artifact is worse than a missing one, and a runner image
+          # moving to another architecture must fail this workflow rather than
+          # quietly ship a binary named for the wrong one.
+          - os: ubuntu-latest
+            slug: linux-x86_64
+            arch: X64
+            ext: tar.gz
+          - os: macos-latest
+            slug: macos-arm64
+            arch: ARM64
+            ext: tar.gz
+          - os: windows-latest
+            slug: windows-x86_64
+            arch: X64
+            ext: zip
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Assert the runner is the architecture the archive name claims
+        shell: bash
+        env:
+          ARCH_EXPECTED: ${{ matrix.arch }}
+          ARCH_ACTUAL: ${{ runner.arch }}
+          SLUG: ${{ matrix.slug }}
+        run: |
+          set -eu
+          if [ "$ARCH_ACTUAL" != "$ARCH_EXPECTED" ]; then
+            echo "::error::this runner is $ARCH_ACTUAL and the archive name claims $SLUG. Fix the matrix; do not publish a mislabelled archive."
+            exit 1
+          fi
+          echo "$SLUG confirmed on a $ARCH_ACTUAL runner"
+      - name: cargo build --workspace --release
+        run: cargo build --workspace --release
+      - name: Collect the three binaries, and fail if one is missing
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p dist
+          missing=""
+          for name in whirld whirl whirl-worker; do
+            copied=""
+            for suffix in "" ".exe"; do
+              if [ -f "target/release/$name$suffix" ]; then
+                cp "target/release/$name$suffix" dist/
+                copied="yes"
+              fi
+            done
+            if [ -z "$copied" ]; then
+              missing="$missing $name"
+            fi
+          done
+          ls -l dist
+          if [ -n "$missing" ]; then
+            echo "::error::the release build produced no binary for:$missing. Three binaries per platform is the artifact; there is no smaller release."
+            exit 1
+          fi
+      - name: Package the archive (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ARCHIVE: whirl-${{ github.ref_name }}-${{ matrix.slug }}.${{ matrix.ext }}
+        run: |
+          set -eu
+          tar --create --gzip --file "$ARCHIVE" --directory dist .
+          echo "packed $ARCHIVE:"
+          tar --list --file "$ARCHIVE"
+      - name: Package the archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARCHIVE: whirl-${{ github.ref_name }}-${{ matrix.slug }}.${{ matrix.ext }}
+        run: |
+          Compress-Archive -Path dist\* -DestinationPath $env:ARCHIVE
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $env:ARCHIVE))
+          $zip.Entries | ForEach-Object { Write-Host "packed $env:ARCHIVE : $($_.FullName)" }
+          $zip.Dispose()
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: whirl-${{ github.ref_name }}-${{ matrix.slug }}
+          path: whirl-${{ github.ref_name }}-${{ matrix.slug }}.${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      # Creating the release and attaching assets is a write. Only this job gets
+      # it; the build jobs above, and every job in `ci.yml`, stay read-only.
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assemble and check the release notes
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import os
+          import re
+          import sys
+
+          tag = os.environ["TAG"]
+          sha = os.environ.get("SHA", "")
+
+          # The tag is the only event value this workflow reads, and it reaches
+          # the script through the environment. Validate its shape before it is
+          # used as a path or as a `gh` argument.
+          if not re.fullmatch(r"v[0-9][0-9A-Za-z.\-]*", tag):
+              sys.exit(
+                  f"the tag {tag!r} is not release-shaped. A release tag is vX.Y.Z or "
+                  "vX.Y.Z-<prerelease> (docs/development.md section 5)."
+              )
+
+          prerelease = "-" in tag
+          template = ".github/release-notes-template.md"
+          written = f"docs/releases/{tag}.md"
+
+          # The notes a release may not ship without. CI cannot run the platform
+          # checklists, so their results are the part of a release that only a
+          # human can produce, and they are required sections rather than a
+          # strongly worded paragraph (docs/development.md section 3).
+          required = [
+              "## What changed",
+              "## Per-platform checklist results",
+              "### macOS",
+              "### Windows",
+              "### Linux",
+              "## Config and protocol changes",
+              "## Upgrades and known issues",
+          ]
+
+          if os.path.isfile(written):
+              with open(written, encoding="utf-8") as handle:
+                  notes = handle.read()
+              where = written
+              notes_file = written
+          elif prerelease:
+              # A prerelease exists to be tested, so it may go out on the
+              # template: the placeholders are still there, which is why the
+              # release is marked as a prerelease.
+              with open(template, encoding="utf-8") as handle:
+                  notes = handle.read()
+              notes = (
+                  notes.replace("<TAG>", tag)
+                  .replace("<DATE>", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"))
+                  .replace("<COMMIT>", sha[:12])
+              )
+              where = f"{template}, rendered for {tag}"
+              notes_file = os.path.join(
+                  os.environ.get("RUNNER_TEMP") or "/tmp", f"release-notes-{tag}.md"
+              )
+              with open(notes_file, "w", encoding="utf-8") as handle:
+                  handle.write(notes)
+          else:
+              sys.exit(
+                  f"no release notes for {tag}. A final release is not published on an "
+                  f"unfilled template: write {written} from {template}, with the "
+                  "per-platform checklist results, land it in the promotion pull request "
+                  "(docs/development.md section 5), and rerun this run."
+              )
+
+          missing = [section for section in required if section not in notes]
+          if missing:
+              sys.exit(
+                  f"{where} is missing {len(missing)} required section(s): "
+                  + ", ".join(missing)
+              )
+
+          if not prerelease:
+              # `<...>` is how the template marks something a human must fill in.
+              # A final release with one left is a release whose notes are still a
+              # template, which is the failure mode this whole step exists for.
+              leftovers = sorted(set(re.findall(r"<[^<>\n]{1,80}>", notes)))
+              if leftovers:
+                  sys.exit(
+                      f"{where} still holds {len(leftovers)} unfilled placeholder(s), "
+                      f"starting with {leftovers[0]!r}. Fill them, land the file through "
+                      "`development` and the promotion, and rerun this run."
+                  )
+
+          print(f"release notes: {where}")
+          print(f"  required sections: {len(required)}, all present")
+          print(f"  prerelease: {prerelease}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"NOTES_FILE={notes_file}\n")
+              handle.write(f"PRERELEASE={str(prerelease).lower()}\n")
+          PY
+      - name: Assert the three platform archives are here, named for this tag
+        run: |
+          set -eu
+          found=$(find dist -type f | sort)
+          echo "$found"
+          count=$(printf '%s\n' "$found" | wc -l | tr -d ' ')
+          if [ "$count" -ne 3 ]; then
+            echo "::error::expected 3 platform archives and found $count. An artifact that was not uploaded is a release missing a platform."
+            exit 1
+          fi
+          for archive in $found; do
+            case "$(basename "$archive")" in
+              "whirl-${GITHUB_REF_NAME}-"*) ;;
+              *)
+                echo "::error::$archive is not named for the tag $GITHUB_REF_NAME"
+                exit 1
+                ;;
+            esac
+          done
+      - name: Create the release, with the notes and the three archives attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          # `--verify-tag`: this run was triggered by the tag, so the tag must
+          # already exist. Without it, a typo in the tag name would silently
+          # create a new one.
+          args=(
+            --repo "$GITHUB_REPOSITORY"
+            --verify-tag
+            --title "whirl $TAG"
+            --notes-file "$NOTES_FILE"
+          )
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}" dist/*
+          echo "release $TAG created; what it holds:"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isPrerelease,isDraft,assets \
+            --jq '"  \(.tagName) prerelease=\(.isPrerelease) draft=\(.isDraft)", (.assets[] | "  \(.name) \(.size) bytes")'

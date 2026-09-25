@@ -52,9 +52,29 @@ result will send it back.
 
 ## Branches, commits, scope
 
-- One branch per change, from `main`, named `<area>/<short-topic>`, for example
+- **`development` integrates, `main` releases, a working branch is short-lived.**
+  Cut your branch from `development` and open the pull request with
+  `gh pr create --base development`. `main` only ever receives a promotion pull
+  request from `development`, after `development` is green and the
+  release-blocking checklists have been run on real hardware
+  (`docs/development.md` section 5).
+- **Nothing reaches `main` twice.** Anything that lands there, a promotion or a
+  later hotfix, is merged straight back into `development`, so `main`'s tip stays
+  an ancestor of `development`: the next working branch catches up without rebasing
+  under a reviewer, and a promotion is a straight merge with nothing to reconcile
+  (section 6 of the guide has the commands and the reason).
+- **A tag on `main` is a release.** `.github/workflows/release.yml` publishes it,
+  notes and artifacts included, and it refuses a final release whose notes are
+  missing, unfilled or incomplete. To rehearse that, use a prerelease tag
+  (`vX.Y.Z-rc.N`), which the workflow marks as a prerelease; a tag shaped like a
+  real release is not a rehearsal, and deleting it afterwards leaves a release in
+  every clone that fetched it.
+- **Branch protection does the remembering:** `main` requires a pull request and
+  passing checks, `development` requires passing checks. That is the expectation
+  these documents describe; the repository owner applies the settings.
+- One branch per change, named `<area>/<short-topic>`, for example
   `daemon/stale-socket-probe` or `worker/wallhaven-pagination`. Delete it after
-  it merges.
+  it merges, and never reuse it.
 - One change per pull request. A formatting sweep and a behaviour change are two
   pull requests.
 - Commit subject in the imperative, 72 characters or fewer, area prefix when it
