@@ -7,7 +7,7 @@
 //! Unix only in this scaffold: the Windows named pipe of 2.1 is a later card,
 //! and `main` refuses to start there rather than pretending.
 
-use crate::state::{Daemon, Resolved, favorite_state, now, platform};
+use crate::state::{Daemon, platform};
 use crate::worker::{Outcome, Verb, WorkerError};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -30,6 +30,12 @@ pub const SUN_PATH_LIMIT: usize = 104;
 
 /// `connection_idle_timeout` (2.8): 300 s without a complete request line.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A subscribed connection polls its socket for a request line every 100 ms so
+/// it can also drain its event queue. This is not the idle timeout: 2.8 measures
+/// idle in "no traffic at all", and a subscribed connection always has traffic,
+/// so a poll that finds nothing is a loop iteration and not a disconnect.
+pub const STREAM_POLL: Duration = Duration::from_millis(100);
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -161,17 +167,22 @@ fn handle(stream: UnixStream, daemon: &Daemon) -> io::Result<()> {
     // The idle timeout of 2.8, applied to the socket rather than to a timer.
     stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
+    let mut writer = stream.try_clone()?;
     writeln!(writer, "{}", protocol::greeting())?;
     writer.flush()?;
 
     loop {
         match read_request_line(&mut reader) {
-            Ok(ReadOutcome::Line(line)) => {
-                if let Control::Close = dispatch(daemon, &line, &mut writer)? {
-                    return Ok(());
+            Ok(ReadOutcome::Line(line)) => match dispatch(daemon, &line, &mut writer)? {
+                Control::Close => return Ok(()),
+                // 2.9: the subscription takes over the connection. When it ends
+                // the connection ends with it, because everything a client sent
+                // during it was answered inside the stream.
+                Control::Subscribe { since } => {
+                    return subscribe(daemon, &stream, &mut reader, &mut writer, since);
                 }
-            }
+                Control::Continue => {}
+            },
             Ok(ReadOutcome::TooLong) => {
                 return write_err(
                     &mut writer,
@@ -198,6 +209,97 @@ fn handle(stream: UnixStream, daemon: &Daemon) -> io::Result<()> {
                 return Ok(());
             }
             Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The stream of docs/architecture.md 2.9: `subscribed:`, an optional `gap:`,
+/// then one `event:` line per state change and one heartbeat per 30 s of quiet.
+///
+/// The daemon keeps no event history, so the only thing a `since` can produce is
+/// the size of the gap. Everything the client sends during the stream is
+/// answered `ERR bad_args subscribe takes over this connection` and the stream
+/// continues, which is what lets a client keep exactly one connection open and
+/// still see its own errors.
+fn subscribe(
+    daemon: &Daemon,
+    stream: &UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    out: &mut UnixStream,
+    since: Option<u64>,
+) -> io::Result<()> {
+    // Subscribing and reading the sequence number happen under one lock, so a
+    // state change can never land between the number the client is told and the
+    // moment its queue exists (Daemon::subscribe).
+    let (seq, events) = daemon.subscribe();
+    writeln!(out, "subscribed: {seq}")?;
+    if let Some(since) = since {
+        if since < seq {
+            writeln!(out, "gap: {}", seq - since)?;
+        }
+    }
+    out.flush()?;
+    stream.set_read_timeout(Some(STREAM_POLL))?;
+
+    loop {
+        let mut sent = false;
+        loop {
+            match events.try_recv() {
+                Ok(line) => {
+                    out.write_all(line.as_bytes())?;
+                    sent = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // The bus dropped this subscriber: its queue filled because the
+                // client stopped reading. The stream ends; the client notices
+                // and reconnects, which re-reads `status` (2.9).
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+        if sent {
+            out.flush()?;
+        }
+        match read_request_line(reader) {
+            // `close` is the one request that is honoured: it ends the stream
+            // and the connection (2.9).
+            Ok(ReadOutcome::Line(line)) if matches!(Request::parse(&line), Ok(Request::Close)) => {
+                return write_ok(out);
+            }
+            Ok(ReadOutcome::Line(_)) => {
+                write_err(
+                    out,
+                    ErrorCode::BadArgs,
+                    "subscribe takes over this connection",
+                )?;
+            }
+            Ok(ReadOutcome::Eof) => return Ok(()),
+            // A line that is too long or not UTF-8 leaves the connection out of
+            // step with the framing, so the stream ends exactly as it does on a
+            // command connection.
+            Ok(ReadOutcome::TooLong) => {
+                return write_err(
+                    out,
+                    ErrorCode::TooLong,
+                    format!("request line exceeds {} bytes", protocol::MAX_REQUEST_LINE),
+                );
+            }
+            Ok(ReadOutcome::BadFraming) => {
+                return write_err(out, ErrorCode::BadFraming, "request line is not UTF-8");
+            }
+            // No request line this poll: not an idle timeout, because a
+            // subscribed connection is never idle (2.8).
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        // 30 s of quiet anywhere in the daemon produces one heartbeat for every
+        // subscriber, and a heartbeat consumes a seq like any other event. The
+        // claim is exclusive, so two subscribers produce one heartbeat.
+        if daemon.bus.claim_heartbeat() {
+            daemon.heartbeat();
         }
     }
 }
@@ -246,10 +348,13 @@ fn read_request_line(reader: &mut impl BufRead) -> io::Result<ReadOutcome> {
     }
 }
 
+/// What the connection does after one request. The third case is 2.9's mode:
+/// `subscribe` is not an answer, it is a handover.
 #[derive(PartialEq, Eq)]
 enum Control {
     Continue,
     Close,
+    Subscribe { since: Option<u64> },
 }
 
 /// One request, one response. `out` is written as the answer is produced, so
@@ -350,14 +455,16 @@ fn dispatch(daemon: &Daemon, line: &str, out: &mut impl Write) -> io::Result<Con
             write_response(out, &response)?;
         }
         Request::Favorite { id } => {
+            // 6.4 step 3: a degraded favorites file is not an empty pin set.
+            // Writing a pin over one the daemon could not read would lose it.
+            if let Some(path) = daemon.favorites_degraded_message() {
+                write_err(out, ErrorCode::FavoritesDegraded, path)?;
+                return Ok(Control::Continue);
+            }
             let resolved = match &id {
                 Some(id) => daemon.resolve_id(id),
-                None => daemon.state().current.as_ref().map(|current| Resolved {
-                    origin_key: current.origin_key.clone(),
-                    digest: Some(current.digest.clone()),
-                    kind: current.kind,
-                    path: current.path.clone(),
-                }),
+                // `favorite` with no argument pins what is on screen (2.5).
+                None => daemon.state().current_resolved(),
             };
             match resolved {
                 None => {
@@ -368,59 +475,32 @@ fn dispatch(daemon: &Daemon, line: &str, out: &mut impl Write) -> io::Result<Con
                     )?;
                 }
                 Some(resolved) => {
-                    let response;
-                    {
-                        let mut state = daemon.state();
-                        let already = state.favorites.contains_key(&resolved.origin_key);
-                        if !already {
-                            let bytes = favorite_state(resolved.path.as_deref());
-                            state.favorites.insert(
-                                resolved.origin_key.clone(),
-                                Favorite {
-                                    added_at: now(),
-                                    kind: resolved.kind,
-                                    origin_key: resolved.origin_key.clone(),
-                                    digest: resolved.digest.clone(),
-                                    state: bytes,
-                                    path: resolved.path.clone(),
-                                },
-                            );
-                        }
-                        state.seq += 1;
-                        let digest = resolved.digest.clone().unwrap_or_else(|| "-".to_string());
-                        response = Response::ok()
-                            .line(format!("favorited: {digest} {}", resolved.origin_key))
-                            .kv("already", u8::from(already));
-                    }
+                    let already = !daemon.add_favorite(&resolved);
+                    let digest = resolved.digest.clone().unwrap_or_else(|| "-".to_string());
+                    let response = Response::ok()
+                        .line(format!("favorited: {digest} {}", resolved.origin_key))
+                        .kv("already", u8::from(already));
                     write_response(out, &response)?;
                 }
             }
         }
         Request::Unfavorite(id) => {
-            let response;
-            {
-                let mut state = daemon.state();
-                let removed = state
-                    .resolve(&id)
-                    .and_then(|resolved| state.favorites.remove(&resolved.origin_key));
-                match removed {
-                    None => {
-                        drop(state);
-                        write_err(
-                            out,
-                            ErrorCode::NotFound,
-                            format!("{id} is not an origin_key, not a digest and not a favorite"),
-                        )?;
-                        return Ok(Control::Continue);
-                    }
-                    Some(favorite) => {
-                        state.seq += 1;
-                        let digest = favorite.digest.unwrap_or_else(|| "-".to_string());
-                        response = Response::ok().line(format!("unfavorited: {digest}"));
-                    }
+            if let Some(path) = daemon.favorites_degraded_message() {
+                write_err(out, ErrorCode::FavoritesDegraded, path)?;
+                return Ok(Control::Continue);
+            }
+            match daemon.remove_favorite(&id) {
+                None => {
+                    write_err(
+                        out,
+                        ErrorCode::NotFound,
+                        format!("{id} is not an origin_key, not a digest and not a favorite"),
+                    )?;
+                }
+                Some(digest) => {
+                    write_response(out, &Response::ok().line(format!("unfavorited: {digest}")))?;
                 }
             }
-            write_response(out, &response)?;
         }
         Request::Next => {
             run_rotation(daemon, out, Via::Source, Verb::Rotate, None)?;
@@ -517,14 +597,10 @@ fn dispatch(daemon: &Daemon, line: &str, out: &mut impl Write) -> io::Result<Con
                 }
             }
         }
-        Request::Subscribe { .. } => {
-            // 2.9 is a later card: this build answers commands only, and says so
-            // rather than holding a connection open with nothing to send.
-            write_err(
-                out,
-                ErrorCode::Internal,
-                "subscribe is not implemented in this scaffold (docs/architecture.md 2.9)",
-            )?;
+        Request::Subscribe { since } => {
+            // 2.9: this is a handover, not an answer. `handle` writes the stream
+            // and drains it until the client closes or the bus drops it.
+            return Ok(Control::Subscribe { since });
         }
         Request::Close => {
             write_ok(out)?;
@@ -587,15 +663,12 @@ fn run_rotation(
             write_ok(out)
         }
         Err(WorkerError::Timeout) => {
-            daemon.record_failure(ErrorCode::Timeout);
-            write_err(
-                out,
-                ErrorCode::Timeout,
-                "the worker did not finish inside schedule.worker_deadline_seconds",
-            )
+            let message = "the worker did not finish inside schedule.worker_deadline_seconds";
+            daemon.record_failure(ErrorCode::Timeout, message);
+            write_err(out, ErrorCode::Timeout, message)
         }
         Err(WorkerError::Failed { code, message }) => {
-            daemon.record_failure(code);
+            daemon.record_failure(code, &message);
             write_err(out, code, &message)
         }
     }
