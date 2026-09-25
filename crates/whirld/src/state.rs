@@ -167,13 +167,15 @@ impl State {
 
     /// How many seconds until `next_at`, clamped to `0..=interval`, or `None`
     /// while paused: a suspended schedule has no deadline to count down to
-    /// (2.10 `next_in_s`, 5.5 rule 8).
-    pub fn next_in_s(&self, interval_seconds: u64) -> Option<i64> {
+    /// (2.10 `next_in_s`, 5.5 rule 8). `now` is passed in rather than read here,
+    /// so each state 2.10 names is asserted on a value instead of on the
+    /// machine's clock.
+    pub fn next_in_s(&self, now: i64, interval_seconds: u64) -> Option<i64> {
         if self.paused {
             return None;
         }
         let next_at = self.next_at?;
-        let remaining = next_at - unix_seconds();
+        let remaining = next_at - now;
         Some(remaining.clamp(0, interval_seconds as i64))
     }
 }
@@ -281,7 +283,7 @@ impl Daemon {
                 "next_in_s",
                 dash(
                     state
-                        .next_in_s(config.schedule.interval_seconds)
+                        .next_in_s(unix_seconds(), config.schedule.interval_seconds)
                         .map(|seconds| seconds.to_string()),
                 ),
             )
@@ -976,4 +978,75 @@ fn cache_usage(root: &Path) -> Option<(u64, u64)> {
 /// and `unrecoverable` when there is no path to check (2.6).
 pub fn favorite_state(path: Option<&str>) -> FavoriteState {
     whirl_core::state::favorite_state_of(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2.10's `next_in_s` row, one assertion per state it names, with `now`
+    /// passed in: a live deadline counts down, a deadline already passed is `0`
+    /// and never negative, a deadline further away than one interval is capped
+    /// at the interval, a suspended schedule has no deadline to count down to
+    /// (`-`, which is `None` here), and a missing deadline is `-` too.
+    ///
+    /// Each assertion fails on a wrong value of the right shape: dropping the
+    /// clamp gives `-7` for the passed deadline and `99_999` for the distant
+    /// one, and returning `Some(0)` for a paused daemon (a plausible reading of
+    /// "no countdown") fails the two `None` assertions.
+    #[test]
+    fn next_in_s_is_the_countdown_of_2_10_in_every_state() {
+        let mut state = State::new(50);
+        assert_eq!(
+            state.next_in_s(1_000, 1800),
+            None,
+            "no persisted deadline: 2.10's `-` while the schedule is unset"
+        );
+
+        state.next_at = Some(2_800);
+        assert_eq!(state.next_in_s(1_000, 1800), Some(1_800));
+        assert_eq!(
+            state.next_in_s(1_799, 1800),
+            Some(1_001),
+            "a second later the countdown is a second shorter"
+        );
+        assert_eq!(
+            state.next_in_s(2_807, 1800),
+            Some(0),
+            "a deadline already passed counts down to 0, not below it"
+        );
+        // A deadline further away than one interval (a hand-edited state file)
+        // is capped at the interval rather than reported as-is.
+        state.next_at = Some(1_000_000);
+        assert_eq!(
+            state.next_in_s(900_000, 1800),
+            Some(1_800),
+            "capped at one interval"
+        );
+
+        state.next_at = Some(2_800);
+        state.paused = true;
+        assert_eq!(
+            state.next_in_s(1_200, 1800),
+            None,
+            "a suspended schedule has no deadline to count down to (5.5 rule 8)"
+        );
+    }
+
+    /// `resume` re-arms from now (2.5, 5.5 rule 8), so the countdown straight
+    /// after it is the full interval; `pause` freezes the deadline where it was
+    /// rather than advancing it, so the value is unchanged by the pause.
+    #[test]
+    fn a_re_armed_deadline_counts_down_from_the_full_interval() {
+        let mut state = State::new(50);
+        state.next_at = Some(crate::schedule::rearmed_from(1_000, 1800));
+        assert_eq!(state.next_in_s(1_000, 1800), Some(1_800));
+        state.paused = true;
+        state.paused = false;
+        assert_eq!(
+            state.next_in_s(1_000, 1800),
+            Some(1_800),
+            "the flag does not move the deadline"
+        );
+    }
 }
