@@ -8,16 +8,16 @@ someone who did not write it has reproduced its evidence and said so, in
 
 | document | status | what it decides |
 |---|---|---|
-| `research/macos.md` | written, revised after review | how macOS stores and applies wallpaper per display and per Space, what the supported API is, multi-display and hotplug behaviour, minimum OS version |
-| `research/windows.md` | written, revised after review | the same for Windows 10/11, including whether per-monitor and per-virtual-desktop wallpaper are possible at all |
+| `research/macos.md` | reviewed | how macOS stores and applies wallpaper per display and per Space, what the supported API is, multi-display and hotplug behaviour, minimum OS version |
+| `research/windows.md` | reviewed | the same for Windows 10/11, including whether per-monitor and per-virtual-desktop wallpaper are possible at all |
 | `research/linux.md` | reviewed | the per-desktop-environment matrix (GNOME, KDE, sway, Hyprland, X11) and which compositors require a resident process |
 | `research/scheduling.md` | reviewed | launchd, Task Scheduler and systemd user timers: missed-run behaviour across sleep, install/uninstall, and whether they can replace an in-daemon timer |
-| `spec/features.md` | written, revised after review | the v0.1 feature set, the source abstraction, filters, and what is explicitly out of scope |
+| `spec/features.md` | reviewed | the v0.1 feature set, the source abstraction, filters, and what is explicitly out of scope |
 | `spec/state-and-cache.md` | reviewed | per-OS state and cache locations, eviction policy, atomic writes, corruption recovery |
-| `architecture.md` | written, review outstanding | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
-| `development.md` | written, review outstanding | repo layout, build and test matrix, release process, contribution workflow |
+| `architecture.md` | reviewed, defects being fixed | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
+| `development.md` | reviewed, defects being fixed | repo layout, build and test matrix, release process, contribution workflow |
 | `decisions/` | template in place, no decisions recorded yet | one ADR per decision that changes the architecture; template in `0000-template.md` |
-| `reviews/` | one report so far, round 2 in progress | one review report per reviewed document: what the reviewer ran, what they observed, what they could not check |
+| `reviews/` | three reports: the pack (two rounds) and the architecture set | one review report per reviewed document: what the reviewer ran, what they observed, what they could not check |
 
 ## Reading order
 
