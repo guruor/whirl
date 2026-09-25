@@ -1473,11 +1473,11 @@ mod tests {
         let plan = plan_record(&[
             ("schedule.interval_seconds".to_string(), "1800".to_string()),
             ("backend".to_string(), "noop".to_string()),
-            ("sources_enabled".to_string(), "1".to_string()),
+            ("sources".to_string(), "1".to_string()),
         ]);
         assert_eq!(
             plan,
-            "plan: schedule.interval_seconds=1800 backend=noop sources_enabled=1"
+            "plan: schedule.interval_seconds=1800 backend=noop sources=1"
         );
         assert_eq!(parse_plan_record(&plan).map(|p| p.len()), Some(3));
     }

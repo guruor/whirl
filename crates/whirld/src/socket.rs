@@ -7,6 +7,7 @@
 //! Unix only in this scaffold: the Windows named pipe of 2.1 is a later card,
 //! and `main` refuses to start there rather than pretending.
 
+use crate::lock;
 use crate::state::{Daemon, Rotation, platform};
 use crate::worker::{Outcome, Verb, WorkerError};
 use std::io::{self, BufRead, BufReader, Write};
@@ -577,10 +578,30 @@ fn dispatch(daemon: &Daemon, line: &str, out: &mut impl Write) -> io::Result<Con
             let deadline = daemon.worker_deadline();
             match daemon.worker.run(Verb::Check, None, run, deadline) {
                 Ok(Outcome::Lines(lines)) => {
-                    for line in lines {
-                        writeln!(out, "{line}")?;
+                    // 8.7 and 4.2's `cache.root` comment: the check refuses a
+                    // root whose filesystem cannot `flock`, and reports
+                    // `lock_mode: excl_file` when the weaker lock had to be used.
+                    // The probe runs after the worker, so this config has already
+                    // passed the value and ordering rules the worker enforces;
+                    // its lines are dropped on a refusal, because 2.5's refusals
+                    // are one `ERR` and a half-answer before one would be a body
+                    // no rule describes.
+                    if let Err(message) =
+                        lock::cache_root_accepts_flock(&daemon.effective.cache_dir)
+                    {
+                        write_err(out, ErrorCode::BadConfig, message)?;
+                    } else {
+                        for line in lines {
+                            writeln!(out, "{line}")?;
+                        }
+                        // Only under 8.7's fallback: 2.5's `config check` body is
+                        // otherwise exhaustive, so this line is absent under
+                        // `flock` rather than always present.
+                        if let Some(line) = daemon.lock_line() {
+                            writeln!(out, "{line}")?;
+                        }
+                        write_ok(out)?;
                     }
-                    write_ok(out)?;
                 }
                 Ok(Outcome::Set(_)) => {
                     write_err(

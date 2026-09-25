@@ -20,6 +20,8 @@
 #[cfg(unix)]
 mod events;
 #[cfg(unix)]
+mod lock;
+#[cfg(unix)]
 mod plan;
 #[cfg(unix)]
 mod schedule;
@@ -82,6 +84,16 @@ fn main() -> ExitCode {
 
 #[cfg(unix)]
 fn run(flags: &plan::Flags) -> Result<(), String> {
+    // 1.5 step 1, before anything else at all: take `state/locks/daemon.lock`
+    // exclusively and non-blocking, and hold it for this process's lifetime.
+    // 7.2 makes the refusal the point of the lock: a second daemon exits here,
+    // naming the holder's pid, rather than unlinking a live socket or rotating
+    // the wallpaper the first one is already rotating. The resolved state
+    // directory is the same value `Effective::resolve` uses below, so step 1
+    // cannot lock one directory while the daemon runs in another.
+    let state_dir = plan::state_dir()?;
+    let lock = lock::take(&state_dir)?;
+
     let effective = plan::Effective::resolve(flags)?;
     eprintln!("whirld: config {}", effective.config_path.display());
     eprintln!(
@@ -97,7 +109,7 @@ fn run(flags: &plan::Flags) -> Result<(), String> {
     // The state files are read here: a quarantine, a rebuild and the degraded
     // modes of docs/spec/state-and-cache.md 6.4 all happen before the socket is
     // bound, so the first `status` already reports them.
-    let daemon = Arc::new(state::Daemon::load(effective, worker));
+    let daemon = Arc::new(state::Daemon::load(effective, worker, lock));
     let listener = socket::bind(&socket_path)?;
     eprintln!("whirld: listening on {}", socket_path.display());
 
