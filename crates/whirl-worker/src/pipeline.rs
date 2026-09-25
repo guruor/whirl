@@ -2108,6 +2108,14 @@ mod tests {
             seeking("sixteen-ten", "b.png", 1600, 1000, 100),
             seeking("just-inside", "c.png", 1600, 890, 100),
             seeking("just-outside", "d.png", 1600, 880, 100),
+            // The case that separates the two readings, and the reason this test
+            // is named after the fractional one: 1600x886 is 1.8059 against
+            // 1.7778, an absolute delta of 0.0281 that the tolerance of 0.02
+            // would reject, but a fractional delta of 0.0158 that it keeps.
+            // Without this candidate `(ratio - target).abs() > tolerance` and
+            // `((ratio - target) / target).abs() > tolerance` agree on every
+            // other entry, so the mutation survives (t_ddb890aa, run 3).
+            seeking("in-the-band", "e.png", 1600, 886, 100),
         ];
 
         let stage = stage_ratio(candidates, &config, Some(target));
@@ -2117,7 +2125,7 @@ mod tests {
             .iter()
             .map(|seeking| seeking.candidate.id.as_str())
             .collect();
-        assert_eq!(kept, vec!["sixteen-nine", "just-inside"]);
+        assert_eq!(kept, vec!["sixteen-nine", "just-inside", "in-the-band"]);
         assert_eq!(stage.rejected, 2);
         // `any` is the config default, and then nothing is rejected.
         assert_eq!(stage_ratio(vec![], &config, None).rejected, 0);
