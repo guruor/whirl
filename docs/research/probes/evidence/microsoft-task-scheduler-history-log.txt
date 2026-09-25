@@ -1,0 +1,8 @@
+# Microsoft Learn: Scheduled Tasks Not Running (Windows Server troubleshooting article)
+# source: https://learn.microsoft.com/en-us/troubleshoot/windows-server/system-management-components/troubleshoot-scheduled-tasks-not-running
+# fetched 2026-09-25 from this machine, HTTP 200
+# excerpt copied verbatim from the fetched page text
+
+Check the History tab for specific task events. This tab allows you to determine if the task is triggered and successfully completed.
+
+Task Scheduler event log (Event Viewer > Applications and Services Logs > Microsoft > Windows > TaskScheduler > Operational)

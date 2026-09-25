@@ -2,7 +2,10 @@
 
 Status: draft for review. Written 2026-09-25 on macOS 26.5.2 (build 25F84), Darwin 25.5.0,
 arm64. macOS behaviour below was measured on this machine; Windows and Linux behaviour is
-cited from primary documentation and is marked **unverified here** throughout.
+cited from primary documentation and is marked **unverified here** throughout. The raw
+command output behind every launchd measurement, together with the probe plists used, is
+committed at `probes/local-probe-transcript.md` (probes A-J, plus R, a re-run of probe F in
+the round-2 session).
 
 The question this document has to answer: **can the OS scheduler be trusted to trigger
 rotations on all three platforms, or must the daemon own its own timer?**
@@ -43,7 +46,9 @@ That is the crux: **an `StartInterval` job loses the firing entirely when the ma
 asleep.** Apple states the general rule as "all other launchd jobs are skipped when the
 computer is turned off or asleep; they will not run until the next designated time occurs"
 [1]. A nightly-sleeping laptop therefore rotates on the first interval boundary *after* wake,
-which for a long interval can be hours late.
+which for a long interval can be hours late (**inference** from the quoted sentence: the man
+page says the firing is lost, it does not say when the next one comes; untested here, see the
+untested table at the end).
 
 `StartCalendarInterval` — same man page:
 
@@ -222,13 +227,13 @@ nothing here is asserted without one.
 
 | capability | launchd (macOS) | Task Scheduler (Windows) | systemd --user (Linux) | source |
 |---|---|---|---|---|
-| Interval trigger | `StartInterval`, floored at 10 s by the default throttle | `/ri <interval>` (minutes) with `MINUTE`/`HOURLY` schedule, or repetition on a time trigger | `OnUnitActiveSec`/`OnBootSec` (monotonic) | measured A/B/F; [8]; [19] |
+| Interval trigger | `StartInterval`, floored at 10 s by the default throttle | `/ri <interval>` (minutes) with `MINUTE`/`HOURLY` schedule, or repetition on a time trigger | `OnUnitActiveSec`/`OnBootSec` (monotonic) | measured A/B/F, re-run as R; [8]; [19] |
 | Calendar trigger | `StartCalendarInterval` (wildcard keys, array of dicts) | time triggers + `StartWhenAvailable` | `OnCalendar` | [launchd.plist(5)], [2]; [4]; [19] |
 | Missed run while asleep | `StartCalendarInterval` runs it on wake; `StartInterval` **loses it** | only with `StartWhenAvailable=true`, ~10 min after wake; `WakeToRun` can wake the machine if the plan allows | `OnCalendar` catches up on resume; monotonic timers do not | [launchd.plist(5)] quoted; [4]; [19] quoted |
-| Burst of missed runs | coalesced into one event | one delayed start per missed trigger; no coalescing language in the docs | coalesced into a single activation | [launchd.plist(5)]; [4] (silent); [19] |
+| Burst of missed runs | coalesced into one event | one delayed start per missed trigger (**inference**: Microsoft documents no coalescing rule for a missed trigger, only the ~10 min start delay) | coalesced into a single activation | [launchd.plist(5)]; [4] (silent: Windows cell is inference); [19] |
 | Missed run while off / job unregistered | not replayed, next designated time instead (measured: `runs = 0`) | `StartWhenAvailable` queues it after the next start; otherwise skipped | only with `Persistent=true` | measured G/H; [1]; [4]; [19] |
 | Crash restart | `KeepAlive` true: unconditional, 10 s throttle (measured) | `RestartOnFailure` Count+Interval; off unless configured | `Restart=always`, `RestartSec` (default 100 ms); `no` by default | measured E/I; [15][11]; [23][24] |
-| Log capture | `StandardOutPath`/`StandardErrorPath` (measured) | Task Scheduler history in its own event log; no per-task stdout redirection documented | journald: `StandardOutput=` "defaults to... journal" for a user service | measured J; [17]; [26][27] |
+| Log capture | `StandardOutPath`/`StandardErrorPath` (measured) | per-task history in the `Microsoft-Windows-TaskScheduler/Operational` event log (Task Scheduler's History tab); no per-task stdout redirection, the `Exec` action's complete child set is `Command`/`Arguments`/`WorkingDirectory` | journald: `StandardOutput=` "defaults to... journal" for a user service | measured J; [28][29]; [26][27] |
 | Overlap of two runs | interval firings during a run are missed (measured C) | `MultipleInstancesPolicy`, default `IgnoreNew` | a service already active is left running | measured C; [14]; [18] |
 | Requires an always-on daemon? | no, but the *wallpaper* needs a GUI session | no, but session 0 / logged-off tasks cannot set a desktop wallpaper | no, but a user manager must exist (session or linger) | reasoning from [1][8][22]; **unverified** |
 | Can it wake the machine | no | yes, `WakeToRun` + the power plan's wake timers | only the system manager (`WakeSystem=` requires privileges) | [launchd.plist(5)] is silent, [1] implies no; [5][7]; [19] |
@@ -454,3 +459,6 @@ systemctl --user daemon-reload
 [25] https://raw.githubusercontent.com/systemd/systemd/main/man/logind.conf.xml
 [26] https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html
 [27] https://raw.githubusercontent.com/systemd/systemd/main/man/systemd.exec.xml
+[28] https://learn.microsoft.com/en-us/troubleshoot/windows-server/system-management-components/troubleshoot-scheduled-tasks-not-running
+[29] https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-exectype-complextype
+

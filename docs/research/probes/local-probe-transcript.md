@@ -179,6 +179,147 @@ J stderr 1790321144
 kickstart fires the job on demand; StandardOutPath and StandardErrorPath capture the job's
 stdout and stderr verbatim.
 
+## R: probe F re-run in the round-2 session (2026-09-25 13:04-13:10 IST)
+
+The round-1 review could not re-run any launchd probe (its session refused
+`launchctl bootstrap`), so it corroborated against the on-disk artifacts instead. This
+section is that re-run, in a session where `launchctl bootstrap`/`bootout` were permitted.
+It repeats probe F: `StartInterval 2` with `ThrottleInterval 1`.
+
+`docs/research/probes/com.whirl.research.probeR.plist`, in full:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Probe R: re-run of probe F under the round-2 review request.
+     StartInterval 2 with ThrottleInterval 1. Probe F measured a 2.1 s cadence,
+     i.e. the throttle, not StartInterval, sets the floor. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.whirl.research.probeR</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>date +%s.%N &gt;&gt; /tmp/whirl-probe-R.log</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>2</integer>
+  <key>ThrottleInterval</key>
+  <integer>1</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/tmp/whirl-probe-R.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/whirl-probe-R.err</string>
+</dict>
+</plist>
+```
+
+Run 1, first bootstrap in this session:
+
+```
+$ launchctl bootstrap gui/501 docs/research/probes/com.whirl.research.probeR.plist
+bootstrap exit=0
+1790321692.899995000          <- date, immediately after bootstrap
+$ sleep 25; cat /tmp/whirl-probe-R.log
+1790321694.941828000
+1790321696.998041000
+1790321699.065373000
+1790321701.127036000
+1790321703.166000000
+1790321705.238234000
+1790321707.306919000
+1790321709.370396000
+1790321711.435752000
+1790321713.481855000
+1790321715.547908000
+1790321717.616484000
+1790321719.688871000
+$ launchctl list | grep -i whirl
+-  0  com.whirl.research.probeR
+```
+
+13 fires, 2.04-2.07 s apart. RunAtLoad is false here, so the first fire is a real interval
+firing, not a load-time run.
+
+Runs 2 and 3 (after `bootout`, to check it reproduces):
+
+```
+$ launchctl print gui/501/com.whirl.research.probeR | grep -E "state =|runs =|minimum runtime|path ="
+path = /private/tmp/probeR.plist
+state = not running
+minimum runtime = 1
+runs = 1
+$ cat /tmp/whirl-probe-R.log
+1790321790.884169000
+1790321792.956749000
+1790321795.028331000
+1790321797.082115000
+1790321799.153640000
+1790321801.217735000
+1790321803.341497000
+1790321808.419345000          <- run 3 starts; the 5.08 s jump below is the reload gap
+1790321810.492653000
+1790321812.565496000
+1790321814.640365000
+1790321816.704919000
+1790321818.775262000
+$ awk '{if(NR>1) printf "%.6f\n", $1-p; p=$1}' /tmp/whirl-probe-R.log
+2.072580
+2.071582
+2.053784
+2.071525
+2.064095
+2.123762
+5.077848                      <- between run 2's last fire and run 3's first fire (reload gap)
+2.073308
+2.072843
+2.074869
+2.064554
+2.070343
+```
+
+`launchctl print` reports `minimum runtime = 1`, which is exactly the `ThrottleInterval`
+this plist sets, and the observed cadence is that floor plus ~60 ms of process overhead.
+That is the same conclusion probe F reached: the throttle, not `StartInterval`, sets the
+floor when `ThrottleInterval` is below it.
+
+One observed launchd quirk, recorded because a future reader will hit it: after
+`launchctl bootout` of this label, bootstrapping the *same plist at the same path* failed
+twice with `Bootstrap failed: 5: Input/output error`, while the identical plist copied to
+`/private/tmp/probeR.plist` bootstrapped fine, and the worktree path was accepted again some
+50 s later. The failure is not reproducible on demand and did not affect the observation
+above (the run used for the cadence numbers is run 1, which bootstrapped first). Treat
+"Input/output error" from `launchctl bootstrap` as a retry-after-bootout symptom, not as a
+verdict on the plist.
+
+### Source-link re-check for the Windows API pages cited as [4] and [6]
+
+The round-1 review reported these two URLs as 404 with the slug `itasettings`. The committed
+text uses the double-s slug. Fetched from this machine, in this session:
+
+```
+$ curl -s -o /dev/null -w "%{http_code}\n" \
+  https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itasksettings-get_startwhenavailable
+200
+$ curl -s -o /dev/null -w "%{http_code}\n" \
+  https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itasksettings-put_waketorun
+200
+$ curl -s -o /dev/null -w "%{http_code}\n" \
+  https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itasettings-get_startwhenavailable
+404
+```
+
+Same result with and without a User-Agent header. `sed -n '433p;435p' scheduling.md | od -c`
+shows `i t a k s e t t i n g s` in both lines, and the two evidence files
+(`evidence/microsoft-startwhenavailable.txt`, `evidence/microsoft-waketorun.txt`) carry the
+same double-s slug on their line 3. So the URLs in the committed artifact resolve 200; the
+404 belongs to the single-s spelling, which appears nowhere in the branch (checked with
+`grep -rn "nf-taskschd-ita"` across `docs/`).
+
 ## Cleanup
 
 ```
@@ -186,6 +327,16 @@ $ launchctl remove com.whirl.probe2   # leftover submitted job from an earlier r
 removed stale com.whirl.probe2
 $ launchctl remove com.whirl.probe4   # ditto
 removed stale com.whirl.probe4
+$ launchctl bootout gui/501/com.whirl.research.probeR   # probe R, round 2
+exit=0
 $ launchctl list | grep -i whirl
 none
+$ ls ~/Library/LaunchAgents/ | grep -i whirl
+none
 ```
+
+Probe R was bootstrapped from its file in this repository and from a copy in `/tmp`; no plist
+was ever copied into `~/Library/LaunchAgents`, so `bootout` removes it completely. Left on
+disk and harmless: `/tmp/whirl-probe-R.log`, `/tmp/whirl-probe-R.out`,
+`/tmp/whirl-probe-R.err`, `/private/tmp/probeR.plist` and the earlier `~/whirl-probe-*` logs.
+No whirl job is loaded on this machine.
