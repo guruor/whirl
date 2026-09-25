@@ -60,9 +60,9 @@ result will send it back.
   (`docs/development.md` section 5).
 - **Nothing reaches `main` twice.** Anything that lands there, a promotion or a
   later hotfix, is merged straight back into `development`, so `main`'s tip stays
-  an ancestor of `development` and the next working branch fast-forwards instead
-  of rebasing under someone who is reviewing it (section 6 of the guide has the
-  commands and the reason).
+  an ancestor of `development`: the next working branch catches up without rebasing
+  under a reviewer, and a promotion is a straight merge with nothing to reconcile
+  (section 6 of the guide has the commands and the reason).
 - **A tag on `main` is a release.** `.github/workflows/release.yml` publishes it,
   notes and artifacts included, and it refuses a final release whose notes are
   missing, unfilled or incomplete. To rehearse that, use a prerelease tag

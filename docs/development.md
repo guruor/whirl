@@ -670,10 +670,12 @@ The rules that follow from that:
   not from a maintainer, not from an agent, and not to fix a release in a hurry.
   A hotfix is a change like any other, so it goes through `development` and then
   through a promotion.
-- **Cut the working branch from the tip of `development`,** and keep it there with
-  `git pull --ff-only origin development`. It does not rebase and it does not
-  merge: a branch whose diff is only its own change is the branch a reviewer can
-  read.
+- **Cut the working branch from the tip of `development`,** and keep it there:
+  `git pull --ff-only origin development` catches it up while it has nothing of its
+  own, and `git merge origin/development` does it once it has. Rebasing to catch up
+  is the thing not to do: a reviewer has already read those commits, and rewriting
+  them changes what is under review. The one exception is a commit that leaked a
+  credential, which is dropped rather than preserved for review (`Secrets` below).
 - **The back-merge rule.** Anything that reaches `main`, a promotion or a later
   hotfix, is merged back into `development` immediately, before any other work
   lands:
@@ -685,11 +687,13 @@ The rules that follow from that:
   git push origin development
   ```
 
-  **Why it exists:** it keeps `main`'s tip an ancestor of `development`. That is
-  what lets the next working branch fast-forward onto `development` instead of
-  rebasing (which rewrites commits a reviewer has already read) or merging (which
-  buries the change in a merge commit and makes the next diff unreadable). Skip
-  the back-merge and the damage is not in `main`, it is in the next branch.
+  **Why it exists:** it keeps `main`'s tip an ancestor of `development`, so the two
+  lines never run in opposite directions. Concretely: a working branch catches up
+  with `development` by a fast-forward or by merging `development` in, not by
+  rewriting its own commits, and a promotion pull request is a straight
+  `development` into `main` merge with nothing to reconcile, because `main` holds
+  no commit that `development` is missing. Skip the back-merge and the damage is
+  not in `main`, it is in the next branch.
 - **The rule is enforced, not remembered.** Branch protection on `main` requires
   a pull request and passing checks, so a direct commit, a force push or a merge
   with a red pipeline is refused by the host rather than by good intentions;
