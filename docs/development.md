@@ -626,20 +626,25 @@ last_via: -
 last_at: -
 last_error: -
 history_entries: 50
-sources: 2
+sources: 1
 ```
 
 ```
 $ cargo run -p whirl-cli -- next
 queued
-set: 05fcfcea6e028590562d144725a514b136342ec76690ffedcd1795dd4b8832bf local:05fcfcea source <path>
+set: 05fcfcea6e028590562d144725a514b136342ec76690ffedcd1795dd4b8832bf pictures:<sha256 of that path> source <path>
 ```
 
 `<path>` is the scaffold's placeholder for the candidate it selected: the scaffold's
 worker reports that name without downloading it, which is a shortcut the real noop
 backend does not take (the real one runs every stage except the platform setter,
 including the download and the cache write). A real worker prints the absolute path
-it set.
+it set. The second field is the `origin_key`, `<source id>:<source-scoped id>`
+(`docs/architecture.md` 2.5): the source is `pictures`, the `id` the config above
+gives it, and for a `local` source the source-scoped half is the sha256 of the
+absolute path, so it is a placeholder here exactly as `<path>` and the digest are.
+The shape is the part to check: the source `id` is the prefix, never the source
+*kind*.
 
 The `queued` line arrives before the work is done, on purpose: the control plane
 never waits on a worker (`docs/architecture.md` 1.8), which is why `next` returns
@@ -719,8 +724,8 @@ printf 'status\n' | nc -U "$WHIRL_SOCKET"
 ```
 
 The daemon speaks first: every connection opens with
-`OK whirl <daemon-version> protocol <n>`, for example
-`OK whirl whirl 0.1.0 protocol 2` (`docs/architecture.md` 2.4), so read a line
+`OK whirl <semver> protocol <n>`, for example
+`OK whirl 0.1.0 protocol 2` (`docs/architecture.md` 2.4), so read a line
 before you write one. `ping` answers a bare `OK`; an unset scalar prints as `-`.
 
 ### Reproducing a prototype measurement
