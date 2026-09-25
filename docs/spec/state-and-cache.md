@@ -7,7 +7,12 @@ degraded-favorites case is now named as a fourth permitted overshoot cause with
 the sweep's behaviour spelled out instead of a hidden exemption (5.3, 5.5, 6.4,
 8.7). Round 1's non-blocking caveats are also applied: the byte-cap sample is
 reported as three draws rather than one (5.1, [L 6], [L 8], [L 9]), and three
-citation imprecisions and one wrong section number are corrected.
+citation imprecisions and one wrong section number are corrected. This revision
+adds the rule the document did not have for the `excl_file` lock file: which
+release sentence is true of which lock (7.2), what the fallback records (8.7), and
+what the daemon does when it finds `state/locks/daemon.lock` held by a holder
+that is gone (8.8), including the `rotate.lock` case and what the daemon reports,
+which is a startup message rather than a `status` key.
 
 This document fixes where whirl keeps its files, what each file contains, what
 gets deleted and when, and which process is allowed to write what. It is written
@@ -877,19 +882,28 @@ and it only happens when a daemon dies.
 | `cache/tmp/**` | the worker run that created it | nobody |
 
 - `daemon.lock` is taken with `flock(LOCK_EX|LOCK_NB)` on POSIX [L 3] and
-  `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)` on Windows [9].
+  `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)` on Windows [9],
+  or with the `excl_file` fallback of 8.7 where that call answers `ENOTSUP`.
   A second daemon exits with a message naming the first daemon's pid, rather than
   unlinking a live socket, which is what `whd.rs:456` does today with an
-  unconditional `remove_file(&cfg.socket)`.
+  unconditional `remove_file(&cfg.socket)`; a lock file left behind by a daemon
+  that is gone is the second kind of refusal, classified and named in the same
+  message under 8.8.
 - `rotate.lock` is the same primitive, and it is what makes a sweep unable to run
   concurrently with a download (5.5) and two rotations unable to run at once.
   `decision:` the daemon holds it only for the sweep, not for the whole rotation,
   because the worker's own lifetime already serialises downloads and holding it
   across the worker would deadlock the two roles.
-- Both locks are advisory, and both are released by the operating system when the
-  holding process exits, including `SIGKILL` [L 3]. There is no stale-lock
-  recovery logic and no pid file to go out of date, which is the point of using
-  the OS primitive.
+- Both locks are advisory. Where the lock is the OS primitive, the operating
+  system releases it when the holding process exits, including `SIGKILL`: a lock
+  belongs to an open file description, and termination closes the descriptors, so
+  the kernel drops it without whirl doing anything [L 3] [12]. That release is
+  what preferring the primitive buys. The `excl_file` fallback of 8.7 does not
+  have it: that lock is a file whose existence is the lock, nothing removes the
+  file when the holder is killed, and its record of the holder is a pid file that
+  can go out of date. 8.8 is the rule for a lock file left behind, and
+  `lock_mode` in `status` (2.10) is how a running daemon says which of the two
+  it holds.
 - `decision:` the socket is unlinked only after a successful connection attempt
   fails, so a running daemon's socket is never removed by a starting one.
 - `decision:` the worker never opens the log file. It writes its result and its
@@ -912,8 +926,10 @@ and it only happens when a daemon dies.
    can see, instead of a second download nobody asked for.
 3. The worker runs: enumerates, filters, downloads, renames, sets, exits with one
    result line on stdout.
-4. The daemon takes `rotate.lock` (the worker has exited, so this cannot block),
-   validates that the reported path is inside the cache root and exists, writes
+4. The daemon takes `rotate.lock` (the worker has exited, so this cannot block;
+   where the `excl_file` fallback of 8.7 is in force, the daemon removes the
+   reaped worker's lock file here, under 8.8), validates that the reported path
+   is inside the cache root and exists, writes
    `current.json`, `history.json` and the index entry, runs the sweep, and
    releases the lock.
 5. The daemon notifies `idle` subscribers once, and only once. The prototype's
@@ -1033,8 +1049,13 @@ happen.
   allowed to be a failure path for the product.
 - Cache root on a filesystem that does not support `flock`: the lock file's
   `flock` returns `ENOTSUP` [L 3]. Fall back to an `O_CREAT|O_EXCL` lock file
-  that names the holder pid and start time, and report `lock_mode: excl_file` in
-  `status` so the weaker guarantee is visible rather than assumed.
+  whose existence is the lock and whose contents name the holder: its pid, and
+  the platform's own start time for that pid, which is the pair 8.8 needs to tell
+  a live holder from a recycled pid. Report `lock_mode: excl_file` in `status` so
+  the weaker guarantee is visible rather than assumed. `decision:` the fallback is
+  a property of the filesystem and not of one lock, so it covers both locks of
+  7.2, and 8.8 is the rule for either of them found left behind by a holder that
+  is gone.
 - `config.json` missing: written with defaults and fully commented, as
   features.md F1 requires. `config.json` unparseable: the daemon does not start,
   and the message names the byte offset, because a config error is the one error
@@ -1048,6 +1069,91 @@ happen.
   in 5.4 be written on legal configs only.
 - A second `whirl next` while a rotation is in flight: refused with `busy`, not
   queued (7.3).
+
+### 8.8 A lock file whose holder is gone
+
+`decision:` the rule is refusal, not recovery: a lock file left behind by a holder
+that is gone is reported to the operator rather than taken over. The daemon never
+unlinks, renames, truncates or overwrites a lock file in order to become the
+holder of it, with one exception it holds proof for, the rotation lock of a
+worker it has just reaped (`rotate.lock` below). This case belongs to the
+`excl_file` fallback of 8.7 alone: under `flock` and `LockFileEx` the kernel
+releases the lock when the holder exits and there is nothing to judge (7.2).
+
+Why the file is not reclaimed. Taking it over needs a compare-and-swap on the
+path, and the fallback is in force exactly where the filesystem does not provide
+the primitive that would give one. Two daemons starting in the same instant, each
+having read a dead holder and each having replaced the file, both run: two
+writers of `current.json`, which is the one failure 7.1 and R5 are written to
+prevent. So the cost of refusing is stated rather than hidden: on such a
+filesystem a `SIGKILL`ed or crashed daemon needs one file removed by hand before
+whirl starts again, and `lock_mode: excl_file` in `status` (2.10, 8.7) is how the
+operator learns the weaker lock was in use when that happened.
+
+What the daemon judges, and what a pid is worth. The record in the lock file is
+the holder's pid and the platform's own start time for that pid (8.7), because a
+pid alone is not an identity: pids are reused, so a recorded pid that answers as
+alive may be an unrelated process. The pair is what makes the message true, and
+the message is the whole output of this case:
+
+| Recorded holder | Message names it as |
+|---|---|
+| pid live, start time matches the record | the holder: `held by pid 4711, started <t>` |
+| pid live, start time differs from the record | a recycled pid: `left by pid 4711 started <t>; pid 4711 is now a different process` |
+| pid gone | a holder that exited: `left by pid 4711, started <t>, which is not running` |
+| liveness or start time unreadable | unjudged: `left by pid 4711, start time unreadable` |
+
+None of the four takes the file. Liveness and start time, per platform:
+
+- macOS and Linux: `kill(pid, 0)`, which the manual page names as the idiom:
+  "A value of 0, however, will cause error checking to be performed (with no
+  signal being sent). This can be used to check the validity of pid" [L 10]. So `0`
+  is alive, `ESRCH` is gone, and `EPERM` is alive and not ours, which is still
+  alive. Start time: macOS `sysctl(KERN_PROC_PID)` and `kp_proc.p_starttime`
+  [L 10], Linux `/proc/<pid>/stat` field 22, "The time the process started after
+  system boot", in clock ticks [13].
+- Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` for the pid, and
+  `GetProcessTimes` for `lpCreationTime`, "a FILETIME structure that receives the
+  creation time of the process" [14] [15]. No Windows host was available here, so
+  this column is documented API behaviour rather than something measured on this
+  machine (architecture.md 3.7 lists it as unverified [D 2]). A failed open is
+  read as gone only where the API documents the pid as nonexistent or unopenable,
+  and as unjudged for `ERROR_ACCESS_DENIED`, which the same page documents for the
+  System and CSRSS processes [14].
+- The judgement is not load-bearing: it changes the sentence, never the action,
+  because all four rows refuse. That is deliberate, and it is what makes pid reuse
+  a reporting problem rather than a correctness problem.
+
+`rotate.lock` under the fallback. The fallback is a property of the filesystem,
+so it applies to `rotate.lock` too (8.7), and the same rule applies to it with
+one exception the parent is entitled to make: the daemon spawned the worker, and
+once it has reaped it (1.7.1, 1.7.2, 7.3 step 4) that worker is provably gone, so
+the daemon removes the lock file here when the record in it names the worker it
+has just reaped. No liveness probe and no pid-reuse question arise, because only
+the parent holds the exit status. A `rotate.lock` naming any other holder,
+including the hand-run worker of 5.5 step 3, is not removed: the sweep does not
+steal it and defers exactly as 5.5 step 1 and `sweep_deferred` (2.10) already
+describe, with a holder that has since exited. That is the one place this section
+reads `sweep_deferred`'s gloss ("already held by someone else") a shade wider
+than its words, and it is named here rather than left for a reader to notice.
+
+What the daemon reports, which is a message and not a key. The refusal happens at
+1.5 step 1, before the control socket is bound, so there is no `status` to carry
+a key and no third value for `lock_mode` (2.10). The message goes to stderr and to
+the log, names the lock path, the classification above, and the one action that
+clears it, for example:
+
+    whirl: state/locks/daemon.lock left by pid 4711, started 2026-09-25T07:41:12Z,
+    which is not running; remove /Users/you/.local/state/whirl/locks/daemon.lock
+    and the supervisor will try again
+
+Exit is 1, which the frontend contract already fixes as "the daemon refused"
+(architecture.md section 8 item 7), and the supervisor keeps trying on its own
+cadence: `KeepAlive` at 10.1 s on macOS, `Restart=always` with `RestartSec=5` on
+Linux, `RestartOnFailure` on Windows (architecture.md section 5). While the
+refusal stands every `whirl` verb exits 2 with the unreachable-daemon message
+(architecture.md failure mode 1), which is all the CLI can say: it does not read
+the lock file and does not start the daemon (2.5.1).
 
 ## 9. Where this supersedes the prototype, and where it touches features.md
 
@@ -1121,7 +1227,9 @@ Against this card's criteria:
   see only the old file or the new one.
 - **The concurrency rule names which process owns which file.** Section 7.1 is
   the rule in one sentence; 7.2 is the per-file table with the writer and the
-  readers; 7.3 is the handoff order.
+  readers; 7.3 is the handoff order; 8.8 is what happens to a lock file whose
+  holder is gone, which is the one case where the OS primitive of 7.2 cannot
+  answer for itself.
 - **Citations for platform conventions.** Apple's File System Programming Guide
   for `Application Support`, `Caches` and `Logs` [1][2]; the XDG Base Directory
   Specification for config, state, cache and runtime [3]; Microsoft's
@@ -1129,7 +1237,9 @@ Against this card's criteria:
   `%LOCALAPPDATA%` and the "use `SHGetKnownFolderPath`" rule [4][5][6]; the pipe
   name form [7]; `MoveFileEx` flags [8] and `LockFileEx` [9] for the two Windows
   primitives; POSIX `rename` [10] and the macOS manual pages [L 1][L 2][L 3] for
-  the atomicity and durability claims underneath section 3 and 6.3.
+  the atomicity and durability claims underneath section 3 and 6.3; the Linux
+  `flock` page [12] for the release-on-close claim that 8.8 rests on, and the
+  Linux and Windows process-identity pages [13][14][15] for its liveness rule.
 - **Specification only.** No production code, no `prototype/` edits, no
   credentials. The only files added are this document and the probe scripts and
   their README under `docs/spec/probes/`, which exist to produce `[L 5]`, `[L 6]`
@@ -1145,13 +1255,14 @@ Local artifacts. `[L n]` is cited inline above.
 |---|---|---|
 | [L 1] | `man 2 rename` | "If new exists, it is first removed. Both old and new must be ... on the same file system." and "The rename() system call guarantees that an instance of new will always exist, even if the system should crash in the middle of the operation." |
 | [L 2] | `man 2 fsync` | "Note that while fsync() will flush all data from the host to the drive ..., the drive itself may not physically write the data to the platters for quite some time". F_FULLFSYNC named as the stricter variant. |
-| [L 3] | `man 2 flock` | Exclusive and shared locks, `LOCK_NB` returns `EWOULDBLOCK` when held, `ENOTSUP` for an unsupported file type, locks are on files rather than descriptors and are released when the descriptor is closed. |
+| [L 3] | `man 2 flock` | Exclusive and shared locks, `LOCK_NB` returns `EWOULDBLOCK` when held, `ENOTSUP` for an unsupported file type, locks are on files rather than descriptors. The release-on-close sentence is not on this page; [12] states it, and 8.8 relies on [12] for it. |
 | [L 4] | `grep -n -A12 "func rename" $(go env GOROOT)/src/os/file_windows.go`; `internal/syscall/windows/syscall_windows.go:357-367` | Go 1.26.1 on this machine: `os.Rename` on Windows is `windows.Rename`, which is `MoveFileEx(from, to, MOVEFILE_REPLACE_EXISTING)`. `MOVEFILE_COPY_ALLOWED` is not passed. |
 | [L 5] | `python3 docs/spec/probes/atomic_write_probe.py 400` (four runs), `python3 docs/spec/probes/hash_cost.py 20`, `python3 docs/spec/probes/index_size.py 500` | In-place rewrite: 3068 bad reads of 3508, 3054 of 3496, 3832 of 4270, 2387 of 2830, so 87.4%, 87.4%, 89.7% and 84.3% of concurrent reads saw a truncated or unparsable file. Temp-plus-`rename`: 0 bad reads of 971, 981, 949, 983. Hashing a 21.0 MB file: 14.4, 14.6 and 13.9 ms against 2.3, 1.6 and 1.5 ms for the read alone. A 500-entry `index.json` matching the section 2.1 schema: 170607 bytes compact, 220135 bytes indented, 341 bytes per entry. |
 | [L 6] | `curl -A "whirl-spec-probe" "https://wallhaven.cc/api/v1/search?sorting=random&purity=100&ratios=16x9&atleast=2560x1440&page={1,2}"` then `python3 docs/spec/probes/size_stats.py wallhaven-p1.json wallhaven-p2.json` | Draw 1 of 3, 2026-09-25: 48 images, `file_size` 0.05 MB to 20.34 MB, median 2.25 MB, mean 3.83 MB, per-file spread 378x. A count cap of 40 spans 2.2 MB to 813.6 MB. The endpoint is the one features.md 2.3 specifies; no key needed for `purity=100` [11]. `sorting=random` returns a different 48 images on every request, so this row is one sample and not a reproducible distribution. |
 | [L 7] | `sw_vers; uname -m; python3 --version` | macOS 26.5.2 (25F84), arm64, Python 3.14.7, Go 1.26.1, rustc 1.94.0. Every local measurement above was taken on this machine. |
 | [L 8] | `curl -sS -A "whirl-spec-probe" "https://wallhaven.cc/api/v1/search?sorting=random&purity=100&ratios=16x9&atleast=2560x1440&page={1,2}"` into `/tmp/whirl-l6b/p1.json` and `p2.json`, then `python3 docs/spec/probes/size_stats.py /tmp/whirl-l6b/p1.json /tmp/whirl-l6b/p2.json` | Draw 2 of 3, re-run on this machine while applying this review round: 48 images, 0.19 MB to 16.03 MB, median 2.11 MB, p90 10.19 MB, mean 3.23 MB, total 154.9 MB, per-file spread 82x. A count cap of 40 spans 7.8 MB to 641.3 MB, 129.1 MB at this draw's mean; 500 files is 1.61 GB at this mean. |
 | [L 9] | the same query, re-drawn by the round-1 review of this document (recorded in this card's comment thread, 2026-09-25 13:21) | Draw 3 of 3: 48 images, 0.23 MB minimum, 2.59 MB median, 5.56 MB p90, 14.02 MB maximum, mean 2.90 MB, spread 60x. Not produced by the author of this document; included because it is an independent draw of the same query and it is the tightest of the three, which is why 5.1 quotes the 60x draw and not the 378x one. |
+| [L 10] | `man 2 kill`, `man 1 ps`, `man 2 flock`, `ps -o pid=,lstart= -p <pid>`, and `grep -n p_starttime "$(xcrun --show-sdk-path)/usr/include/sys/proc.h"` with `grep -n KERN_PROC_PID "$(xcrun --show-sdk-path)/usr/include/sys/sysctl.h"`, while writing 8.8 | `kill(pid, 0)` is the existence check: "A value of 0, however, will cause error checking to be performed (with no signal being sent). This can be used to check the validity of pid", and `ESRCH` is "No process or process group can be found corresponding to that specified by pid"; sending a signal needs a real or effective user ID matching the receiver's, so `EPERM` means the process exists and is not ours. `ps` documents `lstart` as "The exact time the command started" and prints one for a live pid (`Fri Sep 25 20:39:57 2026`); the value comes from `sysctl(KERN_PROC_PID)`, `sys/sysctl.h:437`, into `kp_proc.p_starttime`, `sys/proc.h:97`, "process start time". The macOS `flock` page documents the lock/descriptor association, `EWOULDBLOCK` under `LOCK_NB` and `ENOTSUP`, and does not print the release-on-close sentence that [12] does. |
 
 Sibling research documents. `[D n]` is cited inline above.
 
@@ -1183,3 +1294,7 @@ citation as a decision, not as an observation.
 [9] https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex
 [10] https://pubs.opengroup.org/onlinepubs/9699919799/functions/rename.html
 [11] https://wallhaven.cc/help/api
+[12] https://man7.org/linux/man-pages/man2/flock.2.html
+[13] https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+[14] https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
+[15] https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes
