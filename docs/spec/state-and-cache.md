@@ -695,29 +695,53 @@ report can `cat` them, and the reviewer can check them, without the daemon.
   "written_at": "2026-09-25T07:41:12Z",
   "entries": [
     {
-      "digest": "ab12cd34...",
-      "source": "space",
       "kind": "wallhaven",
-      "origin": "https://w.wallhaven.cc/full/ab/wallhaven-ab12cd.jpg",
       "origin_key": "wallhaven:ab12cd",
-      "width": 2560, "height": 1440, "bytes": 3822331,
+      "digest": "ab12cd34...",
       "cached_path": "/Users/.../sha256/ab/12/ab12cd34....jpg",
-      "mode": "copy",
       "set_at": "2026-09-25T07:41:12Z",
-      "via": "rotate"
+      "via": "source"
     }
   ]
 }
 ```
 
 - `history.json`: newest first, exactly `state.history_entries` entries (default
-  50, matching features.md F5's ring), the oldest dropped on write. `via` is one
-  of `rotate`, `prev`, `set`, `startup`, `external` (an image the user set by
-  hand, features.md 1.5).
-- `favorites.json`: the same entry shape plus `"added_at"`, unordered, one
-  `schema` and one `seq`. Pinned files are found by the digest, which is also the
-  cache filename, which is why "unfavorite" is a single-set operation with no
-  filesystem walk.
+  50, matching features.md F5's ring), the oldest dropped on write. `via` is
+  `docs/architecture.md` 2.6's closed vocabulary, the same five values the `set:`
+  record and `status.last_via` carry: `source`, `manual`, `prev`, `startup`,
+  `recovered`. An image the user set by hand is `kind: external` with
+  `via: startup` (features.md 1.5, architecture.md 1.7.3), not a `via` of its own:
+  `kind` names the origin and `via` names the route, and one closed list on both
+  the wire and the disk is what keeps a state file and a `history` response from
+  disagreeing. `decision:` an earlier draft of this section named `rotate`, `set`
+  and `external` instead. `rotate` and `set` are `source` and `manual`; the
+  `external` spelling is `startup`. A reader accepts all three from a file an
+  earlier build wrote, and this build writes none of them.
+- The entry is the six fields a rotation produces or the daemon knows: `kind`,
+  `origin_key`, `digest`, `cached_path`, `set_at`, `via`. Architecture 2.6's
+  worker result is `<digest> <origin_key> <via> <path>`; `kind` comes from the
+  source the daemon spawned and `set_at` from the moment it wrote the ring.
+  `digest` and `cached_path` are `null` where there is nothing to record: an
+  `external` image whose bytes could not be hashed, and a `reference`-mode set,
+  where the file whirl must not delete is the user's own (6.1; 2.6's `-` on the
+  wire).
+- `decision:` the entry carries no `source`, `origin`, `width`, `height`, `bytes`
+  or `mode`. The first five are `cache/index.json` fields (2.1): that is where
+  the sweep, a `prev` re-materialisation and the favorites lookup read them, and
+  a state file that repeated them would be a second copy free to disagree with
+  the index. `mode` is not a record field at all: it is the source's own config
+  key (`sources[].mode`, architecture 4.2), and a `reference`-mode set is visible
+  as `cached_path: null`. The example above used to carry all six, which is a
+  shape the worker cannot produce.
+- `favorites.json`: `kind`, `origin_key`, `digest`, `cached_path` and
+  `"added_at"`, and no `set_at` or `via`, which describe a rotation rather than a
+  pin; unordered, one `schema` and one `seq`. `state` is not stored either:
+  whether the bytes are there is a fact about the disk right now, so the reader
+  recomputes it and the `favorites` record prints it, and a value written before
+  the file was deleted is never believed. Pinned files are found by the digest,
+  which is also the cache filename, which is why "unfavorite" is a single-set
+  operation with no filesystem walk.
 
 ### 6.3 The write protocol, every state file, no exceptions
 
@@ -793,9 +817,12 @@ favorites.
 4. `schema` greater than the daemon's: a downgrade, not corruption. Quarantine is
    wrong here because the file is presumably fine and a newer whirl wrote it, so
    the file is left exactly as it is, that file becomes read-only for this
-   daemon, and `whirl status` reports `state_schema_newer: favorites.json
-   (found 2, this build understands 1)`. Overwriting it would be destructive and
-   silent; refusing is loud and reversible.
+   daemon, and `whirl status` reports `state_schema_newer: 1`. The key is typed
+   `0|1` (architecture.md 2.10) because it is a status key a client parses rather
+   than a message, and the file name and both numbers go to the log, which is
+   where 6.4 step 2 puts the detail: `favorites.json was written by schema 2 and
+   this build understands 1`. Overwriting it would be destructive and silent;
+   refusing is loud and reversible.
 
 ### 6.5 Resetting without losing the cache
 
