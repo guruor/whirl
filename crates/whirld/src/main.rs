@@ -9,18 +9,24 @@
 //! whirld [--config <path>] [--socket <path>] [--backend <native|noop>]
 //! ```
 //!
-//! This is the scaffold: the socket, the protocol, the config and the worker
-//! contract are real, and the scheduler, the cache, the sweep and the state
-//! files are later cards. It logs to stderr, because a scaffold is run in the
-//! foreground (docs/development.md section 7) and the log file of `[D 6 §7.2]`
-//! arrives with the daemon that has something to rotate.
+//! This is the scaffold: the socket, the protocol, the config, the worker
+//! contract, the state files of `docs/spec/state-and-cache.md` section 6 and the
+//! `subscribe` stream of docs/architecture.md 2.9 are real, and the scheduler,
+//! the cache, the sweep and the wallpaper backends are later cards. It logs to
+//! stderr, because a scaffold is run in the foreground (docs/development.md
+//! section 7) and the log file of `[D 6 §7.2]` arrives with the daemon that has
+//! something to rotate.
 
+#[cfg(unix)]
+mod events;
 #[cfg(unix)]
 mod plan;
 #[cfg(unix)]
 mod socket;
 #[cfg(unix)]
 mod state;
+#[cfg(unix)]
+mod statefile;
 #[cfg(unix)]
 mod worker;
 
@@ -84,7 +90,10 @@ fn run(flags: &plan::Flags) -> Result<(), String> {
     let program = worker::Worker::default_program();
     let worker = worker::Worker::new(program, effective.config_path.clone(), effective.backend);
     let socket_path = effective.socket_path.clone();
-    let daemon = Arc::new(state::Daemon::new(effective, worker));
+    // The state files are read here: a quarantine, a rebuild and the degraded
+    // modes of docs/spec/state-and-cache.md 6.4 all happen before the socket is
+    // bound, so the first `status` already reports them.
+    let daemon = Arc::new(state::Daemon::load(effective, worker));
     let listener = socket::bind(&socket_path)?;
     eprintln!("whirld: listening on {}", socket_path.display());
 

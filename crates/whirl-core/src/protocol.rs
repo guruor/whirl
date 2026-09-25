@@ -978,6 +978,72 @@ pub fn rfc3339_utc(seconds_since_epoch: i64) -> String {
     )
 }
 
+/// The inverse of [`rfc3339_utc`]: `2026-09-25T07:41:12Z` to seconds since the
+/// Unix epoch. `None` for anything that is not exactly that shape, because the
+/// caller's answer to a timestamp it cannot read is a degraded mode rather than
+/// a guess (docs/spec/state-and-cache.md 6.4: a `next_at` this build cannot parse
+/// is not a timestamp it may schedule against).
+///
+/// The accepted form is deliberately the emitted one and only it: four-digit
+/// year, two-digit everything else, a literal `T`, a literal `Z`, no fractional
+/// seconds and no offset. A second grammar here would be a second spelling of a
+/// timestamp in one workspace.
+pub fn parse_rfc3339_utc(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 20 {
+        return None;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[19] != b'Z' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let digits = |range: std::ops::Range<usize>| -> Option<i64> {
+        let slice = text.get(range)?;
+        if !slice.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        slice.parse().ok()
+    };
+    let year = digits(0..4)?;
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    let hour = digits(11..13)?;
+    let minute = digits(14..16)?;
+    let second = digits(17..19)?;
+    if !(1..=12).contains(&month) || !(0..=59).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+    if hour > 23 || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days from 1970-01-01 to `year-month-day`, the inverse of `civil_from_days`
+/// and the same era arithmetic.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_prime = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// Days since 1970-01-01 to a proleptic Gregorian date. Shifts the epoch to
 /// 0000-03-01 so a leap day is the last day of the year and the 400-year cycle
 /// divides cleanly; `div_euclid` is the floor division the algorithm assumes.
@@ -1086,6 +1152,42 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timestamp_round_trips_through_its_parser() {
+        // The formatter and its inverse are one pair, so a timestamp written into
+        // a state file and read back is the same instant.
+        for seconds in [
+            0,
+            1_790_324_533,
+            1_790_000_000,
+            -1,
+            2_147_483_647,
+            // A leap day, and the century that is not a leap year.
+            951_782_400,
+            4_107_542_400,
+        ] {
+            let text = rfc3339_utc(seconds);
+            assert_eq!(parse_rfc3339_utc(&text), Some(seconds), "{text}");
+        }
+        assert_eq!(rfc3339_utc(1_790_324_533), "2026-09-25T08:22:13Z");
+        // Anything this build did not write is refused rather than guessed.
+        for bad in [
+            "",
+            "2026-09-25T07:41:12",
+            "2026-09-25 07:41:12Z",
+            "2026-09-25T07:41:12.000Z",
+            "2026-09-25T07:41:12+00:00",
+            "2026-13-25T07:41:12Z",
+            "2026-02-30T07:41:12Z",
+            "2026-09-25T24:41:12Z",
+            "2026-09-25T07:61:12Z",
+            "26-09-25T07:41:12Z",
+            "202a-09-25T07:41:12Z",
+        ] {
+            assert_eq!(parse_rfc3339_utc(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn sha256_matches_the_published_vectors() {

@@ -1,31 +1,43 @@
-//! The daemon's state, and the `status` block it answers from.
+//! The daemon's state, the state files it is rebuilt from, and the `status`
+//! block it answers from.
 //!
-//! Nothing here is persisted. docs/architecture.md 1.5 step 4 loads
-//! `current.json`, `history.json` and `favorites.json` and quarantines what it
-//! cannot read; 1.7.2 says the worker writes no state; this scaffold ships no
-//! state writer at all, so history, pins and counters live in memory and a
-//! restart loses them. That is a gap in this build, not a design choice, and it
-//! is named in the handoff.
+//! `docs/spec/state-and-cache.md` section 6 is implemented here: `load` reads
+//! `current.json`, `history.json` and `favorites.json`, quarantines what it
+//! cannot read (6.4), rebuilds what it must, and every state change writes the
+//! file back through `crate::statefile::Store`, which is 6.3's protocol (temp
+//! file, `fsync`, `rename`).
 //!
 //! Everything `status` prints that the daemon does not own is measured, not
 //! guessed: `pid` is this process, `uptime_s` is its own clock, `rss_kb` is
 //! `/proc/self/statm` or `ps`, and the cache totals come from walking the cache
 //! root this daemon created.
 
+use crate::events::{Bus, Event, unix_seconds};
 use crate::plan::Effective;
+use crate::statefile::{Kind as File, Store};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::mpsc::Receiver;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
+use whirl_core::config::Config;
 use whirl_core::protocol::{self, ErrorCode, Kind, Response, Via};
-use whirl_core::state::{Favorite, FavoriteState, HistoryEntry, HistoryRing};
+use whirl_core::state::{
+    Anchor, CacheFacts, CurrentFile, Favorite, FavoriteState, FavoritesFile, HistoryEntry,
+    HistoryFile, HistoryRing, StateFile,
+};
 
 /// The image on screen, as this daemon believes it.
+///
+/// `origin_key` and `via` are optional because `current.json`'s anchor carries
+/// neither (6.1): after a restart they are recovered from the history entry with
+/// the same digest, and when no entry names that digest they report `-` rather
+/// than guessing an origin for the image on screen.
 #[derive(Debug, Clone)]
 pub struct Current {
     pub digest: String,
-    pub origin_key: String,
-    pub via: Via,
+    pub origin_key: Option<String>,
+    pub via: Option<Via>,
     pub kind: Kind,
     pub path: Option<String>,
     pub at: String,
@@ -47,6 +59,9 @@ pub struct State {
     pub paused: bool,
     /// The monotonic slot counter the worker's `--run` comes from (1.6).
     pub slot: u64,
+    /// The last slot claimed: what `current.json`'s `written_by` names, so the
+    /// file says which run wrote it rather than which run is next.
+    pub last_run: u64,
     /// The run in flight, which is what makes `next` answer `busy` (2.7).
     pub running: Option<u64>,
     pub rotation_count: u64,
@@ -56,6 +71,29 @@ pub struct State {
     pub history: HistoryRing,
     pub favorites: BTreeMap<String, Favorite>,
     pub current: Option<Current>,
+    /// The persisted deadline, wall clock, RFC 3339 UTC (2.10 `next_at`).
+    /// Frozen while `paused`, re-armed from now by `resume` (2.9, 5.5 rule 8).
+    pub next_at: Option<i64>,
+    /// 5.5 step 1 is this key's only trigger, and no sweep runs yet, so nothing
+    /// sets it: `status` reports the field rather than a literal, and the value
+    /// is 0 until the sweep card lands.
+    pub sweep_deferred: bool,
+    /// 8.4's probe. Kept live: it is re-taken at every rotation, not cached.
+    pub cache_writable: bool,
+    /// 6.4 step 2's sticky report: the file that failed to parse, and where it
+    /// was moved to.
+    pub state_corrupt: Option<String>,
+    pub state_quarantined: Option<String>,
+    /// 6.4 step 4: a state file written by a newer whirl. Left exactly as it is.
+    pub state_schema_newer: bool,
+    /// 6.4 step 3: entries lost to a quarantine, until the next clean write.
+    pub history_lost: bool,
+    /// 6.4 step 3: `favorites.json` was quarantined, so pin state is unknown and
+    /// the daemon stops changing pins.
+    pub favorites_degraded: bool,
+    /// Which state files this daemon may write, indexed by `File::index`. A
+    /// schema newer than this build's makes its file read-only (6.4 step 4).
+    pub read_only: [bool; 3],
 }
 
 impl State {
@@ -64,6 +102,7 @@ impl State {
             seq: 0,
             paused: false,
             slot: 1,
+            last_run: 0,
             running: None,
             rotation_count: 0,
             last_error: None,
@@ -72,6 +111,15 @@ impl State {
             history: HistoryRing::new(history_bound),
             favorites: BTreeMap::new(),
             current: None,
+            next_at: None,
+            sweep_deferred: false,
+            cache_writable: true,
+            state_corrupt: None,
+            state_quarantined: None,
+            state_schema_newer: false,
+            history_lost: false,
+            favorites_degraded: false,
+            read_only: [false; 3],
         }
     }
 
@@ -103,6 +151,31 @@ impl State {
                     .map(resolved_from_favorite)
             })
     }
+
+    /// The current entry as a resolution, for `favorite` with no argument. An
+    /// anchor recovered from `current.json` without a history entry to name it
+    /// has no origin, so there is nothing to pin.
+    pub fn current_resolved(&self) -> Option<Resolved> {
+        let current = self.current.as_ref()?;
+        Some(Resolved {
+            origin_key: current.origin_key.clone()?,
+            digest: Some(current.digest.clone()),
+            kind: current.kind,
+            path: current.path.clone(),
+        })
+    }
+
+    /// How many seconds until `next_at`, clamped to `0..=interval`, or `None`
+    /// while paused: a suspended schedule has no deadline to count down to
+    /// (2.10 `next_in_s`, 5.5 rule 8).
+    pub fn next_in_s(&self, interval_seconds: u64) -> Option<i64> {
+        if self.paused {
+            return None;
+        }
+        let next_at = self.next_at?;
+        let remaining = next_at - unix_seconds();
+        Some(remaining.clamp(0, interval_seconds as i64))
+    }
 }
 
 fn resolved_from_history(entry: &HistoryEntry) -> Resolved {
@@ -123,29 +196,57 @@ fn resolved_from_favorite(favorite: &Favorite) -> Resolved {
     }
 }
 
-/// The daemon. One lock, held only for the duration of a memory read or write:
-/// nothing in this struct is held across a worker (docs/architecture.md 1.8).
+/// The daemon. One lock, held only for the duration of a memory read or write
+/// and the small state-file write that follows one; nothing in this struct is
+/// held across a worker (docs/architecture.md 1.8).
 pub struct Daemon {
     pub effective: Effective,
     /// The worker this daemon spawns, resolved once at startup.
     pub worker: crate::worker::Worker,
+    /// The state directory, and the only thing that writes to it (7.1).
+    pub store: Store,
+    /// Every subscribed connection, and the quiet period a heartbeat is
+    /// measured from (2.9).
+    pub bus: Bus,
     state: Mutex<State>,
     started: Instant,
 }
 
 impl Daemon {
-    pub fn new(effective: Effective, worker: crate::worker::Worker) -> Daemon {
+    /// Build the daemon and load the state files of 6.4.
+    pub fn load(effective: Effective, worker: crate::worker::Worker) -> Daemon {
+        let store = Store::new(&effective.state_dir);
         let bound = effective.config.state.history_entries;
+        let mut state = State::new(bound);
+
+        // 8.4: the probe, at start and at each rotation, not cached.
+        state.cache_writable = crate::plan::probe_cache_writable(&effective.cache_dir, state.slot);
+
+        load_current(&store, &mut state);
+        load_history(&store, &mut state);
+        load_favorites(&store, &mut state);
+        rebuild_current(&mut state);
+
+        // 2.10 `next_at`: the persisted deadline, or a fresh one. A first run
+        // has no file to read it from.
+        let interval = effective.config.schedule.interval_seconds as i64;
+        if state.next_at.is_none() && !state.paused {
+            state.next_at = Some(unix_seconds() + interval);
+        }
+
         Daemon {
             effective,
             worker,
-            state: Mutex::new(State::new(bound)),
+            store,
+            bus: Bus::new(),
+            state: Mutex::new(state),
             started: Instant::now(),
         }
     }
 
-    /// The lock is only ever held for one in-memory operation, so a worker that
-    /// hangs cannot hold it and cannot make `status` wait.
+    /// The lock is only ever held for one in-memory operation plus the state-file
+    /// write that operation implies, so a worker that hangs cannot hold it and
+    /// cannot make `status` wait.
     pub fn state(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -175,19 +276,28 @@ impl Daemon {
             .kv("rotating", u8::from(state.running.is_some()))
             .kv("rotation_count", state.rotation_count)
             .kv("interval_s", config.schedule.interval_seconds)
+            .kv("next_at", dash(state.next_at.map(protocol::rfc3339_utc)))
+            .kv(
+                "next_in_s",
+                dash(
+                    state
+                        .next_in_s(config.schedule.interval_seconds)
+                        .map(|seconds| seconds.to_string()),
+                ),
+            )
             .kv(
                 "last_digest",
                 dash(current.map(|current| current.digest.clone())),
             )
             .kv(
                 "last_origin_key",
-                dash(current.map(|current| current.origin_key.clone())),
+                dash(current.and_then(|current| current.origin_key.clone())),
             )
             .kv(
                 "last_via",
-                dash(current.map(|current| current.via.as_str().to_string())),
+                dash(current.and_then(|current| current.via.map(|via| via.as_str().to_string()))),
             )
-            .kv("last_at", dash(current.map(|current| current.at.clone())))
+            .kv("last_at", dash(current.map(|current| or_dash(&current.at))))
             .kv(
                 "last_error",
                 dash(state.last_error.map(|code| code.as_str().to_string())),
@@ -201,8 +311,7 @@ impl Daemon {
             // reason stays `-` rather than inventing one of 3.7's four.
             .kv("display_mode_effective", config.display.mode.as_str())
             .kv("display_mode_reason", "-")
-            // The anchor is what the daemon believes is on screen, and a
-            // rotation is the only thing that moves it (1.7.3).
+            // The anchor is what the daemon believes is on screen (1.7.3).
             .kv(
                 "anchor_digest",
                 dash(current.map(|current| current.digest.clone())),
@@ -213,7 +322,9 @@ impl Daemon {
             )
             .kv("anchor_verified", u8::from(state.anchor_verified))
             .kv("cache_dir", self.effective.cache_dir.display())
-            // 3.1's identity file does not exist until the cache does.
+            // 2.1 puts the root id inside `index.json`, which the cache card
+            // owns; until that file exists there is no identity to report, and
+            // 6.1's `cache` block is written the same way.
             .kv("cache_root_id", "-")
             .kv(
                 "cache_files",
@@ -229,19 +340,28 @@ impl Daemon {
                 "cache_over_cap",
                 u8::from(matches!(cache, Some((_, bytes)) if bytes > config.cache.max_bytes)),
             )
-            // 5.4's four causes are sweep outcomes, and nothing sweeps yet.
-            .kv("cache_over_reason", "-")
-            .kv("cache_writable", 1)
-            .kv("sweep_deferred", 0)
+            // 5.4's four causes are sweep outcomes. One of them is reachable
+            // here: 6.4 says a degraded favorites file reports itself rather
+            // than a bound the daemon is not enforcing.
+            .kv(
+                "cache_over_reason",
+                if state.favorites_degraded {
+                    "favorites_degraded"
+                } else {
+                    "-"
+                },
+            )
+            .kv("cache_writable", u8::from(state.cache_writable))
+            .kv("sweep_deferred", u8::from(state.sweep_deferred))
             // The rotation lock of 1.8 is an in-process mutex, not a file lock,
             // so `none` is the value 8.7's vocabulary gives it.
             .kv("lock_mode", "none")
             .kv("state_dir", self.effective.state_dir.display())
-            .kv("state_corrupt", "-")
-            .kv("state_quarantined", "-")
-            .kv("state_schema_newer", 0)
-            .kv("history_lost", 0)
-            .kv("favorites_degraded", 0)
+            .kv("state_corrupt", dash(state.state_corrupt.clone()))
+            .kv("state_quarantined", dash(state.state_quarantined.clone()))
+            .kv("state_schema_newer", u8::from(state.state_schema_newer))
+            .kv("history_lost", u8::from(state.history_lost))
+            .kv("favorites_degraded", u8::from(state.favorites_degraded))
             .kv("clock_jump", state.clock_jump)
             // No readback, so `startup.respect_manual` cannot be honoured, and
             // 1.7.3 gives that situation the value 0.
@@ -253,8 +373,32 @@ impl Daemon {
         response
     }
 
+    /// Join the event stream of 2.9: the sequence number to publish, and the
+    /// queue this connection reads.
+    ///
+    /// The registration and the sequence read happen under the state lock, so an
+    /// event can never be emitted between the number a client is told and the
+    /// moment it is listening. That is what makes `subscribed:` trustworthy.
+    pub fn subscribe(&self) -> (u64, Receiver<String>) {
+        let state = self.state();
+        let seq = state.seq;
+        let receiver = self.bus.subscribe();
+        (seq, receiver)
+    }
+
+    /// Publish one event and take the next sequence number. Called with the
+    /// state lock already held by every state change: one transition, one event,
+    /// one number (2.9).
+    fn announce(state: &mut State, bus: &Bus, event: Event) -> u64 {
+        state.seq += 1;
+        let seq = state.seq;
+        bus.broadcast(event.line(seq));
+        seq
+    }
+
     /// A rotation is starting: claim the slot, or refuse because one is in
-    /// flight (docs/architecture.md 1.8: refused, never queued).
+    /// flight (docs/architecture.md 1.8: refused, never queued). The claim is
+    /// the state transition, so it is also where `rotate_start` goes out.
     pub fn start_rotation(&self) -> Result<u64, u64> {
         let mut state = self.state();
         if let Some(run) = state.running {
@@ -262,8 +406,14 @@ impl Daemon {
         }
         let run = state.slot;
         state.slot += 1;
+        state.last_run = run;
         state.running = Some(run);
-        state.seq += 1;
+        // 8.4: the cache probe is re-taken at each rotation, not cached.
+        state.cache_writable = crate::plan::probe_cache_writable(&self.effective.cache_dir, run);
+        // `running` is part of what a client reads from `status`, but 6.1 lists
+        // no such field, so this state change writes no file: the event is the
+        // only record of it. One event per transition, and this is the start.
+        Self::announce(&mut state, &self.bus, Event::RotateStart { run });
         Ok(run)
     }
 
@@ -273,22 +423,24 @@ impl Daemon {
         let mut state = self.state();
         let run = state.slot;
         state.slot += 1;
+        state.last_run = run;
         run
     }
 
+    /// A rotation succeeded: the anchor moves, the ring gains an entry, and both
+    /// files are written back (6.2, 6.3).
     pub fn record_success(&self, digest: &str, origin_key: &str, via: Via, path: Option<&str>) {
         let kind = self.kind_of(origin_key);
         let mut state = self.state();
         let at = now();
         state.running = None;
-        state.seq += 1;
         state.rotation_count += 1;
         state.last_error = None;
         state.anchor_verified = true;
         state.current = Some(Current {
             digest: digest.to_string(),
-            origin_key: origin_key.to_string(),
-            via,
+            origin_key: Some(origin_key.to_string()),
+            via: Some(via),
             kind,
             path: path.map(str::to_string),
             at: at.clone(),
@@ -301,13 +453,35 @@ impl Daemon {
             digest: Some(digest.to_string()),
             path: path.map(str::to_string),
         });
+        Self::announce(
+            &mut state,
+            &self.bus,
+            Event::RotateOk {
+                digest: digest.to_string(),
+                origin_key: origin_key.to_string(),
+                via: via.as_str(),
+                path: path.map(str::to_string),
+            },
+        );
+        self.save_current(&state);
+        self.save_history(&mut state);
     }
 
-    pub fn record_failure(&self, code: ErrorCode) {
+    /// A rotation failed. `last_error` is the code a client reads, and the
+    /// message rides the event (2.9 `rotate_failed`).
+    pub fn record_failure(&self, code: ErrorCode, message: &str) {
         let mut state = self.state();
         state.running = None;
-        state.seq += 1;
         state.last_error = Some(code);
+        Self::announce(
+            &mut state,
+            &self.bus,
+            Event::RotateFailed {
+                code,
+                message: message.to_string(),
+            },
+        );
+        self.save_current(&state);
     }
 
     /// `kind` names the origin, not the mechanism (2.6), and the `origin_key`
@@ -331,21 +505,202 @@ impl Daemon {
         self.state().resolve(id)
     }
 
-    /// The `paused` flag, and the state change that follows it (2.10 `seq`).
+    /// One heartbeat, for the quiet period a connection claimed. A heartbeat is
+    /// an event and consumes a `seq` like any other (2.9); it is not a state
+    /// change, so it writes no file.
+    pub fn heartbeat(&self) {
+        let mut state = self.state();
+        Self::announce(
+            &mut state,
+            &self.bus,
+            Event::Heartbeat {
+                unix_seconds: unix_seconds(),
+            },
+        );
+    }
+
+    /// The `paused` flag, the state change that follows it, and the freeze or
+    /// re-arm of `next_at` (2.9, 5.5 rule 8).
     pub fn set_paused(&self, paused: bool) {
         let mut state = self.state();
         state.paused = paused;
-        state.seq += 1;
+        if !paused {
+            // 2.9 `resumed`: the schedule is live again, `next_at` re-armed from
+            // now. While paused `next_at` keeps its value, frozen: a suspended
+            // schedule has no deadline to count down to.
+            let interval = self.effective.config.schedule.interval_seconds as i64;
+            state.next_at = Some(unix_seconds() + interval);
+        }
+        Self::announce(
+            &mut state,
+            &self.bus,
+            if paused {
+                Event::Paused
+            } else {
+                Event::Resumed
+            },
+        );
+        self.save_current(&state);
+    }
+
+    /// A pin was written. `None` when this id is already pinned, which is the
+    /// `already: 1` case and not a state change.
+    pub fn add_favorite(&self, resolved: &Resolved) -> bool {
+        let mut state = self.state();
+        if state.favorites.contains_key(&resolved.origin_key) {
+            return false;
+        }
+        let favorite = Favorite {
+            added_at: now(),
+            kind: resolved.kind,
+            origin_key: resolved.origin_key.clone(),
+            digest: resolved.digest.clone(),
+            state: crate::state::favorite_state(resolved.path.as_deref()),
+            path: resolved.path.clone(),
+        };
+        state
+            .favorites
+            .insert(resolved.origin_key.clone(), favorite);
+        let digest = resolved.digest.clone().unwrap_or_else(|| "-".to_string());
+        Self::announce(
+            &mut state,
+            &self.bus,
+            Event::FavoriteAdded {
+                digest: digest.clone(),
+                origin_key: resolved.origin_key.clone(),
+            },
+        );
+        self.save_favorites(&state);
+        true
+    }
+
+    /// A pin was removed. `None` when the id resolves to nothing.
+    pub fn remove_favorite(&self, id: &str) -> Option<String> {
+        let mut state = self.state();
+        let removed = state
+            .resolve(id)
+            .and_then(|resolved| state.favorites.remove(&resolved.origin_key));
+        match removed {
+            None => None,
+            Some(favorite) => {
+                let digest = favorite.digest.unwrap_or_else(|| "-".to_string());
+                Self::announce(
+                    &mut state,
+                    &self.bus,
+                    Event::FavoriteRemoved {
+                        digest: digest.clone(),
+                    },
+                );
+                self.save_favorites(&state);
+                Some(digest)
+            }
+        }
+    }
+
+    /// 6.4 step 3: while `favorites.json` is degraded, pin-changing verbs are
+    /// refused and the message carries the quarantine path.
+    pub fn favorites_degraded_message(&self) -> Option<String> {
+        let state = self.state();
+        if !state.favorites_degraded {
+            return None;
+        }
+        Some(
+            state
+                .state_quarantined
+                .clone()
+                .unwrap_or_else(|| "favorites.json".to_string()),
+        )
+    }
+
+    /// Write `current.json` (6.1) as it stands. A file this build is too old for
+    /// is left alone (6.4 step 4).
+    fn save_current(&self, state: &State) {
+        if state.read_only[File::Current.index()] {
+            return;
+        }
+        let config: &Config = &self.effective.config;
+        let file = CurrentFile {
+            seq: state.seq,
+            written_at: now(),
+            written_by: Some(format!(
+                "{}/{} pid={} run={}",
+                protocol::PRODUCT,
+                protocol::VERSION,
+                std::process::id(),
+                state.last_run
+            )),
+            paused: state.paused,
+            rotation_count: state.rotation_count,
+            next_at: state.next_at.map(protocol::rfc3339_utc),
+            last_error: state.last_error.map(|code| code.as_str().to_string()),
+            anchor: state.current.as_ref().map(|current| Anchor {
+                digest: current.digest.clone(),
+                cached_path: current.path.clone(),
+                set_at: Some(current.at.clone()),
+                display_mode: Some(config.display.mode.as_str().to_string()),
+            }),
+            cache: cache_usage(&self.effective.cache_dir).map(|(files, bytes)| CacheFacts {
+                // 2.1: the root id lives in `index.json`, which does not exist
+                // until the cache card lands.
+                root_id: None,
+                files,
+                bytes,
+                over_cap_bytes: u64::from(bytes > config.cache.max_bytes),
+                over_cap_files: u64::from(files > config.cache.max_files),
+            }),
+        };
+        self.write(File::Current, file.encode());
+    }
+
+    /// Write `history.json` (6.2): newest first, bounded at
+    /// `state.history_entries`. A clean write is what clears `history_lost`
+    /// (6.4 step 3).
+    fn save_history(&self, state: &mut State) {
+        if state.read_only[File::History.index()] {
+            return;
+        }
+        let file = HistoryFile {
+            seq: state.seq,
+            written_at: now(),
+            entries: state.history.iter().cloned().collect(),
+        };
+        if self.write(File::History, file.encode()) {
+            state.history_lost = false;
+        }
+    }
+
+    /// Write `favorites.json` (6.2). This is the one irreversible file, and the
+    /// authoritative pin list.
+    fn save_favorites(&self, state: &State) {
+        if state.read_only[File::Favorites.index()] {
+            return;
+        }
+        let file = FavoritesFile {
+            seq: state.seq,
+            written_at: now(),
+            entries: state.favorites.values().cloned().collect(),
+        };
+        self.write(File::Favorites, file.encode());
+    }
+
+    /// One state-file write, logged rather than fatal: 8.5 refuses to start on a
+    /// state directory that cannot be written, but a write that fails while the
+    /// daemon runs keeps the last good state and keeps serving
+    /// (docs/architecture.md 7.4, the disk-full row).
+    fn write(&self, kind: File, text: String) -> bool {
+        match self.store.write(kind, &text) {
+            Ok(()) => true,
+            Err(message) => {
+                eprintln!("whirld: state write failed: {message}");
+                false
+            }
+        }
     }
 }
 
 /// The current time, RFC 3339 UTC (2.6). One convention everywhere.
 pub fn now() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs() as i64)
-        .unwrap_or(0);
-    protocol::rfc3339_utc(seconds)
+    protocol::rfc3339_utc(unix_seconds())
 }
 
 pub fn platform() -> &'static str {
@@ -360,6 +715,215 @@ pub fn platform() -> &'static str {
 
 fn dash(value: Option<String>) -> String {
     value.unwrap_or_else(|| "-".to_string())
+}
+
+/// A timestamp that a state file left empty prints as `-` like every other unset
+/// value (2.6).
+fn or_dash(value: &str) -> String {
+    if value.is_empty() {
+        "-".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loading (docs/spec/state-and-cache.md 6.4)
+// ---------------------------------------------------------------------------
+
+/// Read and apply `current.json`. A file that cannot be read or parsed is
+/// quarantined and its scalars fall back to what `history.json` can supply.
+fn load_current(store: &Store, state: &mut State) {
+    let text = match store.read(File::Current) {
+        Ok(None) => return,
+        Ok(Some(text)) => text,
+        Err(message) => {
+            eprintln!("whirld: {message}");
+            quarantine(store, state, File::Current);
+            return;
+        }
+    };
+    match CurrentFile::parse(&text) {
+        Ok(StateFile::Read(file)) => {
+            state.paused = file.paused;
+            state.rotation_count = file.rotation_count;
+            state.next_at = file
+                .next_at
+                .as_deref()
+                .and_then(protocol::parse_rfc3339_utc);
+            if file.next_at.is_some() && state.next_at.is_none() {
+                // A deadline this build cannot read is not a deadline it may
+                // schedule against: it re-arms from now instead of guessing.
+                eprintln!("whirld: current.json: next_at is not an RFC 3339 UTC timestamp");
+            }
+            state.last_error = file.last_error.as_deref().and_then(ErrorCode::parse);
+            if let Some(anchor) = file.anchor {
+                // The anchor is the display record (5.3) and the reason this
+                // file exists. `origin_key` and `via` are not in it (6.1), so
+                // they are recovered from the history entry with the same
+                // digest once history is loaded.
+                state.current = Some(Current {
+                    digest: anchor.digest,
+                    origin_key: None,
+                    via: None,
+                    kind: Kind::External,
+                    path: anchor.cached_path,
+                    at: anchor.set_at.unwrap_or_default(),
+                });
+                state.anchor_verified = true;
+            }
+        }
+        Ok(StateFile::SchemaNewer { found }) => {
+            eprintln!(
+                "whirld: current.json was written by schema {found} and this build understands {}: leaving it alone",
+                whirl_core::state::SCHEMA
+            );
+            state.read_only[File::Current.index()] = true;
+            state.state_schema_newer = true;
+        }
+        Err(error) => {
+            eprintln!("whirld: current.json: {error}");
+            quarantine(store, state, File::Current);
+        }
+    }
+}
+
+/// Read and apply `history.json`. A quarantine starts from an empty ring and
+/// says so, because a ring that vanished silently is the failure mode 6.4 step 2
+/// exists to prevent.
+fn load_history(store: &Store, state: &mut State) {
+    let text = match store.read(File::History) {
+        Ok(None) => return,
+        Ok(Some(text)) => text,
+        Err(message) => {
+            eprintln!("whirld: {message}");
+            quarantine(store, state, File::History);
+            state.history_lost = true;
+            return;
+        }
+    };
+    match HistoryFile::parse(&text) {
+        Ok(StateFile::Read(file)) => {
+            // Newest first, as written; the ring bounds it again in case the
+            // file was edited by hand.
+            for entry in file.entries.into_iter().rev() {
+                state.history.push(entry);
+            }
+        }
+        Ok(StateFile::SchemaNewer { found }) => {
+            eprintln!(
+                "whirld: history.json was written by schema {found} and this build understands {}: leaving it alone",
+                whirl_core::state::SCHEMA
+            );
+            state.read_only[File::History.index()] = true;
+            state.state_schema_newer = true;
+        }
+        Err(error) => {
+            eprintln!("whirld: history.json: {error}");
+            quarantine(store, state, File::History);
+            state.history_lost = true;
+        }
+    }
+}
+
+/// Read and apply `favorites.json`. This is the escalation of 6.4 step 3: a
+/// corrupt pin file is not an empty pin set, it is a daemon that stops changing
+/// pins and protects the whole cache until the user resolves it.
+fn load_favorites(store: &Store, state: &mut State) {
+    let text = match store.read(File::Favorites) {
+        Ok(None) => return,
+        Ok(Some(text)) => text,
+        Err(message) => {
+            eprintln!("whirld: {message}");
+            quarantine(store, state, File::Favorites);
+            state.favorites_degraded = true;
+            return;
+        }
+    };
+    match FavoritesFile::parse(&text) {
+        Ok(StateFile::Read(file)) => {
+            for favorite in file.entries {
+                state
+                    .favorites
+                    .insert(favorite.origin_key.clone(), favorite);
+            }
+        }
+        Ok(StateFile::SchemaNewer { found }) => {
+            eprintln!(
+                "whirld: favorites.json was written by schema {found} and this build understands {}: leaving it alone",
+                whirl_core::state::SCHEMA
+            );
+            state.read_only[File::Favorites.index()] = true;
+            state.state_schema_newer = true;
+        }
+        Err(error) => {
+            eprintln!("whirld: favorites.json: {error}");
+            quarantine(store, state, File::Favorites);
+            state.favorites_degraded = true;
+        }
+    }
+}
+
+/// 6.4 step 1: rename the file out of the way and report it. A quarantine that
+/// itself fails (a read-only directory) is still reported as corruption rather
+/// than becoming a startup failure: the daemon continues with defaults and the
+/// status line says so.
+fn quarantine(store: &Store, state: &mut State, kind: File) {
+    state.state_corrupt = Some(kind.name().to_string());
+    match store.quarantine(kind, unix_seconds()) {
+        Ok(path) => state.state_quarantined = Some(path.display().to_string()),
+        Err(message) => eprintln!("whirld: {message}"),
+    }
+}
+
+/// 6.4 step 3 and 6.1: `current.json` is derived, so a missing or quarantined
+/// one is rebuilt from `history.json`'s newest entry. The digest is the join
+/// between the anchor and the entry that named it.
+fn rebuild_current(state: &mut State) {
+    let newest = state.history.iter().next().cloned();
+    let anchor = state.current.take();
+    state.current = match (anchor, newest) {
+        (Some(anchor), Some(entry)) => {
+            let named = entry.digest.as_deref() == Some(anchor.digest.as_str())
+                // A `reference`-mode entry has no digest, so the path is the
+                // only identity it can be matched on.
+                || (entry.path.is_some() && entry.path == anchor.path);
+            Some(Current {
+                origin_key: named.then(|| entry.origin_key.clone()),
+                via: named.then_some(entry.via),
+                kind: if named { entry.kind } else { Kind::External },
+                at: if anchor.at.is_empty() {
+                    entry.set_at.clone()
+                } else {
+                    anchor.at.clone()
+                },
+                digest: anchor.digest,
+                path: anchor.path,
+            })
+        }
+        (Some(anchor), None) => Some(Current {
+            digest: anchor.digest,
+            origin_key: None,
+            via: None,
+            kind: Kind::External,
+            path: anchor.path,
+            at: anchor.at,
+        }),
+        (None, Some(entry)) => {
+            // Rebuilt from history: the file's anchor is gone, so nothing has
+            // been read back in this run (1.7.3).
+            state.anchor_verified = false;
+            Some(Current {
+                digest: entry.digest.clone().unwrap_or_default(),
+                origin_key: Some(entry.origin_key.clone()),
+                via: Some(entry.via),
+                kind: entry.kind,
+                path: entry.path.clone(),
+                at: entry.set_at.clone(),
+            })
+        }
+        (None, None) => None,
+    };
 }
 
 /// The daemon's own resident set, in kilobytes. `/proc/self/statm` is the only
@@ -411,9 +975,5 @@ fn cache_usage(root: &Path) -> Option<(u64, u64)> {
 /// `present` when the path it names still exists, `missing` when it does not,
 /// and `unrecoverable` when there is no path to check (2.6).
 pub fn favorite_state(path: Option<&str>) -> FavoriteState {
-    match path {
-        Some(path) if std::path::Path::new(path).exists() => FavoriteState::Present,
-        Some(_) => FavoriteState::Missing,
-        None => FavoriteState::Unrecoverable,
-    }
+    whirl_core::state::favorite_state_of(path)
 }
