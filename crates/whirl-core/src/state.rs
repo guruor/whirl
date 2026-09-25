@@ -214,7 +214,12 @@ pub struct CacheIndexEntry {
     /// The source `id` this candidate came from.
     pub source: String,
     pub kind: Kind,
-    pub origin: String,
+    /// The re-materialisation hint: the URL or absolute path the bytes came
+    /// from (2.1). `None` where the writer did not know it: the daemon writes
+    /// this entry from the worker's `set:` line of docs/architecture.md 1.6,
+    /// which carries `origin_key` and the cache path and no origin (see
+    /// [`IndexFile`]).
+    pub origin: Option<String>,
     pub origin_key: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -566,6 +571,186 @@ impl FavoritesFile {
     }
 }
 
+/// `cache/index.json`: the cache's own metadata (docs/spec/state-and-cache.md
+/// 2.1). The shape lives here with the other records; the daemon owns the file
+/// (7.2) and the worker reads it, read-only, for the recent window of 4.1.
+///
+/// Three fields of an entry are absent in what this build writes, and the reason
+/// is upstream rather than a preference here: `origin`, `width` and `height`
+/// come from the bytes, and the report the daemon builds an entry from is the
+/// two-line stdout contract of docs/architecture.md 1.6 (`downloaded:` and
+/// `set: <digest> <origin_key> <via> <path>`), which carries neither. The
+/// daemon holds no image bytes (docs/architecture.md 1.9) and does not sniff the
+/// file, so those three are written as `null` and are recovered when the
+/// digest's file is next read. 2.1's sentence that "the worker reports the
+/// digest and the origin" describes an origin the record form does not carry.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexFile {
+    pub seq: u64,
+    pub written_at: String,
+    /// Minted when the cache directory is created; a state file whose recorded
+    /// `root_id` differs has to be re-materialised (2.1).
+    pub root_id: String,
+    /// Keyed by the 64-hex digest, which is also the file's name.
+    pub entries: std::collections::BTreeMap<String, CacheIndexEntry>,
+    /// Entries whose file is missing, kept so `whirl status` can report them
+    /// before the next sweep reclaims them (2.1).
+    pub dangling: Vec<String>,
+}
+
+/// The file name of the index, inside the cache root (section 2).
+pub const INDEX_FILE: &str = "index.json";
+
+impl IndexFile {
+    pub fn parse(text: &str) -> Result<StateFile<IndexFile>, StateFileError> {
+        let root = document(text, INDEX_FILE)?;
+        let schema = schema_of(&root)?;
+        if schema > SCHEMA {
+            return Ok(StateFile::SchemaNewer { found: schema });
+        }
+        let mut file = IndexFile {
+            seq: opt_int(&root, "seq")?.unwrap_or(0),
+            written_at: opt_str(&root, "written_at")?.unwrap_or_default(),
+            root_id: opt_str(&root, "root_id")?.unwrap_or_default(),
+            entries: std::collections::BTreeMap::new(),
+            dangling: Vec::new(),
+        };
+        if let Some(node) = field(&root, "entries") {
+            if !node.is_null() {
+                for (digest, entry) in want_object(node, "entries")? {
+                    file.entries
+                        .insert(digest.clone(), index_entry(digest, entry)?);
+                }
+            }
+        }
+        if let Some(node) = field(&root, "dangling") {
+            if !node.is_null() {
+                for (index, item) in node
+                    .as_array()
+                    .ok_or_else(|| StateFileError::new("dangling: not an array"))?
+                    .iter()
+                    .enumerate()
+                {
+                    file.dangling
+                        .push(item.as_str().map(str::to_string).ok_or_else(|| {
+                            type_mismatch(&format!("dangling[{index}]"), "a string", item)
+                        })?);
+                }
+            }
+        }
+        Ok(StateFile::Read(file))
+    }
+
+    pub fn encode(&self) -> String {
+        let mut text = format!(
+            "{{\n  \"schema\": {SCHEMA},\n  \"seq\": {},\n  \"written_at\": {},\n  \"root_id\": {},\n  \"entries\": {{",
+            self.seq,
+            string(&self.written_at),
+            string(&self.root_id)
+        );
+        for (index, (digest, entry)) in self.entries.iter().enumerate() {
+            if index > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!(
+                concat!(
+                    "\n    {}: {{\n",
+                    "      \"ext\": {},\n",
+                    "      \"bytes\": {},\n",
+                    "      \"first_seen\": {},\n",
+                    "      \"last_used\": {},\n",
+                    "      \"source\": {},\n",
+                    "      \"kind\": {},\n",
+                    "      \"origin\": {},\n",
+                    "      \"origin_key\": {},\n",
+                    "      \"width\": {},\n",
+                    "      \"height\": {},\n",
+                    "      \"pinned\": {}\n",
+                    "    }}"
+                ),
+                string(digest),
+                string(&entry.ext),
+                entry.bytes,
+                string(&entry.first_seen),
+                string(&entry.last_used),
+                string(&entry.source),
+                string(entry.kind.as_str()),
+                optional_string(entry.origin.as_deref()),
+                string(&entry.origin_key),
+                optional_int(entry.width.map(u64::from)),
+                optional_int(entry.height.map(u64::from)),
+                if entry.pinned { "true" } else { "false" }
+            ));
+        }
+        text.push_str(if self.entries.is_empty() {
+            "},\n"
+        } else {
+            "\n  },\n"
+        });
+        text.push_str("  \"dangling\": [");
+        for (index, digest) in self.dangling.iter().enumerate() {
+            if index > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!("\n    {}", string(digest)));
+        }
+        text.push_str(if self.dangling.is_empty() {
+            "]\n}\n"
+        } else {
+            "\n  ]\n}\n"
+        });
+        text
+    }
+
+    /// The entry for a digest, if the index knows it.
+    pub fn entry(&self, digest: &str) -> Option<&CacheIndexEntry> {
+        self.entries.get(digest)
+    }
+}
+
+/// `sha256/aa/bb/<digest>.<ext>`: the content-addressed path of section 2, in the
+/// one place, so the worker, the daemon's reconciliation and the sweep agree
+/// about where an entry's file is. The two-level fanout is filesystem ergonomics
+/// only, and nothing depends on it (2.1).
+pub fn content_path(cache_root: &std::path::Path, digest: &str, ext: &str) -> std::path::PathBuf {
+    let mut path = cache_root.join("sha256");
+    if digest.len() >= 4 {
+        path.push(&digest[0..2]);
+        path.push(&digest[2..4]);
+    }
+    path.join(format!("{digest}.{ext}"))
+}
+
+/// `tmp/`: in-flight downloads, never candidates (section 2). It sits next to
+/// `sha256/` so that section 3 step 7's `rename` is same-filesystem by
+/// construction rather than by a runtime check.
+pub fn tmp_dir(cache_root: &std::path::Path) -> std::path::PathBuf {
+    cache_root.join("tmp")
+}
+
+/// One digest-keyed entry of the index, tolerant on read: a field this build
+/// does not know is ignored, and the three that describe the bytes are optional
+/// because a writer that did not hold them wrote `null`.
+fn index_entry(
+    digest: &str,
+    node: &crate::config::json::Node,
+) -> Result<CacheIndexEntry, StateFileError> {
+    let fields = want_object(node, &format!("entries[{digest}]"))?;
+    Ok(CacheIndexEntry {
+        ext: req_str_in(fields, "ext")?,
+        bytes: opt_int_in(fields, "bytes")?.unwrap_or(0),
+        first_seen: opt_str_in(fields, "first_seen")?.unwrap_or_default(),
+        last_used: opt_str_in(fields, "last_used")?.unwrap_or_default(),
+        source: opt_str_in(fields, "source")?.unwrap_or_default(),
+        kind: kind_of(&req_str_in(fields, "kind")?, 0)?,
+        origin: opt_str_in(fields, "origin")?,
+        origin_key: req_str_in(fields, "origin_key")?,
+        width: opt_int_in(fields, "width")?.and_then(|value| u32::try_from(value).ok()),
+        height: opt_int_in(fields, "height")?.and_then(|value| u32::try_from(value).ok()),
+        pinned: opt_bool_in(fields, "pinned")?.unwrap_or(false),
+    })
+}
+
 /// Where a favorite's bytes are (docs/architecture.md 2.6, the favorites record).
 /// One implementation, used by the state-file reader and by `favorites`.
 pub fn favorite_state_of(path: Option<&str>) -> FavoriteState {
@@ -690,7 +875,14 @@ fn opt_int(
     root: &[(String, crate::config::json::Node)],
     key: &str,
 ) -> Result<Option<u64>, StateFileError> {
-    match field(root, key) {
+    opt_int_in(root, key)
+}
+
+fn opt_int_in(
+    entries: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<Option<u64>, StateFileError> {
+    match field(entries, key) {
         None => Ok(None),
         Some(node) if node.is_null() => Ok(None),
         Some(node) => match node.as_num() {
@@ -706,7 +898,14 @@ fn opt_bool(
     root: &[(String, crate::config::json::Node)],
     key: &str,
 ) -> Result<Option<bool>, StateFileError> {
-    match field(root, key) {
+    opt_bool_in(root, key)
+}
+
+fn opt_bool_in(
+    entries: &[(String, crate::config::json::Node)],
+    key: &str,
+) -> Result<Option<bool>, StateFileError> {
+    match field(entries, key) {
         None => Ok(None),
         Some(node) if node.is_null() => Ok(None),
         Some(node) => node
@@ -791,6 +990,15 @@ fn string(value: &str) -> String {
 fn optional_string(value: Option<&str>) -> String {
     match value {
         Some(value) => string(value),
+        None => "null".to_string(),
+    }
+}
+
+/// An optional integer in a document this build writes: `null` where the writer
+/// did not know the value, which is the only unset marker in a JSON file (6.3).
+fn optional_int(value: Option<u64>) -> String {
+    match value {
+        Some(value) => value.to_string(),
         None => "null".to_string(),
     }
 }
@@ -1101,5 +1309,69 @@ mod tests {
         assert_eq!(fields.len(), 6);
         fields[5] = fields[5].trim_start();
         assert_eq!(HistoryEntry::from_record_fields(&fields), Some(original));
+    }
+
+    /// The index of 2.1 round-trips through its own encoder, including an entry
+    /// whose three byte-derived fields the writer did not know.
+    #[test]
+    fn the_index_round_trips_through_its_encoder() {
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "ab12cd34".to_string(),
+            CacheIndexEntry {
+                ext: "jpg".to_string(),
+                bytes: 3_822_331,
+                first_seen: "2026-09-24T22:10:03Z".to_string(),
+                last_used: "2026-09-25T07:41:12Z".to_string(),
+                source: "space".to_string(),
+                kind: Kind::Wallhaven,
+                origin: None,
+                origin_key: "wallhaven:ab12cd".to_string(),
+                width: None,
+                height: None,
+                pinned: true,
+            },
+        );
+        let index = IndexFile {
+            seq: 41,
+            written_at: "2026-09-25T07:41:12Z".to_string(),
+            root_id: "8f1d0c2e".to_string(),
+            entries,
+            dangling: vec!["c0ffee".to_string()],
+        };
+        let text = index.encode();
+        assert!(text.contains("\"origin\": null"), "{text}");
+        assert!(text.contains("\"width\": null"), "{text}");
+        match IndexFile::parse(&text) {
+            Ok(StateFile::Read(parsed)) => assert_eq!(parsed, index),
+            other => panic!("the index reads back: {other:?}"),
+        }
+    }
+
+    /// An index from a newer build is left alone, the same rule as the state
+    /// files (6.4 step 4) and the same one case.
+    #[test]
+    fn an_index_from_a_newer_build_is_not_read() {
+        let text = "{\"schema\": 2, \"entries\": {}}";
+        assert_eq!(
+            IndexFile::parse(text),
+            Ok(StateFile::SchemaNewer { found: 2 })
+        );
+    }
+
+    /// The content-addressed path of section 2 is one function, and the fanout
+    /// is the first four hex characters.
+    #[test]
+    fn the_content_path_is_the_digest_under_the_two_level_fanout() {
+        let root = std::path::Path::new("/cache");
+        assert_eq!(
+            content_path(root, "ab12cd34ef", "jpg"),
+            std::path::PathBuf::from("/cache/sha256/ab/12/ab12cd34ef.jpg")
+        );
+        assert_eq!(
+            tmp_dir(root),
+            std::path::PathBuf::from("/cache/tmp"),
+            "tmp/ sits next to sha256/ so the rename of section 3 is same-filesystem"
+        );
     }
 }
