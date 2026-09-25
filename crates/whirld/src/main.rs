@@ -10,17 +10,21 @@
 //! ```
 //!
 //! This is the scaffold: the socket, the protocol, the config, the worker
-//! contract, the state files of `docs/spec/state-and-cache.md` section 6 and the
-//! `subscribe` stream of docs/architecture.md 2.9 are real, and the scheduler,
-//! the cache, the sweep and the wallpaper backends are later cards. It logs to
-//! stderr, because a scaffold is run in the foreground (docs/development.md
-//! section 7) and the log file of `[D 6 §7.2]` arrives with the daemon that has
-//! something to rotate.
+//! contract, the state files of `docs/spec/state-and-cache.md` section 6, the
+//! `subscribe` stream of docs/architecture.md 2.9 and the schedule of 5.5 are
+//! real, and the cache, the sweep and the wallpaper backends are later cards. It
+//! logs to stderr, because a scaffold is run in the foreground
+//! (docs/development.md section 7) and the log file of `[D 6 §7.2]` arrives with
+//! the daemon that has somewhere to put it.
 
 #[cfg(unix)]
 mod events;
 #[cfg(unix)]
 mod plan;
+#[cfg(unix)]
+mod schedule;
+#[cfg(unix)]
+mod scheduler;
 #[cfg(unix)]
 mod socket;
 #[cfg(unix)]
@@ -96,6 +100,17 @@ fn run(flags: &plan::Flags) -> Result<(), String> {
     let daemon = Arc::new(state::Daemon::load(effective, worker));
     let listener = socket::bind(&socket_path)?;
     eprintln!("whirld: listening on {}", socket_path.display());
+
+    // The schedule of 5.5 is a thread of this process, not a timer service (1.1):
+    // it owns the two clocks (an `Instant` for its own origin and the wall clock
+    // the state file persists) and nothing else. It starts after the socket is
+    // bound so that the first `status` can be answered, and its first decision is
+    // taken immediately, which is 5.5 rule 6's restart case.
+    let started = std::time::Instant::now();
+    std::thread::spawn({
+        let daemon = Arc::clone(&daemon);
+        move || scheduler::run(daemon, started)
+    });
 
     // The accept loop runs until the process is signalled, which is the
     // supervisor's job to do (1.5).

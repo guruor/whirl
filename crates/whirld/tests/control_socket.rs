@@ -491,6 +491,162 @@ fn history_reports_the_ring_newest_first_in_the_record_form() {
     );
 }
 
+/// 6.2's ring, end to end: newest first, exactly `state.history_entries` (50)
+/// entries, the oldest dropped on write, `history_count` reporting what is in
+/// the ring rather than how many rotations have happened, and the whole thing
+/// surviving a restart.
+///
+/// 51 rotations, so the 51st is the one that overflows the bound. What each
+/// assertion fails on: a ring with no bound (or one bounded at 51) answers
+/// `count: 51` with 51 entries; a ring that drops the newest instead of the
+/// oldest loses the last file's digest and keeps the first one; an encoder that
+/// wrote the entries oldest-first fails the comparison against the response; a
+/// ring that is not read back at startup comes back empty, so both the count and
+/// the body of the restart's `history 50` change; and a `history.json` this
+/// build cannot parse fails in `HistoryFile::parse` rather than silently.
+///
+/// The file is read back with the parser the daemon itself uses
+/// (`whirl_core::state::HistoryFile`), so the assertion is about the file the
+/// next daemon parses rather than about a substring of it, and it is the state
+/// layout's own path (`state/history.json`, 6.1).
+#[test]
+fn the_ring_keeps_the_fifty_newest_entries_and_survives_a_restart() {
+    let mut daemon = start("the_ring_keeps_the_fifty_newest_entries_and_survives_a_restart");
+
+    /// The digest of the `set:` record in a rotation's response.
+    fn digest_of(lines: &[String]) -> String {
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix("set: "))
+            .unwrap_or_else(|| panic!("a set: line in {lines:?}"))
+            .split(' ')
+            .next()
+            .expect("a digest")
+            .to_string()
+    }
+
+    /// The digests of a `history` response, in the order it wrote them: field 5
+    /// of `entry: <set_at> <via> <kind> <origin_key> <digest> <path|->` (2.6).
+    fn recorded_of(lines: &[String]) -> Vec<String> {
+        body(lines)
+            .iter()
+            .filter(|line| line.starts_with("entry: "))
+            .map(|line| {
+                line["entry: ".len()..]
+                    .split(' ')
+                    .nth(4)
+                    .expect("a digest")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    // 51 distinct files, so 51 distinct digests, and the bound is 50.
+    let mut digests = Vec::new();
+    for index in 0..51 {
+        let path = daemon.dir.join(format!("ring-{index:02}.jpg"));
+        std::fs::write(&path, format!("ring {index}")).expect("a file to set");
+        let lines = daemon.ask(&format!("set path {}", path.display()));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("OK"),
+            "rotation {index}: {lines:?}"
+        );
+        digests.push(digest_of(&lines));
+    }
+    let mut distinct = digests.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 51, "the 51 sets are distinguishable");
+    let oldest = digests[0].clone();
+    // `history` is newest first (2.5, 2.6), so the expectation is the reverse of
+    // the order the rotations happened in, less the one the ring dropped.
+    let expected: Vec<String> = digests[1..].iter().rev().cloned().collect();
+
+    let lines = daemon.ask("history 50");
+    assert_eq!(lines.last().map(String::as_str), Some("OK"));
+    assert_eq!(
+        body(&lines)[0],
+        "count: 50",
+        "the ring is bounded at state.history_entries (6.2)"
+    );
+    let recorded = recorded_of(&lines);
+    assert_eq!(
+        recorded.len(),
+        50,
+        "the count and the entries agree: {lines:?}"
+    );
+    assert_eq!(
+        recorded, expected,
+        "the newest 50, newest first: the 51st set is what dropped the first"
+    );
+    assert!(
+        !recorded.contains(&oldest),
+        "the oldest entry is the one the ring dropped (6.2)"
+    );
+
+    let status = daemon.ask("status");
+    assert_eq!(
+        value(&status, "history_entries"),
+        "50",
+        "the bound 2.10 names"
+    );
+    assert_eq!(
+        value(&status, "history_count"),
+        "50",
+        "50 entries in the ring after 51 rotations, not 51 (2.10)"
+    );
+
+    let history = daemon.dir.join("state").join("history.json");
+    let text = std::fs::read_to_string(&history).expect("state/history.json");
+    let file = whirl_core::state::HistoryFile::parse(&text)
+        .expect("a history file this build wrote")
+        .value()
+        .expect("schema 1 is this build's schema");
+    assert_eq!(
+        file.entries.len(),
+        50,
+        "the file holds the bound, so the 51st rotation dropped one (6.2)"
+    );
+    let on_disk: Vec<String> = file
+        .entries
+        .iter()
+        .map(|entry| entry.digest.clone().expect("a digest"))
+        .collect();
+    assert_eq!(
+        on_disk, recorded,
+        "the file and the response agree, newest first (6.2)"
+    );
+
+    // A restart re-reads the file, and nothing here rotates while it does:
+    // `set path` is not a slot on the grid, so `next_at` is still in the future
+    // and 5.5 rule 6 has no past deadline to rotate on. That is what keeps the
+    // two rings comparable.
+    daemon.child.kill().expect("the daemon is killed");
+    daemon.child.wait().expect("it is reaped");
+    daemon.child = spawn_daemon(&daemon.dir, &daemon.socket, true);
+
+    let after = daemon.ask("history 50");
+    assert_eq!(after.last().map(String::as_str), Some("OK"));
+    assert_eq!(
+        body(&after)[0],
+        "count: 50",
+        "the ring survived the restart"
+    );
+    assert_eq!(
+        recorded_of(&after),
+        recorded,
+        "same entries, same order, after a restart (6.2, 6.4)"
+    );
+    let status = daemon.ask("status");
+    assert_eq!(value(&status, "history_count"), "50");
+    assert_eq!(
+        value(&status, "last_digest"),
+        expected[0],
+        "the anchor is the newest entry's digest (6.1)"
+    );
+}
+
 #[test]
 fn refusals_name_their_code_and_the_line_protocol_holds() {
     let daemon = start("refusals_name_their_code_and_the_line_protocol_holds");
@@ -886,9 +1042,19 @@ fn status_reaches_the_states_its_keys_are_named_for() {
     );
 }
 
-/// 2.9 end to end: `subscribed:`, one event per state change with a `seq` that
-/// increases by exactly 1, commands refused inside the stream, and `close` ending
-/// it.
+/// 2.9 end to end, line for line: `subscribed:`, then the exact lines a complete
+/// rotation produces (2.11 B is the contract), one event per state change with a
+/// `seq` that increases by exactly 1, a command refused inside the stream, and
+/// `close` ending it.
+///
+/// Every line here is compared as a whole string rather than by prefix, and the
+/// `rotate_ok` fields are taken from the `set:` record the *other* connection
+/// received, so the stream and the response cannot disagree about the digest,
+/// the origin, the `via` or the path. What each assertion fails on: a reordered
+/// field (the `via` where the path belongs, which a prefix or a field count
+/// tolerates), a dropped field, a `-` where a path belongs, a wrong `run`, a
+/// wrong `seq`, or an event emitted at a transition that is not the one
+/// announced.
 #[test]
 fn subscribe_streams_one_event_per_state_change() {
     let daemon = start("subscribe_streams_one_event_per_state_change");
@@ -909,12 +1075,37 @@ fn subscribe_streams_one_event_per_state_change() {
     assert_eq!(
         read_line(&mut reader),
         "subscribed: 0",
-        "`subscribed:` carries the daemon's current seq (2.9)"
+        "`subscribed:` carries the daemon's current seq (2.9), and nothing has \
+         happened yet"
     );
 
-    // One state change on another connection: one event, one seq.
-    assert_eq!(daemon.ask("pause").last().map(String::as_str), Some("OK"));
-    assert_eq!(read_line(&mut reader), "event: 1 paused");
+    // A rotation announces exactly two events: the start, whose field is the
+    // daemon's monotonic slot counter (1.6), and the outcome. `run` is 1 because
+    // this daemon has taken no other slot: `state.slot` starts at 1 and a fresh
+    // start arms `next_at` one interval out, so 5.5 rule 6 has no past deadline
+    // to rotate on. Two events is what [M 12]'s duplicate wake had to be
+    // replaced by (2.9).
+    let rotation = daemon.ask("next");
+    assert_eq!(rotation.last().map(String::as_str), Some("OK"));
+    let set = rotation
+        .iter()
+        .find(|line| line.starts_with("set: "))
+        .unwrap_or_else(|| panic!("a set: line in {rotation:?}"));
+    let mut fields = set["set: ".len()..].splitn(4, ' ');
+    let digest = fields.next().expect("a digest");
+    let origin_key = fields.next().expect("an origin_key");
+    let via = fields.next().expect("a via");
+    let path = fields.next().expect("a path");
+    assert_eq!(
+        read_line(&mut reader),
+        "event: 1 rotate_start 1",
+        "the start is announced first, with the slot the worker was given (2.9)"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        format!("event: 2 rotate_ok {digest} {origin_key} {via} {path}"),
+        "then the outcome: 2.6's `set:` record, field for field, after `rotate_ok`"
+    );
 
     // Any other request inside the stream is refused there, and the stream
     // continues: an `ERR` line is distinguishable from an `event` line by prefix.
@@ -925,24 +1116,12 @@ fn subscribe_streams_one_event_per_state_change() {
         "ERR bad_args subscribe takes over this connection"
     );
 
-    // A rotation announces exactly two events: the start and the outcome, which
-    // is what [M 12]'s duplicate wake had to be replaced by (2.9).
-    let rotation = daemon.ask("next");
-    assert_eq!(rotation.last().map(String::as_str), Some("OK"));
-    let start = read_line(&mut reader);
-    assert!(
-        start.starts_with("event: 2 rotate_start "),
-        "the start is announced first: {start}"
-    );
-    let ok = read_line(&mut reader);
-    assert!(
-        ok.starts_with("event: 3 rotate_ok "),
-        "then the outcome: {ok}"
-    );
-    assert!(
-        ok.split(' ').count() >= 7,
-        "rotate_ok carries digest, origin_key, via and a path: {ok}"
-    );
+    // `pause` and `resume` are one event each, and 2.9 gives both an empty field
+    // list: a trailing space or a field here fails on the string.
+    assert_eq!(daemon.ask("pause").last().map(String::as_str), Some("OK"));
+    assert_eq!(read_line(&mut reader), "event: 3 paused");
+    assert_eq!(daemon.ask("resume").last().map(String::as_str), Some("OK"));
+    assert_eq!(read_line(&mut reader), "event: 4 resumed");
 
     writeln!(writer, "close").expect("the request");
     writer.flush().expect("a flush");
@@ -957,6 +1136,99 @@ fn subscribe_streams_one_event_per_state_change() {
         0,
         "the connection is closed after the terminator"
     );
+}
+
+/// 2.11 C3's other half, end to end and line for line: a rotation that produced
+/// nothing is visible on both planes, with the same code and the same message --
+/// 2.7's `ERR` to the client, and 2.9's `rotate_failed <code> <message>` on the
+/// stream -- and `2.10`'s `last_error` carries the code afterwards.
+///
+/// The failure needs no special worker: the daemon is configured, before it
+/// starts, with one `wallhaven` source and no local one, and
+/// `crates/whirl-worker/src/pipeline.rs` has no HTTP client, so the worker
+/// reports `no_candidates` on stderr with its failing stage. The config is the
+/// minimum 4.3 accepts (`sources` is the only key that decides this outcome; the
+/// rest take their defaults), so this test does not have to carry 4.2's whole
+/// example.
+///
+/// A wrong code, a message that is not the worker's own stderr line, the two
+/// fields in the other order, or a stream event whose `seq` does not follow the
+/// `rotate_start` each fail here: the message is compared as a whole string and
+/// the stream line is built from the client's own terminator, so the two planes
+/// cannot disagree.
+#[test]
+fn a_failed_rotation_is_visible_on_both_planes() {
+    let daemon = start_prepared("a_failed_rotation_is_visible_on_both_planes", |dir| {
+        std::fs::write(
+            dir.join("config.json"),
+            "{\n  \"sources\": [\n    { \"id\": \"space\", \"kind\": \"wallhaven\", \"weight\": 3, \"query\": \"landscape\" }\n  ]\n}\n",
+        )
+        .expect("a wallhaven-only config");
+    });
+
+    let stream = UnixStream::connect(&daemon.socket).expect("a connection");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("a read timeout");
+    let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
+    let mut writer = stream;
+    assert!(read_line(&mut reader).starts_with("OK whirl "));
+    writeln!(writer, "subscribe 0").expect("the request");
+    writer.flush().expect("a flush");
+    assert_eq!(read_line(&mut reader), "subscribed: 0");
+
+    let failure = daemon.ask("next");
+    assert_eq!(failure[1], "queued", "the worker was started (2.6)");
+    let terminator = failure.last().expect("a terminator");
+    let code = terminator.split(' ').nth(1).expect("a code");
+    assert_eq!(
+        code, "no_candidates",
+        "2.7's code for a source that yielded nothing: {terminator}"
+    );
+    let message = terminator
+        .strip_prefix(&format!("ERR {code} "))
+        .expect("a message after the code");
+    assert!(
+        message.starts_with("stage=source code=no_candidates "),
+        "the worker's failing stage rides the message (1.6): {message}"
+    );
+
+    assert_eq!(
+        read_line(&mut reader),
+        "event: 1 rotate_start 1",
+        "the start is announced even though the rotation then fails (2.9)"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        format!("event: 2 rotate_failed {code} {message}"),
+        "and the outcome carries the same code and the same message the client got"
+    );
+
+    let status = daemon.ask("status");
+    assert_eq!(
+        value(&status, "last_error"),
+        "no_candidates",
+        "2.10's key for the last rotation's code"
+    );
+    assert_eq!(
+        value(&status, "rotation_count"),
+        "0",
+        "a rotation that produced nothing is not a completed rotation"
+    );
+    assert_eq!(
+        value(&status, "rotating"),
+        "0",
+        "the failure released the slot (1.7)"
+    );
+    assert_eq!(
+        daemon.ask("ping").last().map(String::as_str),
+        Some("OK"),
+        "a failed rotation is not a broken connection (2.11 C1)"
+    );
+
+    writeln!(writer, "close").expect("the request");
+    writer.flush().expect("a flush");
+    assert_eq!(read_line(&mut reader), "OK");
 }
 
 /// `since` produces the gap of 2.9 and nothing more: the daemon keeps no event

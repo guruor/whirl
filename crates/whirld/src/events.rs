@@ -65,7 +65,6 @@ pub enum Event {
     },
     /// The wall clock moved more than two intervals, so the deadline was
     /// recomputed.
-    #[allow(dead_code)] // trigger: the scheduler (docs/spec/state-and-cache.md 8.6)
     ClockJump {
         seconds: i64,
     },

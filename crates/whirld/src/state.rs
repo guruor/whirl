@@ -15,13 +15,14 @@
 use crate::events::{Bus, Event, unix_seconds};
 use crate::plan::Effective;
 use crate::statefile::{Kind as File, Store};
+use crate::worker::{Outcome, Verb, WorkerError};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use whirl_core::config::Config;
-use whirl_core::protocol::{self, ErrorCode, Kind, Response, Via};
+use whirl_core::protocol::{self, ErrorCode, Kind, Response, SetRecord, Via};
 use whirl_core::state::{
     Anchor, CacheFacts, CurrentFile, Favorite, FavoriteState, FavoritesFile, HistoryEntry,
     HistoryFile, HistoryRing, StateFile,
@@ -167,13 +168,15 @@ impl State {
 
     /// How many seconds until `next_at`, clamped to `0..=interval`, or `None`
     /// while paused: a suspended schedule has no deadline to count down to
-    /// (2.10 `next_in_s`, 5.5 rule 8).
-    pub fn next_in_s(&self, interval_seconds: u64) -> Option<i64> {
+    /// (2.10 `next_in_s`, 5.5 rule 8). `now` is passed in rather than read here,
+    /// so each state 2.10 names is asserted on a value instead of on the
+    /// machine's clock.
+    pub fn next_in_s(&self, now: i64, interval_seconds: u64) -> Option<i64> {
         if self.paused {
             return None;
         }
         let next_at = self.next_at?;
-        let remaining = next_at - unix_seconds();
+        let remaining = next_at - now;
         Some(remaining.clamp(0, interval_seconds as i64))
     }
 }
@@ -194,6 +197,19 @@ fn resolved_from_favorite(favorite: &Favorite) -> Resolved {
         kind: favorite.kind,
         path: favorite.path.clone(),
     }
+}
+
+/// What one rotation produced, for either of its two callers: a client's
+/// `next`/`set` over the control socket, or a due slot of the scheduler (2.5,
+/// 5.5 rule 4). The state change has already happened by the time this is
+/// returned; this is only what to *say* about it.
+#[derive(Debug)]
+pub enum Rotation {
+    /// The wallpaper changed: 2.6's `set:` record, already parsed.
+    Set(SetRecord),
+    /// The rotation produced nothing: the code and message of 2.7, which are
+    /// also in `last_error` and on the `rotate_failed` event.
+    Failed { code: ErrorCode, message: String },
 }
 
 /// The daemon. One lock, held only for the duration of a memory read or write
@@ -281,7 +297,7 @@ impl Daemon {
                 "next_in_s",
                 dash(
                     state
-                        .next_in_s(config.schedule.interval_seconds)
+                        .next_in_s(unix_seconds(), config.schedule.interval_seconds)
                         .map(|seconds| seconds.to_string()),
                 ),
             )
@@ -501,6 +517,101 @@ impl Daemon {
             .unwrap_or(Kind::External)
     }
 
+    /// The `plan:` line of 2.6 for this daemon, from the one implementation
+    /// beside the schema (`Config::plan_pairs`).
+    ///
+    /// `whirl config check` prints this same line, and 2.6's claim is that "what
+    /// did the daemon actually adopt" is answerable from the line alone, so the
+    /// daemon records it at a rotation instead of keeping a second opinion about
+    /// the effective values.
+    pub fn plan_line(&self) -> String {
+        protocol::plan_record(&self.effective.config.plan_pairs(self.effective.backend))
+    }
+
+    /// The deadline a worker gets: `schedule.worker_deadline_seconds` (1.7.1).
+    pub fn worker_deadline(&self) -> Duration {
+        Duration::from_secs(self.effective.config.schedule.worker_deadline_seconds)
+    }
+
+    /// One rotation, in the slot `run` the caller claimed, with its outcome
+    /// recorded. This is the whole of the rotation path, shared by its two
+    /// callers so that a scheduled slot and a client's `next` cannot diverge:
+    /// `crate::socket` writes the `set:` line or the `ERR` to the client, and
+    /// `crate::scheduler` logs the outcome for a slot nobody asked for.
+    ///
+    /// The worker is spawned outside the state lock (1.8), and `record_success`
+    /// or `record_failure` is what clears `running` again.
+    pub fn rotation(&self, run: u64, via: Via, verb: Verb, target: Option<&str>) -> Rotation {
+        let deadline = self.worker_deadline();
+        match self.worker.run(verb, target, run, deadline) {
+            Ok(Outcome::Set(record)) => {
+                self.record_success(
+                    &record.digest,
+                    &record.origin_key,
+                    via,
+                    record.path.as_deref(),
+                );
+                Rotation::Set(record)
+            }
+            // A rotation verb answered with `source:`/`plan:` lines is not the
+            // `set:` of 2.5 or 2.6, so its output could not be parsed into the
+            // answer the client asked for: `worker_failed` (2.7). The lines are
+            // in the message because they are all the evidence there is.
+            Ok(Outcome::Lines(lines)) => {
+                let message = format!(
+                    "the worker answered a rotation with check lines: {}",
+                    lines.join(" | ")
+                );
+                self.record_failure(ErrorCode::WorkerFailed, &message);
+                Rotation::Failed {
+                    code: ErrorCode::WorkerFailed,
+                    message,
+                }
+            }
+            Err(WorkerError::Timeout) => {
+                let message = "the worker did not finish inside schedule.worker_deadline_seconds";
+                self.record_failure(ErrorCode::Timeout, message);
+                Rotation::Failed {
+                    code: ErrorCode::Timeout,
+                    message: message.to_string(),
+                }
+            }
+            Err(WorkerError::Failed { code, message }) => {
+                self.record_failure(code, &message);
+                Rotation::Failed { code, message }
+            }
+        }
+    }
+
+    /// Spend the slot of a due rotation: the deadline advances by whole
+    /// intervals (5.5 rule 4) and is persisted *before* the worker is spawned,
+    /// because the slot is spent whether or not the rotation inside it succeeds
+    /// (1.7.2: a crash mid-rotation has "the slot consumed").
+    ///
+    /// Only a due slot calls this. A client's `next` is not a slot on the grid,
+    /// so it leaves `next_at` where it is: 2.12's table re-anchors on the
+    /// rotation that a slot ran, not on every rotation.
+    pub fn spend_slot(&self, next_at: i64) {
+        let mut state = self.state();
+        state.next_at = Some(next_at);
+        self.save_current(&state);
+    }
+
+    /// 5.5 rule 5: one line in the daemon's log, one more `clock_jump` for
+    /// `status` (2.10), the deadline re-anchored from the wall clock, and the
+    /// event on the stream (2.9). Not a rotation, so no `rotate_*` event.
+    pub fn record_clock_jump(&self, seconds: i64, next_at: i64) {
+        let mut state = self.state();
+        state.clock_jump += 1;
+        state.next_at = Some(next_at);
+        Self::announce(&mut state, &self.bus, Event::ClockJump { seconds });
+        self.save_current(&state);
+        eprintln!(
+            "whirld: clock jump: the wall clock moved {seconds} s, next_at re-anchored to {}",
+            protocol::rfc3339_utc(next_at)
+        );
+    }
+
     pub fn resolve_id(&self, id: &str) -> Option<Resolved> {
         self.state().resolve(id)
     }
@@ -526,10 +637,12 @@ impl Daemon {
         state.paused = paused;
         if !paused {
             // 2.9 `resumed`: the schedule is live again, `next_at` re-armed from
-            // now. While paused `next_at` keeps its value, frozen: a suspended
+            // now (`crate::schedule::rearmed_from`, the same rule the scheduler
+            // reads it from, so `resume` and a fresh start cannot disagree).
+            // While paused `next_at` keeps its value, frozen: a suspended
             // schedule has no deadline to count down to.
-            let interval = self.effective.config.schedule.interval_seconds as i64;
-            state.next_at = Some(unix_seconds() + interval);
+            let interval = self.effective.config.schedule.interval_seconds;
+            state.next_at = Some(crate::schedule::rearmed_from(unix_seconds(), interval));
         }
         Self::announce(
             &mut state,
@@ -976,4 +1089,75 @@ fn cache_usage(root: &Path) -> Option<(u64, u64)> {
 /// and `unrecoverable` when there is no path to check (2.6).
 pub fn favorite_state(path: Option<&str>) -> FavoriteState {
     whirl_core::state::favorite_state_of(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2.10's `next_in_s` row, one assertion per state it names, with `now`
+    /// passed in: a live deadline counts down, a deadline already passed is `0`
+    /// and never negative, a deadline further away than one interval is capped
+    /// at the interval, a suspended schedule has no deadline to count down to
+    /// (`-`, which is `None` here), and a missing deadline is `-` too.
+    ///
+    /// Each assertion fails on a wrong value of the right shape: dropping the
+    /// clamp gives `-7` for the passed deadline and `99_999` for the distant
+    /// one, and returning `Some(0)` for a paused daemon (a plausible reading of
+    /// "no countdown") fails the two `None` assertions.
+    #[test]
+    fn next_in_s_is_the_countdown_of_2_10_in_every_state() {
+        let mut state = State::new(50);
+        assert_eq!(
+            state.next_in_s(1_000, 1800),
+            None,
+            "no persisted deadline: 2.10's `-` while the schedule is unset"
+        );
+
+        state.next_at = Some(2_800);
+        assert_eq!(state.next_in_s(1_000, 1800), Some(1_800));
+        assert_eq!(
+            state.next_in_s(1_799, 1800),
+            Some(1_001),
+            "a second later the countdown is a second shorter"
+        );
+        assert_eq!(
+            state.next_in_s(2_807, 1800),
+            Some(0),
+            "a deadline already passed counts down to 0, not below it"
+        );
+        // A deadline further away than one interval (a hand-edited state file)
+        // is capped at the interval rather than reported as-is.
+        state.next_at = Some(1_000_000);
+        assert_eq!(
+            state.next_in_s(900_000, 1800),
+            Some(1_800),
+            "capped at one interval"
+        );
+
+        state.next_at = Some(2_800);
+        state.paused = true;
+        assert_eq!(
+            state.next_in_s(1_200, 1800),
+            None,
+            "a suspended schedule has no deadline to count down to (5.5 rule 8)"
+        );
+    }
+
+    /// `resume` re-arms from now (2.5, 5.5 rule 8), so the countdown straight
+    /// after it is the full interval; `pause` freezes the deadline where it was
+    /// rather than advancing it, so the value is unchanged by the pause.
+    #[test]
+    fn a_re_armed_deadline_counts_down_from_the_full_interval() {
+        let mut state = State::new(50);
+        state.next_at = Some(crate::schedule::rearmed_from(1_000, 1800));
+        assert_eq!(state.next_in_s(1_000, 1800), Some(1_800));
+        state.paused = true;
+        state.paused = false;
+        assert_eq!(
+            state.next_in_s(1_000, 1800),
+            Some(1_800),
+            "the flag does not move the deadline"
+        );
+    }
 }
