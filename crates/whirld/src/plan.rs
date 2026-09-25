@@ -78,11 +78,7 @@ impl Effective {
             .or_else(paths::socket_file)
             .ok_or("no socket path: neither --socket, WHIRL_SOCKET, `socket` nor a platform default is available")?;
 
-        let state_dir = env_path("WHIRL_STATE_DIR")
-            .or_else(paths::state_dir)
-            .ok_or(
-                "no state directory: neither WHIRL_STATE_DIR nor a platform default is available",
-            )?;
+        let state_dir = state_dir()?;
 
         let cache_dir = env_path("WHIRL_CACHE_DIR")
             .or_else(|| config.cache.root.clone())
@@ -140,6 +136,23 @@ impl Effective {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
+}
+
+/// The state directory, resolved the way `resolve` does it: `WHIRL_STATE_DIR`,
+/// then the platform default (docs/architecture.md 4.3's precedence — this is the
+/// one path with no config-file arm, because the config lives in the state
+/// directory's own tree).
+///
+/// It is a function of its own because 1.5 step 1 takes the daemon lock before
+/// anything else resolves, and one resolution is what keeps step 1 and the rest
+/// of startup from being able to disagree about which directory that is.
+pub fn state_dir() -> Result<PathBuf, String> {
+    env_path("WHIRL_STATE_DIR")
+        .or_else(paths::state_dir)
+        .ok_or_else(|| {
+            "no state directory: neither WHIRL_STATE_DIR nor a platform default is available"
+                .to_string()
+        })
 }
 
 /// Read the config, writing the annotated default first when the file is absent
