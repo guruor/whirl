@@ -8,11 +8,22 @@ name: ci
 # Rule (docs/development.md, "Continuous integration"): every command a
 # contributor runs before opening a pull request appears here verbatim. If a
 # check is not in this file it is a preference, not a gate.
+#
+# Triggers (docs/development.md section 6): `development` integrates, `main`
+# releases. So this workflow runs for a push to either branch, and for a pull
+# request whose base is either. The pull request whose base is `main` is a
+# promotion, and it runs the full matrix like any other change: the promotion is
+# the last look between `development` and the tag.
+#
+# A tag is not a trigger here. A tag runs `.github/workflows/release.yml`, which
+# is the release and needs to write to the repository; this file builds and
+# checks, and declares `contents: read` so that it cannot write.
 
 on:
   push:
-    branches: [main]
+    branches: [main, development]
   pull_request:
+    branches: [main, development]
   workflow_dispatch:
 
 concurrency:

@@ -101,7 +101,14 @@ docs/
   research/                 per-platform findings, with the real-hardware checklists
   decisions/                ADRs: NNNN-title.md, template in 0000-template.md
   reviews/                  review reports, one per reviewed document
-.github/workflows/ci.yml    the gate (section 4)
+  releases/                 one file per release: vX.Y.Z.md, the notes the tag
+                            workflow publishes, written before the tag (section 5)
+.github/workflows/ci.yml    the gate: push to `main` or `development`, pull request
+                            into either, by hand (section 4)
+.github/workflows/release.yml   a tag `v*` becomes a release: same artifacts, notes,
+                                and a GitHub Release (section 5)
+.github/release-notes-template.md   the shape of a release's notes, and the sections
+                                    a release may not publish without (section 5)
 prototype/                  the throwaway spike: read-only, never shipped, never built by CI
 ```
 
@@ -288,9 +295,16 @@ not the evidence.
 
 `.github/workflows/ci.yml` is the gate. Seven jobs: `fmt`, `clippy` (three OS),
 `test` (three OS), `msrv`, `guards`, `secrets`, `artifacts` (three OS). It runs
-on pushes to `main`, on every pull request, and by hand with `workflow_dispatch`.
-It declares `permissions: contents: read`, so a compromised step cannot write to
-the repository, and it cancels superseded runs on the same ref.
+on pushes to `main` **and to `development`**, on every pull request whose base is
+either, and by hand with `workflow_dispatch`. It declares
+`permissions: contents: read`, so a compromised step cannot write to the
+repository, and it cancels superseded runs on the same ref.
+
+The pull request whose base is `main` is a promotion, and it runs the whole
+matrix like any other change: the promotion is the last look `development` gets
+before the tag (section 5). A **tag** does not run this workflow at all; a tag
+runs `.github/workflows/release.yml`, which is the release itself and the only
+workflow here that is allowed to write to the repository (section 5).
 
 `secrets` runs gitleaks over the commits the change adds, not over the tree and
 not over the whole history: gitleaks' git mode reads a commit's added lines, so a
@@ -320,9 +334,10 @@ before it is used as a range.
 
 ### What has and has not been verified about the workflow
 
-- **Verified on this machine:** `actionlint` (1.7.11) reports no problems for the
-  file, and a real YAML parse finds 6 jobs and the three triggers. Both commands
-  are in the handoff note.
+- **Verified on this machine:** `actionlint` (1.7.11) reports no problems for this
+  file and for `.github/workflows/release.yml`, and a real YAML parse finds 7 jobs
+  and the three triggers here, and the 2 jobs of the release workflow with its one
+  trigger. Both commands are in the handoff note.
 - **Verified when this guide was written, and now superseded:** `gh run list -R
   guruor/whirl` returned an empty list, so no CI run had executed. **The first run
   is pull request #1's:** run `36126085459`, green, twelve jobs. A run named by its
@@ -356,7 +371,7 @@ does not repeat the value anywhere else:
 |---|---|---|
 | the toolchain version | `rust-toolchain.toml` | a one-line pull request; CI picks it up through `rustup show` |
 | the MSRV | `rust-version` in the workspace manifest, plus the `msrv` job | the four steps above, in one commit |
-| the pinned action versions, and the gitleaks version and its digest | `.github/workflows/ci.yml` | Dependabot or a deliberate pull request, never a floating tag |
+| the pinned action versions, and the gitleaks version and its digest | `.github/workflows/ci.yml` and `.github/workflows/release.yml` | Dependabot or a deliberate pull request. An action added from now on is pinned to a full commit SHA, never to a tag or a branch: a tag can be moved under the repository between two runs |
 | the two vendor prices and their URLs | the Sources list at the end of this document, each with its retrieval date | re-fetch, and correct the date, before repeating the number as a fact |
 | the platform facts | `docs/research/*`, each with its own retrieval date and provenance | a research card, not an edit here |
 
@@ -374,20 +389,133 @@ the number is the vendor's to change and ours to re-check.
   `whirl-core::protocol` is negotiated at runtime (`docs/architecture.md` 2.4) and
   moves on its own schedule. The greeting carries both, so a stale client fails
   fast with a message instead of behaving strangely.
-- **A release is a git tag `vX.Y.Z` on `main`,** plus the artifacts built from it
-  by the `artifacts` job. No branch is a release. The release notes are written at
-  tag time and must include: what changed, the per-platform checklist results
-  (section 3), and any config key added, removed or defaulted differently.
+- **A release is a git tag `vX.Y.Z` on `main`,** plus the artifacts the tag
+  workflow builds from it (below). No branch is a release. The notes are written
+  *before* the tag, not after it, because the workflow publishes them from the
+  tagged commit: they must include what changed, the per-platform checklist
+  results (section 3), and any config key added, removed or defaulted differently.
 - **A patch release fixes; a minor release adds.** Anything that raises the MSRV,
   changes a config key's meaning or changes the protocol is a minor release.
 
+### The promotion: how a commit reaches `main`
+
+`development` integrates and `main` releases, and the step between them is one
+pull request. It is the last look before the tag, so it has five parts and no
+shortcuts:
+
+1. **`development` is green.** The *tip* of `development` has a green `ci.yml` run,
+   named by its run id in the pull request. "The last change was green" is a
+   different claim, and it is not the one that matters.
+2. **The release-blocking checklists have been run on real hardware,** for every
+   platform this release supports, by people who have that hardware. The results
+   are the notes' required sections (step 3). CI green is a precondition, not the
+   evidence (section 3, "What CI cannot prove").
+3. **The notes are written on `development`**, at `docs/releases/vX.Y.Z.md`, from
+   `.github/release-notes-template.md`. They travel with the promotion because the
+   tag has to point at a commit that already contains them: the workflow refuses
+   to publish a final release whose notes file is missing or still holds a
+   placeholder.
+4. **The promotion pull request is opened and merged:**
+   `gh pr create --base main --head development`. It runs the full matrix, because
+   `ci.yml` triggers on a pull request whose base is `main` as well as
+   `development` (section 4), and it is reviewed like any other pull request, by
+   someone who did not open it. Nothing else rides in it: a change that did not
+   land on `development` first does not enter `main` through the promotion.
+5. **`main` is back-merged into `development` immediately** (section 6, the
+   back-merge rule), before anything else and before the tag.
+
+Then, and only then, the tag: "Cutting a release, step by step" below.
+
+### Making the tag do the work
+
+`.github/workflows/release.yml` runs on a tag push (`on: push: tags: ["v*"]`) and
+is this document's procedure in executable form:
+
+| step | what happens |
+|---|---|
+| build | `cargo build --workspace --release` on `ubuntu-latest`, `macos-latest` and `windows-latest`: the command the `artifacts` job runs, and the same three binaries per platform |
+| package | one archive per platform, `whirl-<tag>-<os>-<arch>.<ext>`, and the run fails if the runner's architecture is not the one the archive name claims, because a mislabelled artifact is worse than a missing one |
+| notes | `docs/releases/<tag>.md` from the tagged commit. A `vX.Y.Z-rc.N` tag with no such file is rendered from `.github/release-notes-template.md`, placeholders and all, which is what the prerelease flag says out loud. A final release with no notes file is refused, and so is a file that is missing a required section or still holds a placeholder |
+| publish | `gh release create <tag>` with the three archives attached, and `--verify-tag` so a typo cannot create a tag quietly. A tag with a prerelease suffix (`v0.2.0-rc.1`) is published as a GitHub prerelease; `vX.Y.Z` is not |
+
+Three consequences worth stating:
+
+- **The tag is the trigger, not a note to yourself.** Nothing else has to be
+  clicked, run or remembered after `git push origin vX.Y.Z`.
+- **The notes are part of the promotion,** not something typed into the release
+  page afterwards, because the workflow reads them out of the tagged commit.
+- **A failed run is fixable without re-tagging.** Fix the notes, land them through
+  `development` and a promotion, then `gh run rerun <run id>`. Re-tagging means
+  deleting a tag that someone may already have fetched, which is the kind of
+  manual repair this workflow exists to remove.
+
+The workflow does not run the test suite, and does not need to: the tagged commit
+is `main`'s tip, which is a promotion's merge commit, and `ci.yml` has already run
+the whole matrix on it, both on the promotion pull request and on the push to
+`main` the merge produced. The tag is the last step of a procedure that starts
+with a green `development`, not a substitute for it.
+
+### Cutting a release, step by step
+
+For someone who has never done it here:
+
+1. **Decide the version.** SemVer (above): a patch fixes, a minor adds, and `0.x`
+   holds until all three platforms have passed their checklists. The protocol
+   version is not the release version and moves on its own schedule.
+2. **Bump `version` in `[workspace.package]` in `Cargo.toml`, on `development`,**
+   as its own pull request, one change per pull request, and let it go green.
+3. **Write the notes on `development`**, at `docs/releases/vX.Y.Z.md`, from
+   `.github/release-notes-template.md`, with the checklist results from step 2 of
+   the promotion. Same route: a pull request into `development`.
+4. **Promote:** the five steps above, ending with the back-merge.
+5. **Tag `main`'s tip and push it:**
+
+   ```sh
+   git fetch origin
+   git switch main && git pull --ff-only
+   git tag --annotate vX.Y.Z --message "whirl vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+   Annotated rather than lightweight: a release has an author, a date and a
+   message, and `git describe` should say what a lightweight tag cannot.
+6. **Watch the run and the release:**
+
+   ```sh
+   gh run list --workflow release.yml --limit 1
+   gh release view vX.Y.Z
+   ```
+
+   If it failed on the notes gate, fix the notes, land them through `development`
+   and a promotion, and rerun the failed run. Do not delete the tag to push it
+   again.
+7. **A prerelease is the same procedure with `vX.Y.Z-rc.N`,** except that step 3 is
+   optional and the run marks it as a prerelease. That is the only shape to use for
+   a rehearsal: a tag that looks like a final release is not a rehearsal, and
+   deleting one afterwards leaves a release in every clone that fetched it.
+
 ### What a release artifact is, per platform
+
+What the tag workflow produces today, and therefore what `gh release view` shows
+for a release:
 
 | platform | artifact | notes |
 |---|---|---|
-| macOS | `whirl-vX.Y.Z-macos.tar.gz` with the three binaries and a launchd plist, plus an optional `.pkg` | Apple silicon and Intel separately unless a universal binary is built; see signing below |
-| Windows | `whirl-vX.Y.Z-windows-x86_64.zip` with `whirld.exe`, `whirl.exe`, `whirl-worker.exe` and a Task Scheduler registration script | per-user install, no service: the setter needs the user's session (`docs/research/windows.md` 4) |
-| Linux | `whirl-vX.Y.Z-linux-x86_64.tar.gz` with the three binaries and a systemd user unit | distribution packages are deferred; see below |
+| macOS | `whirl-vX.Y.Z-macos-arm64.tar.gz`: the three binaries | built on `macos-latest`, which is arm64; an Intel build is a deliberate addition to the matrix, not something to assume |
+| Windows | `whirl-vX.Y.Z-windows-x86_64.zip`: `whirld.exe`, `whirl.exe`, `whirl-worker.exe` | per-user install, no service: the setter needs the user's session (`docs/research/windows.md` 4) |
+| Linux | `whirl-vX.Y.Z-linux-x86_64.tar.gz`: the three binaries | distribution packages are deferred; see below |
+
+The archive is the three binaries and nothing else, because that is what the
+workflow builds and what it can prove it built. Three things a release will have
+to carry and does not yet, each its own piece of work rather than a line here:
+
+- **The supervisor's own files:** a launchd plist, a Task Scheduler registration
+  script, a systemd user unit. `docs/research/scheduling.md` has the text of each;
+  until they are in the artifact, the notes say what installing the release
+  involves.
+- **A `.pkg`, or any installer.** The tarball and the zip are the install.
+- **Signing and notarization.** The macOS artifacts are unsigned today, so the
+  release notes have to say what a first run looks like (below).
 
 Binary size is part of the promise, not an accident:
 
@@ -491,11 +619,54 @@ What is deliberately not supported:
 
 ## 6. Contribution flow
 
-### Branches and pull requests
+### Branches: `development` integrates, `main` releases
 
-- Branch from `main`, one branch per change, named `<area>/<short-topic>`, for
-  example `daemon/stale-socket-probe`, `worker/wallhaven-pagination`,
-  `docs/development-guide`. Never reuse a branch after its pull request merges.
+Three kinds of branch, one line each:
+
+- **`development` integrates.** Every change lands here first, and it is the only
+  branch a working branch is opened against.
+- **`main` releases.** A commit reaches `main` only as a promotion (section 5), and
+  a release is a tag on it. It is always meant to be production-ready, so it never
+  carries an intermediate failure.
+- **A working branch is short-lived.** One branch per change, cut from
+  `development`, named `<area>/<short-topic>`, for example
+  `daemon/stale-socket-probe`, `worker/wallhaven-pagination`,
+  `docs/development-guide`. Delete it after its pull request merges, and never
+  reuse it after that.
+
+The rules that follow from that:
+
+- **Every change arrives as a pull request into `development`.** Open it with
+  `gh pr create --base development`. **`main` never receives a direct commit:**
+  not from a maintainer, not from an agent, and not to fix a release in a hurry.
+  A hotfix is a change like any other, so it goes through `development` and then
+  through a promotion.
+- **Cut the working branch from the tip of `development`,** and keep it there with
+  `git pull --ff-only origin development`. It does not rebase and it does not
+  merge: a branch whose diff is only its own change is the branch a reviewer can
+  read.
+- **The back-merge rule.** Anything that reaches `main`, a promotion or a later
+  hotfix, is merged back into `development` immediately, before any other work
+  lands:
+
+  ```sh
+  git fetch origin
+  git switch development && git pull --ff-only
+  git merge --no-ff --no-edit origin/main
+  git push origin development
+  ```
+
+  **Why it exists:** it keeps `main`'s tip an ancestor of `development`. That is
+  what lets the next working branch fast-forward onto `development` instead of
+  rebasing (which rewrites commits a reviewer has already read) or merging (which
+  buries the change in a merge commit and makes the next diff unreadable). Skip
+  the back-merge and the damage is not in `main`, it is in the next branch.
+- **The rule is enforced, not remembered.** Branch protection on `main` requires
+  a pull request and passing checks, so a direct commit, a force push or a merge
+  with a red pipeline is refused by the host rather than by good intentions;
+  `development` requires passing checks too, so a red tip is visible before a
+  promotion reads it. This document describes the expectation; the repository
+  owner applies the settings, because a screenshot of a setting is not a rule.
 - One change per pull request. A formatting sweep and a behaviour change in the
   same diff is two pull requests.
 - The pull request body states: what changed, what you ran, what you observed, and
@@ -592,12 +763,13 @@ No test in the repository may need a real credential: the Wallhaven tests run
 against fixtures, or are marked as requiring a key and skipped when it is absent.
 
 Run the scanner before you push. It is the same tool, the same config file and the
-same range the `secrets` job scans: the commits your branch adds to `main`.
+same range the `secrets` job scans: the commits your branch adds to `development`
+(which is the branch a working branch is cut from, section 6).
 
 ```sh
-git fetch origin main
+git fetch origin development
 gitleaks git --config .gitleaks.toml --redact \
-  --log-opts="$(git merge-base origin/main HEAD)..HEAD"
+  --log-opts="$(git merge-base origin/development HEAD)..HEAD"
 ```
 
 `gitleaks` is not a build dependency; take it from the project's releases (CI pins
@@ -608,11 +780,11 @@ makes `git log -p` colourise a pipe, and gitleaks cannot read that. The CI job
 pins both off for this reason, and the same two overrides work locally:
 
 ```sh
-git fetch origin main
+git fetch origin development
 GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false \
 GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false \
 gitleaks git --config .gitleaks.toml --redact \
-  --log-opts="$(git merge-base origin/main HEAD)..HEAD"
+  --log-opts="$(git merge-base origin/development HEAD)..HEAD"
 ```
 
 An exemption from the scanner's rules lives in `.gitleaks.toml`, needs a
