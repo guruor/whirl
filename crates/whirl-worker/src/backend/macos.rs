@@ -485,3 +485,31 @@ fn current_images() -> Result<Vec<(String, Option<String>)>, SetError> {
     }
     Ok(images)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reads every screen's current image and prints the platform's own answer,
+    /// for the by-hand real-set-and-restore check that CI cannot make
+    /// (docs/development.md, "What CI cannot prove": CI runs headless). It changes
+    /// nothing, which is why it is safe to run against a live desktop.
+    ///
+    /// `#[ignore]`d and it stays ignored: a machine without an Aqua session has no
+    /// screens to report, so it can only ever say something on a Mac with someone
+    /// at the keyboard. It is not evidence in CI and the card handoff says so. Run
+    /// it by hand:
+    /// `cargo test -p whirl-worker --bin whirl-worker prints_every -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reads the real desktop: needs an Aqua session, run by hand with --ignored --nocapture"]
+    fn prints_every_screens_current_image() {
+        let images = current_images().expect("a desktop session");
+        println!("NSScreen.screens: {}", images.len());
+        for (screen, path) in images {
+            println!(
+                "  {screen}: {}",
+                path.unwrap_or_else(|| "<no image>".to_string())
+            );
+        }
+    }
+}
