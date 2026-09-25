@@ -4,9 +4,10 @@ A cross-platform wallpaper manager built as a small daemon with an `mpd`-style
 line protocol, a config file instead of a settings UI, and thin clients that can
 be added later without touching the core.
 
-**Status: design phase.** Nothing is released. [docs/](docs/) will hold the
-research and the specs; [prototype/](prototype/) holds a throwaway spike that
-establishes the two numbers the design rests on.
+**Status: design phase.** Nothing is released. [docs/](docs/) holds the research,
+the specs, the architecture and the development guide; [prototype/](prototype/)
+holds a throwaway spike that establishes the two numbers the design rests on. The
+Cargo workspace under `crates/` is the next thing to land.
 
 ## Why another wallpaper app
 
@@ -51,9 +52,17 @@ owned, is flat forever.
 ## Repo layout
 
 ```
-docs/          research, specs, architecture, development guide (being written)
+crates/        the workspace: whirl-core, whirld, whirl-worker, whirl-cli (next thing to land)
+docs/          research, specs, architecture, the development guide
 prototype/     the throwaway spike: reference only, not shipped
 ```
+
+## Working on it
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) for a first pull request, and
+[docs/development.md](docs/development.md) for the repo layout, the toolchain and
+dependency policy, the test matrix, the release process, and how to run a rotation
+without changing your own wallpaper.
 
 ## Non-goals
 
