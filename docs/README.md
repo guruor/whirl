@@ -14,10 +14,10 @@ someone who did not write it has reproduced its evidence and said so, in
 | `research/scheduling.md` | reviewed | launchd, Task Scheduler and systemd user timers: missed-run behaviour across sleep, install/uninstall, and whether they can replace an in-daemon timer |
 | `spec/features.md` | reviewed | the v0.1 feature set, the source abstraction, filters, and what is explicitly out of scope |
 | `spec/state-and-cache.md` | reviewed | per-OS state and cache locations, eviction policy, atomic writes, corruption recovery |
-| `architecture.md` | reviewed, defects being fixed | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
-| `development.md` | reviewed, defects being fixed | repo layout, build and test matrix, release process, contribution workflow |
+| `architecture.md` | reviewed | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
+| `development.md` | reviewed | repo layout, build and test matrix, release process, contribution workflow |
 | `decisions/` | template in place, no decisions recorded yet | one ADR per decision that changes the architecture; template in `0000-template.md` |
-| `reviews/` | three reports: the pack (two rounds) and the architecture set | one review report per reviewed document: what the reviewer ran, what they observed, what they could not check |
+| `reviews/` | four reports: the pack in two rounds, the architecture set in two rounds | one review report per reviewed document: what the reviewer ran, what they observed, what they could not check |
 
 ## Reading order
 
