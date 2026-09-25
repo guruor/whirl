@@ -26,3 +26,22 @@ repository = "https://github.com/guruor/whirl"
 
 [workspace.dependencies]
 whirl-core = { path = "crates/whirl-core" }
+
+# The shipped artifact, and the reason this exists rather than a code diet:
+# docs/architecture.md R2 caps `whirld` at 1 MiB, and the daemon's own feature
+# work (the rotation plan, the worker spawn contract, supervision and the event
+# stream) took the unstripped binary from 0.99 MiB to 1.02 MiB on the ubuntu
+# runner. The cap is a real invariant and the guard in `.github/workflows/ci.yml`
+# measures exactly this artifact, so the profile meets it: a stripped binary is
+# what an install gets anyway, and it drops the symbol table rather than any
+# behaviour. `lto` and one codegen unit are affordable here because the workspace
+# has zero third-party dependencies, so the whole graph is four small crates.
+#
+# These are the only knobs set. In particular `panic = "abort"` is not one of
+# them: it would change how a failing worker or a poisoned lock is handled at
+# runtime, which is a behaviour decision for the architecture and not a size
+# trick for CI.
+[profile.release]
+strip = "symbols"
+lto = true
+codegen-units = 1
