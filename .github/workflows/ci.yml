@@ -1,0 +1,188 @@
+name: ci
+
+# Three operating systems, because the daemon has three transports and the worker
+# has three platform backends (docs/architecture.md 3.1). Nothing here sets a
+# wallpaper: the noop backend exists so that a whole rotation can run in CI
+# (docs/architecture.md 4.2, `backend`).
+#
+# Rule (docs/development.md, "Continuous integration"): every command a
+# contributor runs before opening a pull request appears here verbatim. If a
+# check is not in this file it is a preference, not a gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain and its components
+        run: rustup show
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain and its components
+        run: rustup show
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain and its components
+        run: rustup show
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: cargo test --workspace
+        run: cargo test --workspace
+        env:
+          # A test that rotates must never reach a real desktop.
+          WHIRL_BACKEND: noop
+
+  msrv:
+    name: msrv (1.85.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the MSRV toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - name: cargo +1.85.0 check --workspace --all-targets
+        run: cargo +1.85.0 check --workspace --all-targets
+      - name: cargo +1.85.0 test --workspace
+        run: cargo +1.85.0 test --workspace
+        env:
+          WHIRL_BACKEND: noop
+
+  guards:
+    name: guards (dependencies and binary size)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show
+      - name: Assert the workspace has no third-party dependencies
+        run: |
+          cargo metadata --format-version 1 > /dev/null
+          python3 - <<'PY'
+          import re
+          import sys
+
+          ours = {"whirl-core", "whirld", "whirl-worker", "whirl-cli"}
+          names = re.findall(r'^name = "([^"]+)"', open("Cargo.lock").read(), re.M)
+          extra = sorted(set(names) - ours)
+          if extra:
+              sys.exit("third-party dependencies appeared: " + ", ".join(extra))
+          print(f"Cargo.lock holds {len(names)} entries, all ours: {sorted(set(names))}")
+          PY
+      - name: Build the release binaries
+        run: cargo build --workspace --release
+      - name: Assert the binary size caps
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          # docs/architecture.md R2: the daemon stays under a megabyte and never
+          # links a platform backend. Caps are in MiB.
+          caps = {"whirld": 1.0, "whirl": 2.0, "whirl-worker": 12.0}
+          suffixes = ["", ".exe"]
+          failed = []
+          for name, cap in caps.items():
+              path = next(
+                  (f"target/release/{name}{s}" for s in suffixes
+                   if os.path.exists(f"target/release/{name}{s}")), None,
+              )
+              if path is None:
+                  failed.append(f"{name}: no release binary")
+                  continue
+              size = os.path.getsize(path) / (1024 * 1024)
+              print(f"{name}: {size:.2f} MiB (cap {cap:.2f} MiB)")
+              if size > cap:
+                  failed.append(f"{name}: {size:.2f} MiB over the {cap:.2f} MiB cap")
+          if failed:
+              sys.exit("; ".join(failed))
+          PY
+
+  artifacts:
+    name: artifacts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [clippy, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: cargo build --workspace --release
+        run: cargo build --workspace --release
+      - name: Collect the binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          for name in whirld whirl whirl-worker; do
+            for suffix in "" ".exe"; do
+              if [ -f "target/release/$name$suffix" ]; then
+                cp "target/release/$name$suffix" dist/
+              fi
+            done
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whirl-${{ runner.os }}-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
