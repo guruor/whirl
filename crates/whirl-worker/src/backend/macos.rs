@@ -1,5 +1,6 @@
-//! The macOS setter: `-[NSWorkspace setDesktopImageURL:forScreen:options:error:]`,
-//! sent through the Objective-C runtime by hand.
+//! The macOS setter and readback: `-[NSWorkspace setDesktopImageURL:forScreen:options:error:]`
+//! and `-[NSWorkspace desktopImageURLForScreen:]`, sent through the
+//! Objective-C runtime by hand.
 //!
 //! **Why the FFI is hand-written.** v0.1 allows no third-party dependency at all
 //! (docs/development.md section 2), and the CI `guards` job fails if any package
@@ -315,6 +316,17 @@ fn screen_name(screen: Id, index: usize) -> String {
         .unwrap_or_else(|| format!("screen #{} (the platform reported no name)", index + 1))
 }
 
+/// `[url path]`, the file path behind the URL the platform reports. Null for a
+/// null URL (no image on that screen) and for a URL that is not a file URL; both
+/// are reported as "not a path", never as a successful readback of something
+/// else.
+fn url_path(url: Id) -> Option<String> {
+    if url.is_null() {
+        return None;
+    }
+    string_of(url, selector(c"path"))
+}
+
 /// The facts the failure message needs, read out of the `NSError` the platform
 /// wrote through the out-parameter. Every field is `None` when the call answered
 /// `NO` and left no error object behind, which the message says out loud rather
@@ -426,4 +438,50 @@ pub fn set(path: &str) -> Result<(), SetError> {
         }
     }
     Ok(())
+}
+
+/// What the platform currently has on the desktop of the first screen in
+/// `NSScreen.screens`, which is the zero screen (`NSScreen.h:25`), or `None` when
+/// that screen has no image (a solid colour, or no desktop at all).
+///
+/// The readback of docs/architecture.md 3.2 and 1.7.3, on the same boundary as
+/// [`set`]: the platform's own answer, not a parse of its store. It reads and
+/// does nothing else. The other screens are deliberately not part of this answer:
+/// `status`'s `anchor_path` is a single path, and per-display behaviour on this
+/// platform is unverified (docs/architecture.md 3.7), so what this reports is the
+/// image of the screen `set` writes to first.
+///
+/// Nothing in the worker calls this yet, hence `dead_code`: it is here because the
+/// by-hand proof of a real set needs it (docs/development.md, "What CI cannot
+/// prove") and because `status`'s `anchor_path` is the card after this one.
+#[allow(dead_code)]
+pub fn current() -> Result<Option<String>, SetError> {
+    let mut images = current_images()?;
+    Ok(images.drain(..).next().and_then(|(_screen, path)| path))
+}
+
+/// Every screen and its current image, names included, because the readback is the
+/// evidence a human reads on a machine CI cannot see. `current` is the first of
+/// these. `ErrorCode::Internal` is the code here and not `SetFailed`: a readback
+/// that cannot be taken refuses nothing, and the codes are the closed set of
+/// docs/architecture.md 2.7.
+#[allow(dead_code)]
+fn current_images() -> Result<Vec<(String, Option<String>)>, SetError> {
+    let _pool = AutoreleasePool::new();
+    let readback_failed = |reason: String| {
+        SetError::new(
+            ErrorCode::Internal,
+            format!("the macOS readback could not read the desktop image: {reason}"),
+        )
+    };
+
+    let workspace = workspace().map_err(readback_failed)?;
+    let screens = screens().map_err(readback_failed)?;
+    let mut images = Vec::with_capacity(screens.len());
+    for (index, screen) in screens.iter().enumerate() {
+        let screen = *screen;
+        let url = msg_id1(workspace, selector(c"desktopImageURLForScreen:"), screen);
+        images.push((screen_name(screen, index), url_path(url)));
+    }
+    Ok(images)
 }
