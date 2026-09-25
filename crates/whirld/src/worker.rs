@@ -287,6 +287,9 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread::JoinHandle;
 
     /// A temp directory with scripts in it. The tests below are the only place
     /// where a "worker" is anything other than `whirl-worker`: a deliberately
@@ -460,14 +463,123 @@ mod tests {
         }
     }
 
-    /// `SIGTERM` at the deadline, the whole five-second grace, then `SIGKILL`
-    /// (1.7.1). The script records the `SIGTERM` it was sent and keeps running
-    /// through it, so the marker proves the polite signal arrived and the exit
-    /// proves the kill was needed and worked.
+    /// How closely the test can pin the *early* side of the deadline: how much
+    /// before `DEADLINE` a `SIGTERM` may be and still count as at it.
     ///
-    /// A daemon that skipped `SIGTERM` fails the marker assertion; one that
-    /// killed immediately fails `elapsed >= TERM_GRACE`; one that returned
-    /// without killing leaves the process alive and fails the `kill -0` probe.
+    /// The reading it is applied to is a late-biased one and can never lead the
+    /// signal: the watcher polls every `WATCH_POLL`, and the shell runs a trap
+    /// only once the command it is executing returns, which in the script below
+    /// is one `sleep 0.05`. So the marker lags the true `SIGTERM` by up to about
+    /// 52 ms plus however long the watching thread waited for a core, and 500 ms
+    /// covers that with room to spare on a load-parallel `cargo test
+    /// --workspace`. It is also six times below the 3 s the defect this asserts
+    /// against is off by, so the mutation in the pull request still fails by
+    /// thousands of milliseconds rather than by a hair.
+    const TOLERANCE: Duration = Duration::from_millis(500);
+
+    /// The tolerance on the *late* side: how much after the deadline the
+    /// `SIGTERM` may be, and how much after `DEADLINE + TERM_GRACE` the total
+    /// may be. Deliberately looser than `TOLERANCE`, because it is a sanity
+    /// check on the total rather than one of the two facts this test exists for:
+    /// it catches an escalation that runs away (a worker never killed, a wait
+    /// measured in seconds instead of milliseconds), and the cost of being wrong
+    /// the other way is a test the scheduler can fail, which would be worse than
+    /// missing a defect this card does not concern.
+    const SLACK: Duration = Duration::from_secs(2);
+
+    /// How often the watcher below looks for the marker file.
+    const WATCH_POLL: Duration = Duration::from_millis(2);
+
+    /// The watcher's own bail-out, so a worker that is never signalled cannot
+    /// leave a thread spinning past the end of the test. Longer than the
+    /// deadline plus the grace, which is all the run can take.
+    const WATCH_BOUND: Duration = Duration::from_secs(30);
+
+    /// When a `TERM` trap was seen to run, on the test's own clock.
+    ///
+    /// A timestamp written by the trap itself would be a wall-clock reading
+    /// taken in another process, and the test has no way to compare that with
+    /// the `Instant` it takes before the spawn. So the trap keeps its one job,
+    /// appending to the marker file, and this thread watches for that file and
+    /// records an `Instant` the moment it exists: one clock, one process,
+    /// nothing to correlate.
+    ///
+    /// The reading is always at or after the signal, never before it, as
+    /// described on `TOLERANCE`.
+    struct TermWatch {
+        stop: Arc<AtomicBool>,
+        running: JoinHandle<()>,
+        seen: mpsc::Receiver<Instant>,
+    }
+
+    impl TermWatch {
+        fn new(marker: PathBuf) -> TermWatch {
+            let (sender, seen) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let watching = Arc::clone(&stop);
+            let running = std::thread::spawn(move || {
+                let give_up = Instant::now() + WATCH_BOUND;
+                loop {
+                    if marker.exists() {
+                        let _ = sender.send(Instant::now());
+                        return;
+                    }
+                    if watching.load(Ordering::SeqCst) || Instant::now() >= give_up {
+                        // A marker written in the same instant the test stopped
+                        // watching is still reported rather than lost to the
+                        // race, since the file outlives both threads.
+                        if marker.exists() {
+                            let _ = sender.send(Instant::now());
+                        }
+                        return;
+                    }
+                    std::thread::sleep(WATCH_POLL);
+                }
+            });
+            TermWatch {
+                stop,
+                running,
+                seen,
+            }
+        }
+
+        /// The reading, once the watcher has stopped. `None` if the marker never
+        /// appeared at all.
+        fn moment(self) -> Option<Instant> {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = self.running.join();
+            self.seen.try_recv().ok()
+        }
+    }
+
+    /// `SIGTERM` **at the deadline**, the whole five-second grace, then
+    /// `SIGKILL` (1.7.1). The script appends to the marker file from its `TERM`
+    /// trap and keeps running through the signal, so the marker proves the
+    /// polite signal arrived and the exit proves the kill was needed and worked.
+    ///
+    /// Three facts, not one, and the reason is the earlier version of this test.
+    /// It asserted only `elapsed >= TERM_GRACE`, which a daemon that sent
+    /// `SIGTERM` the instant the child existed and `SIGKILL` five seconds later
+    /// satisfied, while never looking at the deadline at all: the test passed
+    /// for the wrong reason. The moment the trap ran is now recorded, and
+    /// checked against the deadline itself:
+    ///
+    /// 1. the trap ran no earlier than the deadline, within `TOLERANCE`;
+    /// 2. it did not run late either, within `SLACK`;
+    /// 3. the exit came at least the grace after the trap, within `TOLERANCE`;
+    /// 4. and the total is the deadline plus the grace, within those bounds.
+    ///
+    /// A daemon that skipped `SIGTERM` fails 1 and the marker assertion; one
+    /// that killed alongside the signal fails 3 and 4; one that returned without
+    /// killing leaves the process alive and fails the `kill -0` probe.
+    ///
+    /// What it still cannot see: the instant of the signal itself, any closer
+    /// than `TOLERANCE` early and `SLACK` late, and the signal by number. The
+    /// signal is observed only through the shell's trap table, so this says
+    /// "the trap the script installed for `TERM` ran", which on every shell
+    /// here means `SIGTERM` and not that the daemon used `kill(1)` rather than
+    /// a syscall.
+    ///
     /// The `trap` is the script's first statement and the pid file its second:
     /// both orderings are load-sensitive, and installing the handler before
     /// anything that can block keeps the window in which a `SIGTERM` would kill
@@ -487,16 +599,41 @@ mod tests {
         );
 
         let started = Instant::now();
+        let watch = TermWatch::new(marker.clone());
         let outcome = worker(program).run(Verb::Rotate, None, 7, DEADLINE);
         let elapsed = started.elapsed();
+        let termed_at = match watch.moment() {
+            Some(moment) => moment.duration_since(started),
+            None => panic!(
+                "no SIGTERM trap ran in {WATCH_BOUND:?}: {} never appeared",
+                marker.display()
+            ),
+        };
+        let after_term = elapsed - termed_at;
 
         assert!(
             matches!(outcome, Err(WorkerError::Timeout)),
             "the deadline expired, whatever the worker did on the way out: {outcome:?}"
         );
         assert!(
-            elapsed >= TERM_GRACE,
-            "the grace period was honoured: {elapsed:?}"
+            termed_at >= DEADLINE - TOLERANCE,
+            "SIGTERM is sent at the {DEADLINE:?} deadline, not before it: the trap ran {termed_at:?} after the spawn, and only {TOLERANCE:?} of tolerance is allowed"
+        );
+        assert!(
+            termed_at <= DEADLINE + SLACK,
+            "and not after it either: the trap ran {termed_at:?} after the spawn, and only {SLACK:?} of slack is allowed"
+        );
+        assert!(
+            after_term >= TERM_GRACE - TOLERANCE,
+            "the worker is killed a whole {TERM_GRACE:?} after SIGTERM: the exit came {after_term:?} after the trap ran"
+        );
+        assert!(
+            elapsed >= DEADLINE + TERM_GRACE - TOLERANCE,
+            "the total is the deadline plus the grace: {elapsed:?} elapsed, at least {DEADLINE:?} plus {TERM_GRACE:?} expected"
+        );
+        assert!(
+            elapsed <= DEADLINE + TERM_GRACE + SLACK,
+            "and no more than that plus slack: {elapsed:?} elapsed"
         );
         assert!(
             scripts.exists("term.txt"),
