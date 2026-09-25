@@ -35,7 +35,7 @@ not produce both went to Part 3 instead.
 | F4 | Pause / resume | `pause` stops the scheduler from rotating; `resume` re-arms the next slot from now. The current wallpaper is untouched either way. | The single most-used control on a rotator: stop it without uninstalling or killing it. | One bool in state, already in the protocol. |
 | F5 | History and `prev` | A bounded ring of the last 50 set entries (`id`, source kind, origin, cached path, timestamp), persisted, and a verb to step back through it. | `prev` is the undo of a rotation. Without it the only remedy for a wallpaper you dislike is a manual search. | ~50 short lines in a state file, a few KB. No images. |
 | F6 | Favorites | See 1.2. A separate collection of records, pinned in the cache. | Users keep images they like; this is the one curation primitive that pays for itself without a browser or a gallery. | Records in state plus a pin flag the evictor honours. Disk bounded by the user's own favorites, not by cache policy. |
-| F7 | Multi-display policy | See 1.3. Default: one image everywhere. | "Rotation that just works" has to have an answer for two monitors, and the answer must not drag a resident toolkit in. | Zero, in the default mode: one setter call per display or one OS-wide call, depending on what the platform research confirms. |
+| F7 | Multi-display policy | See 1.3. Default: one image everywhere. | "Rotation that just works" has to have an answer for two monitors, and the answer must not drag a resident toolkit in. | Zero in the default mode: one platform-specific call (Windows OS-wide; macOS the frontmost Space's displays; Linux one command per environment). `per-display`, where a platform answered yes, adds an enumeration and one setter call per display. |
 | F8 | Failure handling | See 1.4. No network, no candidates, unreadable image, full disk. | A rotator that can leave a black desktop is worse than no rotator. This is the feature that makes the daemon safe to autostart. | Bounded retries inside one worker run. No retry queue in the daemon, no watcher thread. |
 | F9 | Startup behaviour | See 1.5. Set a wallpaper at login, and do not stomp an image the user set by hand since the last rotation. | The daemon is started by the OS supervisor, and login is the one moment a wallpaper app is judged. | One read of the current desktop image at startup. No polling, no watcher. |
 | F10 | `status` and `sources` introspection | Machine-readable `key: value` output: state, rotation count, next-in, last entry, cache count, per-source last outcome and disabled reason. | Debuggability without a GUI, and the honest place for "this source is disabled because it needs an API key". | A few lines of formatting per verb. Keys are stable and are part of the protocol contract. |
@@ -111,25 +111,60 @@ The mechanism:
 and conditional.
 
 - Config: `display.mode = "all" | "per-display"`, default `"all"`.
-- `"all"` is the default because it needs one call on macOS and Windows and is
-  reachable from a short-lived worker on every platform the spike touched. The
-  spike reports per-Space setting on macOS via `NSWorkspace.setDesktopImageURL`
-  with the `allSpaces` option, and states that Windows has no per-virtual-desktop
-  wallpaper API and that its `SystemParametersInfoW` path sets one image
-  everywhere (`prototype/README.md`).
+- `"all"` is the default because it is reachable from a short-lived worker on every
+  platform the spike touched, without a resident toolkit. What `"all"` actually
+  covers differs by platform, and that difference is what a reader must take away
+  rather than the folklore it replaced:
+  - **Windows**: one OS-wide call. `SystemParametersInfoW(SPI_SETDESKWALLPAPER)`
+    takes a single path and has no monitor parameter, so it sets one image for
+    everything; Windows has no per-virtual-desktop wallpaper API
+    (`docs/research/windows.md`).
+  - **macOS**: one `NSWorkspace.setDesktopImageURL` call covers the displays of the
+    **frontmost Space only**, not the machine. `docs/research/macos.md` sections 2
+    and 3 measured this: with and without the undocumented `allSpaces` option the
+    same two `Index.plist` nodes are written, the write lands on the Space that is
+    frontmost at that moment, and no parameter in the public API names a Space
+    (`forScreen:` takes an `NSScreen`, and that is all). Per-Space coverage is
+    therefore **not reachable through any documented API**: a rotator can set the
+    wallpaper for the Space the user is looking at and cannot touch any other,
+    including the ones the user will switch to later. `allSpaces` is undocumented
+    (absent from `NSWorkspace.h` and from Apple's published docs) and inert, and
+    **must not be used**. The `prototype/README.md` claim that it "rewrote all 10
+    Space nodes" is `LastUse` churn, not a rewrite (macos.md [V5]/[V5b]).
+  - **Linux**: per-monitor is per-environment, and mostly out of scope. GNOME
+    applies one image to all monitors (a hard limitation, not a missing call) and
+    KDE's stock tool sets all desktops; sway and the plain-X11 setters can address
+    individual outputs, and Hyprland is per-monitor but needs a resident helper
+    (`docs/research/linux.md`).
 - `"per-display"` means each display gets its own independently chosen image.
   It requires an enumeration API, an identity that survives hotplug, and a
   per-display setter, all callable from a process that lives for one rotation.
 
-`assumption:` whether `"per-display"` is possible at all is **not decided here**.
-It is decided by the four research cards, which are in flight and have produced
-no output yet. `evidence:` queried the board
-(`sqlite3 ~/.hermes/kanban/boards/whirl/kanban.db "select id,status from tasks"`)
-and inspected each research worktree (`git log --oneline wt/t_57b8de1e` etc. from
-`/Users/govind.rajpurohit/Workspace/Personal/whirl`): `t_57b8de1e` (macOS),
-`t_a7a134e2` (Windows), `t_be6f5e61` (Linux) and `t_b9e349e6` (schedulers) are
-all `running`, and no `docs/research/*.md` file exists on any branch yet. The
-spec deliberately does not assume their answer.
+`decision:` whether `"per-display"` is possible is now answered by the four research
+notes, which landed after the first draft of this spec: `docs/research/macos.md`,
+`windows.md`, `linux.md` and `scheduling.md`. In short:
+
+- **Windows**: per-monitor is reachable from a short-lived process.
+  `IDesktopWallpaper::SetWallpaper(monitorID, path)` takes a monitor id from
+  `GetMonitorDevicePathAt`, so one image per monitor is a documented call
+  (windows.md, "The central question, answered explicitly").
+- **macOS**: per-display is modelled in the store
+  (`Spaces[<space>].Displays[<uuid>]`) but was not exercised on the one-display
+  test machine, and there is no API to name a Space, so a per-Space set is not
+  reachable (macos.md sections 2 and 3).
+- **Linux**: per-monitor is per-environment and mostly out of scope. GNOME applies
+  one image to all monitors and KDE's stock tool sets all desktops; sway and the
+  plain-X11 setters can address outputs individually, and Hyprland is per-monitor
+  but needs a resident helper (linux.md, "The decisive column, at a glance").
+
+`evidence:` the board query this paragraph used to carry is kept as **history, not
+current state**: it ran while the cards were still in flight
+(`sqlite3 ~/.hermes/kanban/boards/whirl/kanban.db "select id,status from tasks"` and
+`git log --oneline wt/t_57b8de1e` etc. from
+`/Users/govind.rajpurohit/Workspace/Personal/whirl`) and showed `t_57b8de1e` (macOS),
+`t_a7a134e2` (Windows), `t_be6f5e61` (Linux) and `t_b9e349e6` (schedulers) as
+`running`, with no `docs/research/*.md` on any branch. All four completed and were
+merged before this revision; the notes above, not that query, are the current answer.
 
 Fallback, stated now so the spec is actionable either way:
 
@@ -206,7 +241,7 @@ honest signal.
 - `startup.enabled` (default `true`): on daemon start, apply a wallpaper. The
   daemon itself is started by launchd, Task Scheduler or a systemd user unit;
   which one, and how missed runs across sleep are handled, is
-  `docs/research/scheduling.md` (card `t_b9e349e6`, `running`).
+  `docs/research/scheduling.md`.
 - `startup.mode = "last" | "rotate"`, default `"last"`: re-apply the last entry
   in history, or pick a new one. `"last"` avoids burning a Wallhaven request and
   a download on every login.
@@ -508,8 +543,8 @@ Out of scope for v0.1. Each has a reason of one line.
 | Image editing, crop or blur on the fly | Pixel work in the daemon, and the rotated file is no longer the file the user favourited. |
 | Tagging and curation | Turns the product into a gallery, which `README.md` names as a non-goal, and needs a store, not a cache. |
 | Multi-user or remote control | The socket is `0600` and local by design; remote control is an attack surface bought with no user benefit. |
-| Per-display images before the platform research answers | Stated as a dependency, not an assumption (1.3): the answer decides it, and it may be a v0.2 item. |
-| Windows and Linux *per-virtual-desktop* differentiation | No documented API on Windows; Linux is per-DE and partly compositor-specific. Wait for `docs/research/windows.md` and `linux.md`. |
+| Per-display images as a blanket v0.1 promise | Stated as a dependency, not an assumption (1.3). The research answers it per platform: Windows per-monitor is reachable, macOS per-Space is not, Linux is per-DE. `"per-display"` is honoured only where a platform answered yes, and rejected at `whirl config check` with that platform's reason elsewhere. |
+| Windows and Linux *per-virtual-desktop* differentiation | No public API on Windows: `IDesktopWallpaper` does not model virtual desktops at all, and the Windows 11 per-desktop backgrounds are reachable only through undocumented, per-build shell COM (`IVirtualDesktopManagerInternal::SetDesktopWallpaper`), which a daemon must not depend on (`docs/research/windows.md`). Linux is per-DE and partly compositor-specific (`docs/research/linux.md`). |
 | A wallpaper browser, gallery or preview UI | Named as a non-goal in `README.md`; browsing belongs to a web frontend over the protocol, if anyone wants one. |
 | Dynamic plugin loading (`dlopen`-style sources) | Loads foreign code into the resident process; the source factory in 2.6 gets the same extensibility for free. |
 | Colour extraction, palettes, statistic reporting | Nothing consumes them, and each is a decode in the daemon or an extra worker pass per rotation. |
@@ -521,7 +556,7 @@ Out of scope for v0.1. Each has a reason of one line.
 Against this card's criteria:
 
 - **Every feature states a cost and a reason.** Table in Part 1, cost column
-  mandatory; F1 through F10 each carry both. Anything that could not got a row in
+  mandatory; F1 through F10 each carry both. Anything that could not get a row in
   Part 3 instead (`search`, `blur`, `stats`, a browser, scheduling rules).
 - **The source schema is concrete enough to add a source without a question.**
   2.2, 2.3 and 2.6: required keys, defaults, the interface's three methods, the
@@ -529,9 +564,10 @@ Against this card's criteria:
 - **The Wallhaven section names the exact endpoints and which need a key, with a
   citation.** 2.3 and 2.4, with `wallhaven.cc/help/api` as `[1]` for every
   endpoint, parameter and the 45-a-minute limit [1].
-- **The multi-display policy names its dependency.** 1.3 names the research cards
-  by id, states that they are `running` with no output yet (with the command that
-  showed it), and gives the fallback in both directions.
+- **The multi-display policy names its dependency.** 1.3 names the research notes
+  and their per-platform answers, reconciles the macOS `all` mode with what
+  macos.md measured (frontmost Space only; `allSpaces` undocumented and inert), and
+  gives the fallback in both directions.
 - **No feature requires a resident GUI toolkit.** Audit, per feature: F0 is the
   absence of one; F3 is a socket client that exits; F6 is a list in a state file;
   F7 uses the platform's wallpaper API from a worker and explicitly does not watch

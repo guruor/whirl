@@ -118,10 +118,10 @@ A maintained, merged Rust implementation shows the whole pattern in about 145 li
 `sindresorhus/windows-wallpaper` calls `CoInitialize(None)`, then
 `CoCreateInstance(&DesktopWallpaper, None, CLSCTX_LOCAL_SERVER)`, then `GetMonitorDevicePathCount`,
 `GetMonitorDevicePathAt(index)`, `SetWallpaper(monitor, path)` and `SetPosition(position)`, and
-releases with `CoFreeUnusedLibraries` and `CoUninitialize` on `Drop` [24]. Its `Cargo.toml` pins
-`windows = { version = "0.44.0", features = ["Win32_Foundation", "Win32_System_Com",
-"Win32_System_Memory", "Win32_UI_Shell"] }`, so the cost is two feature flags beyond COM and one
-dependency, not a new runtime [41].
+releases with `CoFreeUnusedLibraries` and `CoUninitialize` on `Drop` [24]. Its `Cargo.toml` declares
+`windows = { version = "0.48.0", features = ["Win32_Foundation", "Win32_System_Com",
+"Win32_System_Memory", "Win32_UI_Shell"] }` (read from the live file 2026-09-25), so the cost is one
+Windows dependency with four Win32 feature flags (COM plus three more), not a new runtime [41].
 
 Three practical costs to plan for. First, COM apartment setup is required: `CoInitialize` before
 `CoCreateInstance`, `CoUninitialize` after, which in Rust means either living with a `Drop` guard or
