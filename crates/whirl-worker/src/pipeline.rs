@@ -98,11 +98,16 @@ pub fn set(
 /// `--verb check`: the source and plan records `whirl config check` forwards.
 /// The architecture fixes the rotate contract, not this output
 /// (docs/development.md section 7).
-pub fn check(config: &Config) {
+///
+/// `backend` is the resolved backend and not `config.backend`: 2.6's plan line
+/// carries effective values, "what did the daemon actually adopt", and the two
+/// differ whenever 4.3's precedence let `WHIRL_BACKEND` or `--backend` win over
+/// the file.
+pub fn check(config: &Config, backend: Backend) {
     for source in &config.sources {
         println!("{}", source_record(source).line());
     }
-    println!("{}", protocol::plan_record(&plan_pairs(config)));
+    println!("{}", protocol::plan_record(&plan_pairs(config, backend)));
 }
 
 /// The `source:` record of a configured source, from the one implementation in
@@ -117,7 +122,10 @@ pub fn source_record(source: &SourceConfig) -> SourceRecord {
 /// (2.6). `display.mode_effective` is what the platform actually gets; with no
 /// platform code yet it is the configured mode, which is honest only for `all`
 /// and is why 3.7's fallback is a later card.
-pub fn plan_pairs(config: &Config) -> Vec<(String, String)> {
+///
+/// `backend` is passed in rather than read from `config.backend`: 2.6's values
+/// are effective values, and the resolved backend is what the run adopted (4.3).
+pub fn plan_pairs(config: &Config, backend: Backend) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut push = |key: &str, value: String| pairs.push((key.to_string(), value));
     push(
@@ -181,7 +189,7 @@ pub fn plan_pairs(config: &Config) -> Vec<(String, String)> {
         "cache.orphan_grace_seconds",
         config.cache.orphan_grace_seconds.to_string(),
     );
-    push("backend", config.backend.as_str().to_string());
+    push("backend", backend.as_str().to_string());
     push(
         "sources",
         config

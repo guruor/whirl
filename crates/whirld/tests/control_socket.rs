@@ -87,22 +87,64 @@ fn start(name: &str) -> Daemon {
 /// The same daemon, with a hook that runs once the directory exists and before
 /// the daemon does, so a test can plant a corrupt state file for 6.4 to find.
 fn start_prepared(name: &str, prepare: impl FnOnce(&Path)) -> Daemon {
+    start_with(name, true, prepare)
+}
+
+/// The same daemon with `WHIRL_CONFIG` unset and `HOME` pointed at its own
+/// directory, so the config path it resolves is the documented platform default,
+/// inside this test's own tree rather than the user's:
+/// `config_path_defaults_to_the_documented_platform_location` asserts it.
+fn start_without_whirl_config(name: &str) -> Daemon {
+    start_with(name, false, |_| {})
+}
+
+/// One temporary tree per test, and the one place `spawn_daemon`'s third
+/// argument is decided.
+fn start_with(name: &str, whirl_config: bool, prepare: impl FnOnce(&Path)) -> Daemon {
     let dir = std::env::temp_dir().join(format!("whirl-t{}-{}", std::process::id(), short(name)));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a temporary directory");
     let socket = dir.join("run").join("whirl.sock");
     prepare(&dir);
     Daemon {
-        child: spawn_daemon(&dir, &socket),
+        child: spawn_daemon(&dir, &socket, whirl_config),
         dir,
         socket,
     }
 }
 
+/// The config file this daemon read: `WHIRL_CONFIG`, resolved in `spawn_daemon`.
+fn config_path(daemon: &Daemon) -> PathBuf {
+    daemon.dir.join("config.json")
+}
+
+/// The platform default config path of docs/architecture.md 4.2's `socket`
+/// comment, resolved from `home` (the rules live in
+/// `crates/whirl-core/src/config.rs::paths`).
+///
+/// The arms are gated visibly rather than collapsed into one path that happens
+/// to hold here: macOS is `~/Library/Application Support/whirl/config.json`,
+/// Linux is `$XDG_CONFIG_HOME/whirl/config.json` or `~/.config/whirl/config.json`
+/// (`spawn_daemon` removes `XDG_CONFIG_HOME`, so this arm is the `~/.config`
+/// one), and Windows is `%APPDATA%\whirl\config.json`, which this file cannot
+/// exercise: it is `#![cfg(unix)]` because 2.1's Windows transport, a named
+/// pipe, is a later card.
+fn default_config_path(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let relative = "Library/Application Support/whirl/config.json";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let relative = ".config/whirl/config.json";
+    home.join(relative)
+}
+
 /// One daemon child, waited for by its socket. Spawning and waiting are separate
 /// functions so a test can restart a daemon over a directory that already has
 /// state in it.
-fn spawn_daemon(dir: &Path, socket: &Path) -> Child {
+///
+/// `whirl_config` false omits `WHIRL_CONFIG` (and removes it if this process has
+/// one) and points `HOME` at `dir`, so the daemon resolves the documented
+/// platform default: inside this test's tree, never the user's own config.
+fn spawn_daemon(dir: &Path, socket: &Path, whirl_config: bool) -> Child {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_whirld"));
     let worker = executable
         .parent()
@@ -117,17 +159,26 @@ fn spawn_daemon(dir: &Path, socket: &Path) -> Child {
     // The daemon's stderr goes to a file, never to this process's: a child that
     // inherited the test harness's pipe would hold it open past the run.
     let log = std::fs::File::create(dir.join("daemon.log")).expect("a log file");
-    let child = Command::new(&executable)
-        .env("WHIRL_CONFIG", dir.join("config.json"))
+    let mut command = Command::new(&executable);
+    command
         .env("WHIRL_SOCKET", socket)
         .env("WHIRL_STATE_DIR", dir.join("state"))
         .env("WHIRL_CACHE_DIR", dir.join("cache"))
         .env("WHIRL_BACKEND", "noop")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("the daemon starts");
+        .stderr(Stdio::from(log));
+    if whirl_config {
+        command.env("WHIRL_CONFIG", dir.join("config.json"));
+    } else {
+        command
+            .env_remove("WHIRL_CONFIG")
+            .env("HOME", dir)
+            // Linux resolves the default under `$XDG_CONFIG_HOME` first (4.2's
+            // `socket` comment); removing it makes `~/.config` the arm in force.
+            .env_remove("XDG_CONFIG_HOME");
+    }
+    let child = command.spawn().expect("the daemon starts");
 
     // Ready means "accepting connections", not "the path exists": a restart over
     // the same directory has a stale socket file from the daemon that just died,
@@ -255,18 +306,103 @@ fn pause_and_resume_flip_the_flag_and_move_the_sequence() {
     );
 }
 
+/// docs/architecture.md 2.6's `plan:` line, byte for byte, for the config this
+/// test's daemon writes: 4.2's annotated example is the file the daemon writes
+/// when `config.json` is missing, so its keys are 4.2's keys and its values 4.2's
+/// defaults.
+///
+/// 2.6 fixes the shape and the order: `<config key>=<effective value>`, "the
+/// config's own dotted key paths, in file order", one `plan:` line per response
+/// (2.5's `config check` row). The order below is 4.2's file order, with
+/// `display.mode_effective` beside `display.mode` where 2.6's bullet and 2.10
+/// put that effective value.
+///
+/// `backend` is `noop` and not the file's `native`: 2.6's values are effective
+/// values ("what did the daemon actually adopt must be answerable"), and this
+/// test runs the daemon and its worker under `WHIRL_BACKEND=noop` (4.3's
+/// precedence order ends in the environment and the flags). `sources` is the
+/// count of enabled sources, 2.10's own name for that fact.
+///
+/// It is a literal and not a table the test joins together: a table could hide a
+/// reordering of the keys behind a reordering of the table, which is the failure
+/// this assertion exists to catch.
+const PLAN_CHECK: &str = "plan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1 startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02 filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=- cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 backend=noop sources=2";
+
+/// The data lines of the `config check` response of docs/architecture.md 2.5 and
+/// 2.6, in order: `queued` first (2.6: "the only interim line", and only for the
+/// verbs that spawn a worker), one `source:` record per configured source in
+/// config order, then exactly one `plan:` line. The two sources are 4.2's, in its
+/// order, with its weights.
+///
+/// `last` is `-` here because a check has no outcome to report (2.6), and the
+/// bracketed counter group of 2.6's record form is absent because the pipeline
+/// that counts candidates does not exist yet (`crates/whirl-worker/src/pipeline.rs`
+/// says which stage is a placeholder, and no source implementation exists). The
+/// group is optional in that form, and these assertions pin the bytes the
+/// scaffold emits today: the group's arrival will fail them, which is the signal
+/// for the pipeline card to update this fixture.
+fn config_check_lines() -> Vec<String> {
+    vec![
+        "queued".to_string(),
+        "source: pictures local weight=1 enabled=1 last=- reason=-".to_string(),
+        "source: space wallhaven weight=3 enabled=1 last=- reason=-".to_string(),
+        PLAN_CHECK.to_string(),
+    ]
+}
+
+/// `config check` byte for byte (2.5, 2.6): `queued`, the `source:` records, then
+/// the one `plan:` line, and nothing else in the body.
+///
+/// The whole body is compared as a list, so this fails on a missing or repeated
+/// `queued`, on a `source:` record dropped, invented or reordered, on a counter
+/// group that appears or disappears, on a `plan:` line moved above the records or
+/// duplicated, on a key moved inside the plan, on any value changed, and on any
+/// extra line at all. The greeting of 2.4 and the `OK` terminator of 2.6 are
+/// asserted separately.
 #[test]
 fn config_check_reports_the_sources_and_the_plan() {
     let daemon = start("config_check_reports_the_sources_and_the_plan");
     let lines = daemon.ask("config check");
+    assert_eq!(lines[0], "OK whirl 0.1.0 protocol 2", "the greeting (2.4)");
     assert_eq!(lines.last().map(String::as_str), Some("OK"));
+    assert_eq!(
+        body(&lines),
+        config_check_lines().as_slice(),
+        "2.5's `config check` row, 2.6's `source:` and `plan:` records, in order"
+    );
+}
+
+/// `config path` with `WHIRL_CONFIG` unset: the documented platform default
+/// (2.5 answers `config: <abs path>`, the file in force; 4.2's `socket` comment
+/// names the per-platform location, and the rules live in
+/// `crates/whirl-core/src/config.rs::paths`).
+///
+/// `HOME` points at this test's own directory (`start_without_whirl_config`), so
+/// the default is resolved inside the temporary tree: the assertion is the
+/// platform's rule rather than a path that only holds on this machine, and it
+/// never reads or writes the user's real config directory.
+#[test]
+fn config_path_defaults_to_the_documented_platform_location() {
+    let daemon =
+        start_without_whirl_config("config_path_defaults_to_the_documented_platform_location");
+    let expected = default_config_path(&daemon.dir);
     assert!(
-        lines.iter().any(|line| line.starts_with("source: ")),
-        "{lines:?}"
+        expected.starts_with(&daemon.dir),
+        "the default is resolved from HOME, which this test moved: {}",
+        expected.display()
     );
     assert!(
-        lines.iter().any(|line| line.starts_with("plan: ")),
-        "{lines:?}"
+        expected.is_file(),
+        "the daemon writes 4.2's annotated file where it resolved the default (1.5): {}",
+        expected.display()
+    );
+
+    let lines = daemon.ask("config path");
+    assert_eq!(lines.last().map(String::as_str), Some("OK"));
+    assert_eq!(
+        body(&lines),
+        [format!("config: {}", expected.display())].as_slice(),
+        "the platform default of 4.2, derived from HOME and the platform rule"
     );
 }
 
@@ -348,11 +484,10 @@ fn history_reports_the_ring_newest_first_in_the_record_form() {
 
     let lines = daemon.ask("config path");
     assert_eq!(lines.last().map(String::as_str), Some("OK"));
-    assert_eq!(body(&lines).len(), 1, "one data line: {lines:?}");
-    let path = value(&lines, "config");
-    assert!(
-        path.starts_with('/') && path.ends_with("config.json"),
-        "the absolute path of the config in force (2.5): {path}"
+    assert_eq!(
+        body(&lines),
+        [format!("config: {}", config_path(&daemon).display())].as_slice(),
+        "`config path` names the exact file in force (2.5), not a path of the right shape"
     );
 }
 
@@ -499,18 +634,19 @@ fn the_clis_quickstart_commands_answer_over_the_real_socket() {
 
     let (ok, check) = whirl(&daemon, &["config", "check"]);
     assert!(ok, "{check}");
-    assert!(
-        check.lines().any(|line| line.starts_with("source: ")),
-        "{check}"
-    );
-    assert!(
-        check.lines().any(|line| line.starts_with("plan: ")),
-        "{check}"
+    assert_eq!(
+        check,
+        format!("{}\n", config_check_lines().join("\n")),
+        "the CLI prints the daemon's data lines in order and nothing else (2.5.1)"
     );
 
     let (ok, path) = whirl(&daemon, &["config", "path"]);
     assert!(ok, "{path}");
-    assert!(path.contains(&daemon.dir.display().to_string()), "{path}");
+    assert_eq!(
+        path,
+        format!("config: {}\n", config_path(&daemon).display()),
+        "the CLI prints the exact path in force (2.5)"
+    );
 
     let (ok, ping) = whirl(&daemon, &["ping"]);
     assert!(ok, "{ping}");
@@ -898,7 +1034,7 @@ fn the_state_files_are_written_and_read_back_across_a_restart() {
     // Kill it, and start a second daemon over the same directory.
     daemon.child.kill().expect("the daemon is killed");
     daemon.child.wait().expect("it is reaped");
-    daemon.child = spawn_daemon(&daemon.dir, &daemon.socket);
+    daemon.child = spawn_daemon(&daemon.dir, &daemon.socket, true);
 
     let after = daemon.ask("status");
     assert_eq!(value(&after, "paused"), "1", "the flag survived (6.1)");

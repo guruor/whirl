@@ -119,7 +119,7 @@ fn main() -> ExitCode {
 
     let result = match args.verb {
         Verb::Check => {
-            pipeline::check(&config);
+            pipeline::check(&config, backend);
             return ExitCode::SUCCESS;
         }
         Verb::Rotate => pipeline::rotate(&config, backend),
