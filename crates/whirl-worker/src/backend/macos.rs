@@ -490,6 +490,107 @@ fn current_images() -> Result<Vec<(String, Option<String>)>, SetError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_relative_path_is_refused() {
+        let error = set("wallhaven-1.jpg").expect_err("a relative path is refused");
+        assert_eq!(error.code, ErrorCode::SetFailed);
+        assert!(
+            error.message.contains("wallhaven-1.jpg"),
+            "the message names the path: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("absolute"),
+            "the message says what is wrong: {}",
+            error.message
+        );
+    }
+
+    /// The reading of a real `NSError` and the message built from it, on an error
+    /// object this test makes itself: no desktop, no screen and no wallpaper
+    /// involved, so it asserts the same thing on a headless runner as on a Mac
+    /// with someone at the keyboard.
+    #[test]
+    fn reads_the_domain_and_the_code_out_of_a_real_nserror() {
+        let _pool = AutoreleasePool::new();
+        let domain = nsstring("WhirlTestDomain").expect("an NSString");
+        let ns_error = class(c"NSError").expect("NSError is registered");
+        let error = {
+            // `+ (instancetype)errorWithDomain:(NSErrorDomain)domain code:(NSInteger)code
+            // userInfo:(nullable NSDictionary *)dict`: two objects and an
+            // NSInteger, returning an object, so the ABI is
+            // `id (*)(id, SEL, id, long, id)`.
+            let send: unsafe extern "C" fn(Id, Sel, Id, i64, Id) -> Id =
+                unsafe { std::mem::transmute(objc_msgSend as unsafe extern "C" fn()) };
+            unsafe {
+                send(
+                    ns_error,
+                    selector(c"errorWithDomain:code:userInfo:"),
+                    domain,
+                    42,
+                    ptr::null_mut(),
+                )
+            }
+        };
+        assert!(!error.is_null(), "the test's own NSError exists");
+
+        let failure = ns_failure(error);
+        assert_eq!(failure.domain.as_deref(), Some("WhirlTestDomain"));
+        assert_eq!(failure.code, Some(42));
+        assert!(
+            failure
+                .description
+                .as_deref()
+                .is_some_and(|description| !description.is_empty()),
+            "a real NSError carries its own sentence"
+        );
+
+        let message = describe(&failure, "Built-in Retina Display", "/tmp/whirl-test.jpg");
+        for needle in [
+            "WhirlTestDomain",
+            "42",
+            "setDesktopImageURL:forScreen:options:error:",
+            "Built-in Retina Display",
+            "/tmp/whirl-test.jpg",
+        ] {
+            assert!(
+                message.contains(needle),
+                "the message carries {needle:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_null_nserror_is_reported_as_missing_not_as_a_domain() {
+        let failure = ns_failure(ptr::null_mut());
+        assert_eq!(failure.domain, None);
+        assert_eq!(failure.code, None);
+        let message = describe(&failure, "screen #1", "/tmp/whirl-test.jpg");
+        assert!(message.contains("no NSError was returned"), "{message}");
+    }
+
+    /// The error mapping, exercised through the real call: a path that does not
+    /// exist is refused by the platform with an `NSError`, and what comes back is
+    /// `SetFailed`, never `Ok`.
+    ///
+    /// What this test cannot pin in CI is the domain and the code, because a
+    /// runner with no Aqua session fails earlier, on `NSScreen.screens`. Both are
+    /// pinned by `reads_the_domain_and_the_code_out_of_a_real_nserror` above and
+    /// were observed through this same call by hand on a real desktop; the message
+    /// is printed so the CI log carries whichever one happened.
+    #[test]
+    fn a_missing_file_is_set_failed() {
+        let missing = format!("/nonexistent/whirl/{}/missing.jpg", std::process::id());
+        let error = set(&missing).expect_err("a missing file is not a successful set");
+        assert_eq!(error.code, ErrorCode::SetFailed);
+        assert!(
+            error.message.contains(&missing),
+            "the message names the path: {}",
+            error.message
+        );
+        println!("set({missing}) -> {}", error.message);
+    }
+
     /// Reads every screen's current image and prints the platform's own answer,
     /// for the by-hand real-set-and-restore check that CI cannot make
     /// (docs/development.md, "What CI cannot prove": CI runs headless). It changes
