@@ -22,6 +22,8 @@ mod events;
 #[cfg(unix)]
 mod plan;
 #[cfg(unix)]
+mod schedule;
+#[cfg(unix)]
 mod socket;
 #[cfg(unix)]
 mod state;
