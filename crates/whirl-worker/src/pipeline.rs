@@ -1637,14 +1637,24 @@ mod tests {
     /// reads it, because [`Bytes`] answers the origins. The floors are low and
     /// the cap is small so a fixture image can be either side of both.
     fn config(dir: &Path, extra: &str) -> Config {
+        // A path becomes a string literal in the body, so it is escaped rather
+        // than trusted: on Windows `dir` is `C:\Users\...`, and an unescaped
+        // `\U` is a syntax error at the config parser (which decodes the full
+        // escape set precisely because Windows paths need it,
+        // crates/whirl-core/src/config.rs). The two lines are the ones
+        // crates/whirl-worker/tests/argv.rs uses for the same reason.
+        let quoted = |path: PathBuf| {
+            let path = path.display().to_string();
+            format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+        };
         let body = format!(
             "{{\n  \"config_schema\": 1,\n  \"backend\": \"noop\",\n  \"min_width\": 16,\n  \
              \"min_height\": 16,\n  \"filters\": {{ \"max_bytes\": 4096, \"ratio_tolerance\": 0.02, \
-             \"target_ratio\": null }},\n  \"cache\": {{ \"root\": \"{}\" }},\n  \
+             \"target_ratio\": null }},\n  \"cache\": {{ \"root\": {} }},\n  \
              \"sources\": [ {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \
-             \"paths\": [\"{}\"] }} ]{extra}\n}}\n",
-            dir.join("cache").display(),
-            dir.join("pictures").display()
+             \"paths\": [{}] }} ]{extra}\n}}\n",
+            quoted(dir.join("cache")),
+            quoted(dir.join("pictures"))
         );
         Config::parse(&body)
             .expect("the fixture config parses")
@@ -1727,6 +1737,25 @@ mod tests {
     }
 
     // -- the sniff, per format ----------------------------------------------
+
+    /// The harness writes paths into a config body, and a path with a backslash
+    /// in it is why that is a quoting job and not string concatenation: written
+    /// raw, the config parser stops at `unknown escape '\U'`. On the Windows
+    /// runner the temporary directory is `C:\Users\...`, which is how eleven
+    /// pipeline tests failed there and nowhere else (run 36157542930 on
+    /// t_ddb890aa); this pins the escaping where every platform runs it, using
+    /// a path that is absolute on all three.
+    #[test]
+    fn the_fixture_config_escapes_a_path_with_a_backslash_in_it() {
+        let dir = PathBuf::from(r"/tmp/whirl\worker-7");
+        let parsed = config(&dir, "");
+        assert_eq!(parsed.cache.root, Some(dir.join("cache")));
+        let source = parsed.sources.first().expect("the fixture source");
+        assert_eq!(
+            source.local.as_ref().expect("local").paths,
+            vec![dir.join("pictures")]
+        );
+    }
 
     #[test]
     fn the_sniff_names_each_format_and_its_dimensions() {
