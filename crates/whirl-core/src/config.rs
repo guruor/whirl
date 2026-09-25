@@ -2462,14 +2462,21 @@ mod tests {
 
     #[test]
     fn the_legacy_aliases_are_accepted_and_deprecated() {
-        let text =
-            "{\n  \"keep\": 100,\n  \"cache\": {\n    \"cache_dir\": \"/tmp/whirl-cache\"\n  }\n}";
-        let loaded = Config::parse(text).expect("aliases are accepted");
-        assert_eq!(loaded.config.cache.max_files, 100);
-        assert_eq!(
-            loaded.config.cache.root,
-            Some(PathBuf::from("/tmp/whirl-cache"))
+        // The validator asks the platform whether the path is absolute, and a bare
+        // `/tmp/...` is not absolute on Windows: the fixture has to be absolute
+        // where it runs, or this test fails for the platform's reason instead of
+        // the alias's.
+        let root = if cfg!(windows) {
+            "C:/whirl-cache"
+        } else {
+            "/tmp/whirl-cache"
+        };
+        let text = format!(
+            "{{\n  \"keep\": 100,\n  \"cache\": {{\n    \"cache_dir\": \"{root}\"\n  }}\n}}"
         );
+        let loaded = Config::parse(&text).expect("aliases are accepted");
+        assert_eq!(loaded.config.cache.max_files, 100);
+        assert_eq!(loaded.config.cache.root, Some(PathBuf::from(root)));
         let fields: Vec<&str> = loaded.warnings.iter().map(|w| w.field.as_str()).collect();
         assert_eq!(fields, vec!["keep", "cache.cache_dir"]);
         assert!(loaded.warnings[0].to_string().contains("deprecated"));
