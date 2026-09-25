@@ -54,23 +54,35 @@ measure.py     Drives a running daemon and samples its RSS during rotations.
 ## What it proves
 
 - The per-OS wallpaper API is reachable from a short-lived process; no resident
-  GUI toolkit is needed. macOS per-Space setting works via
-  `NSWorkspace.setDesktopImageURL` with the `allSpaces` option (10 Space nodes
-  verified rewritten); AppleScript `set desktop picture` is a silent no-op on
-  Tahoe and must not be used.
+  GUI toolkit is needed. On macOS the setter must nevertheless run inside the
+  Aqua session: a per-user LaunchAgent qualifies, a pre-login daemon does not
+  (`docs/research/macos.md`, section 9).
 - Sources-as-data works: three sources (Wallhaven query, Wikimedia Commons, local
   folder) cost ~150 lines and **zero** additional resident memory.
 - A daemon can hold config, schedule, history and favorites while staying under
   3 MB, if it delegates the image work.
 - `idle`/subscribe gives frontends push updates, so a TUI never polls.
 
+## Corrected by later research
+
+`docs/research/macos.md` was produced on this machine and falsifies four things
+this spike asserted at the time. Do not build on the original claims:
+
+- `NSWorkspace.setDesktopImageURL` with the `"allSpaces"` option **changes nothing
+  observable**. The key is undocumented and inert; the "10 Space nodes rewritten"
+  was `LastUse` churn, not a per-Space write.
+- AppleScript `set desktop picture` is **not** a silent no-op. It works.
+- `desktoppr` does **not** require sudo. Homebrew's cask installs via a `.pkg`,
+  but the same release ships the bare binary in a `.zip`.
+- There is no "Appearance node" in the store.
+
 ## What it does not prove
 
 - Windows and Linux backends are **compile-verified only**. No hardware was
   available; nobody has run them. Treat those files as hypotheses.
-- Windows has no per-virtual-desktop wallpaper API. `SystemParametersInfoW` sets
-  one image everywhere; whether the `IDesktopWallpaper` COM interface does better
-  is exactly what `docs/research/windows.md` must establish.
+- Windows has no per-virtual-desktop wallpaper API: `IDesktopWallpaper` does
+  per-monitor wallpaper but has no virtual-desktop concept at all
+  (`docs/research/windows.md`).
 - The daemon wakes twice per rotation (worker start and finish), so an `idle`
   subscriber sees duplicate notifications. Cosmetic, unfixed here.
 - No code signing, packaging, installer, update path, or CI. No tests worth the
