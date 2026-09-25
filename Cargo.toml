@@ -1,0 +1,28 @@
+# The whirl workspace. The crate and binary names are fixed by docs/architecture.md
+# 1.2 and the tree is docs/development.md section 1; nothing here may be renamed
+# without an ADR (docs/development.md section 6).
+#
+# v0.1 has zero third-party dependencies. Every crate below depends on nothing but
+# the standard library, and the CI `guards` job fails if any other package appears
+# in Cargo.lock (docs/development.md, "Dependencies: zero").
+[workspace]
+resolver = "3"
+members = [
+  "crates/whirl-core",
+  "crates/whirld",
+  "crates/whirl-cli",
+  "crates/whirl-worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# The MSRV is edition 2024's floor, not a guess; the CI `msrv` job builds and tests
+# with exactly this toolchain. Raising it is a minor release with four steps
+# (docs/development.md section 2).
+rust-version = "1.85.0"
+license = "MIT"
+repository = "https://github.com/guruor/whirl"
+
+[workspace.dependencies]
+whirl-core = { path = "crates/whirl-core" }

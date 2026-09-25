@@ -1,0 +1,16 @@
+[package]
+name = "whirl-cli"
+description = "the whirl command line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The package is whirl-cli and the binary is whirl (docs/architecture.md 1.2).
+[[bin]]
+name = "whirl"
+path = "src/main.rs"
+
+[dependencies]
+whirl-core = { workspace = true }

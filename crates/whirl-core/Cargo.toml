@@ -1,0 +1,11 @@
+[package]
+name = "whirl-core"
+description = "whirl's shared types: the line protocol, the config schema, state records and the source trait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Zero third-party dependencies, by rule (docs/development.md section 2).
+[dependencies]
