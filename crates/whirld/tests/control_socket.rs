@@ -14,7 +14,7 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -283,5 +283,150 @@ fn refusals_name_their_code_and_the_line_protocol_holds() {
         String::from_utf8_lossy(&second.stderr).contains("another daemon"),
         "{}",
         String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+/// `whirl`, next to the daemon, as `cargo build --workspace` lays the two down.
+fn cli_binary() -> PathBuf {
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_whirld"));
+    let cli = executable
+        .parent()
+        .expect("the executable has a directory")
+        .join(if cfg!(windows) { "whirl.exe" } else { "whirl" });
+    assert!(
+        cli.exists(),
+        "{} is missing; build the workspace first (`cargo test --workspace`)",
+        cli.display()
+    );
+    cli
+}
+
+/// One `whirl` command against the running daemon, with the five variables of
+/// docs/development.md section 7 in its environment. Bounded: a client that waits
+/// for a line the daemon will never send must fail this test, not hang the suite.
+fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
+    let mut child = Command::new(cli_binary())
+        .args(args)
+        .env("WHIRL_CONFIG", daemon.dir.join("config.json"))
+        .env("WHIRL_SOCKET", &daemon.socket)
+        .env("WHIRL_STATE_DIR", daemon.dir.join("state"))
+        .env("WHIRL_CACHE_DIR", daemon.dir.join("cache"))
+        .env("WHIRL_BACKEND", "noop")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the CLI starts");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("the CLI is waited on") {
+            Some(status) => break status,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "`whirl {}` did not answer in 30 s: the client is waiting for a line \
+                         that never arrived",
+                        args.join(" ")
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+
+    // Read after the exit: the CLI's output is a status block, far below the pipe
+    // buffer, and the deadline above is what bounds a client that ignores that.
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    (status.success(), format!("{stdout}{stderr}"))
+}
+
+/// The quickstart's own commands, run as `docs/development.md` section 7 spells
+/// them, against a daemon on a temporary socket. This is the pair a user meets
+/// first, and it is the only test that exercises the CLI's wire side: the client
+/// has to terminate its request line, or both ends wait forever.
+#[test]
+fn the_clis_quickstart_commands_answer_over_the_real_socket() {
+    let daemon = start("the_clis_quickstart_commands_answer_over_the_real_socket");
+
+    let (ok, status) = whirl(&daemon, &["status"]);
+    assert!(ok, "{status}");
+    // The greeting is a handshake the client reads and checks, not a data line it
+    // prints; the first line of output is the first key of the status block.
+    assert!(
+        status.starts_with("daemon_version: whirl 0.1.0\n"),
+        "the status block comes first: {status}"
+    );
+    for expected in [
+        "daemon_version: whirl 0.1.0",
+        "protocol: 2",
+        "paused: 0",
+        "rotating: 0",
+        "sources: 2",
+    ] {
+        assert!(status.contains(expected), "{expected} in {status}");
+    }
+    // `OK` is the terminator and is not printed as a data line (2.5.1).
+    assert!(!status.contains("\nOK\n"), "{status}");
+
+    let (ok, next) = whirl(&daemon, &["next"]);
+    assert!(ok, "{next}");
+    assert!(next.lines().any(|line| line == "queued"), "{next}");
+    let set = next
+        .lines()
+        .find(|line| line.starts_with("set: "))
+        .unwrap_or_else(|| panic!("a set line in {next}"));
+    assert_eq!(
+        set.split(' ').count(),
+        5,
+        "set: <digest> <origin_key> <via> <path>: {set}"
+    );
+
+    let (ok, check) = whirl(&daemon, &["config", "check"]);
+    assert!(ok, "{check}");
+    assert!(
+        check.lines().any(|line| line.starts_with("source: ")),
+        "{check}"
+    );
+    assert!(
+        check.lines().any(|line| line.starts_with("plan: ")),
+        "{check}"
+    );
+
+    let (ok, path) = whirl(&daemon, &["config", "path"]);
+    assert!(ok, "{path}");
+    assert!(path.contains(&daemon.dir.display().to_string()), "{path}");
+
+    let (ok, ping) = whirl(&daemon, &["ping"]);
+    assert!(ok, "{ping}");
+
+    // The client clamps `history 500` to the documented maximum rather than
+    // sending it: the daemon's own refusal of n > 50 is asserted over the raw
+    // socket in `refusals_name_their_code_and_the_line_protocol_holds`.
+    let (ok, history) = whirl(&daemon, &["history", "500"]);
+    assert!(ok, "{history}");
+    assert!(
+        history.lines().any(|line| line.starts_with("count: ")),
+        "{history}"
+    );
+
+    // A refusal reaches the client as the daemon's own line on stderr, and 1 is
+    // the one refusal exit code (2.5.1).
+    let (ok, refused) = whirl(&daemon, &["set", "not-an-id"]);
+    assert!(!ok, "{refused}");
+    assert!(
+        refused.contains(
+            "ERR not_found not-an-id is not an origin_key, not a digest and not a favorite"
+        ),
+        "{refused}"
     );
 }

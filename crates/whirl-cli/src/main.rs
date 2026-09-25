@@ -178,9 +178,11 @@ fn talk(request: &Request) -> Result<ExitCode, TalkError> {
     })?;
     render::check_greeting(&greeting).map_err(TalkError::Protocol)?;
 
-    writer
-        .write_all(request.encode().as_bytes())
-        .map_err(TalkError::Io)?;
+    // `Request::encode` is the wire form *without* its newline, because it is the
+    // inverse of `Request::parse` and the tests pair them; the daemon reads a
+    // line, so the newline is the caller's. Writing the encoded form alone leaves
+    // both ends waiting for a newline that never comes.
+    writeln!(writer, "{}", request.encode()).map_err(TalkError::Io)?;
     writer.flush().map_err(TalkError::Io)?;
 
     // `whirl idle` is `subscribe` plus one event, then `close` (2.5.1).
@@ -207,9 +209,7 @@ fn talk(request: &Request) -> Result<ExitCode, TalkError> {
                 println!("{line}");
                 if one_event && !closed {
                     closed = true;
-                    writer
-                        .write_all(Request::Close.encode().as_bytes())
-                        .map_err(TalkError::Io)?;
+                    writeln!(writer, "{}", Request::Close.encode()).map_err(TalkError::Io)?;
                     writer.flush().map_err(TalkError::Io)?;
                 }
             }
