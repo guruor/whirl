@@ -62,9 +62,7 @@ rather than `whirl config check`: that record's field set is fixed and its count
 candidates removed per stage (docs/architecture.md 2.6, docs/spec/features.md 2.5), so a file the
 source drops before it becomes a candidate moves none of them. `whirld` appends the worker's own
 words to that same stderr, where such a file reads `warning: source pictures: entries skipped: 1
-unreadable, 0 symlink, 0 revisited`; under the launchd agent of docs/architecture.md 5.2 the
-identical line lands in the log file, `~/Library/Logs/whirl/whirl.log` (docs/spec/state-and-cache.md
-1.1).
+unreadable, 0 symlink, 0 revisited`.
 
 ## 4. Stop it
 
