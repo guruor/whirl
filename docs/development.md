@@ -884,7 +884,7 @@ with either "done" or a numbered list of specific changes. A review that could
 have been written by reading the diff alone has not been done.
 
 Reviews of a document use the same rule. The reports live in `docs/reviews/`,
-and the index in `README.md` says what each one covers. Each report records
+and the index in `docs/README.md` says what each one covers. Each report records
 what the reviewer ran, what they observed, and what they could not check,
 marked as unverified rather than assumed either way.
 
