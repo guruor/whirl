@@ -70,6 +70,26 @@ if [ -z "$GATE_TOOLCHAIN" ] || [ -z "$GATE_NEXTEST" ]; then
 fi
 GATE_IMAGE_BASE="whirl-gate:${GATE_TOOLCHAIN}-${GATE_NEXTEST}"
 
+# The container modes run the suite as the invoking user, never as root, and
+# that is not a nicety: CI's runner is a non-root user, and one test can only
+# mean what it says when this process is not root (whirl-worker's
+# sources::local plants a file with mode 0o000 and asserts the read fails, so
+# "the fixture has to be unreadable for this test to mean anything"). As root
+# that read succeeds and the assertion fails, which is how `linux` and `all`
+# came to exit 100 on a clean tree (t_207186c7). `--user` takes the uid and gid
+# from the machine the gate is running on, which is exactly the difference
+# between this container and CI that the mode exists to close.
+#
+# `CARGO_HOME` and `RUSTUP_HOME` are 0777 in the rust image, so a non-root uid
+# needs nothing there; the target directory is the one path that has to be
+# handed over, because a Docker volume belongs to root until something chowns
+# it (hand_over_target_volume, below).
+#
+# A gate invoked by root runs the container as root too: the uid is whoever
+# invoked the gate, and that is the only honest reading of the flag.
+GATE_UID="$(id -u)"
+GATE_GID="$(id -g)"
+
 # `linux` runs the container on this machine's own architecture, and pins it
 # explicitly. A bare `docker run rust:1.94.0-bookworm` resolves to whichever
 # manifest is in the local store, and on this machine that has been both: the
@@ -232,6 +252,24 @@ gate_image() { printf '%s-%s\n' "$GATE_IMAGE_BASE" "${1##*/}"; }
 
 target_volume() { printf 'whirl-gate-target-%s\n' "${1##*/}"; }
 
+# A named volume is created root-owned, and a volume an earlier root run wrote
+# holds root-owned files, so `--user` would meet `Permission denied` on the
+# first write into CARGO_TARGET_DIR. One short root container hands the volume
+# over instead of a delete-and-rebuild: it chowns the tree in place, which keeps
+# the warm cache, and it prints the one line below when it does, so a first run
+# after this fix says what happened rather than looking like nothing did. On a
+# volume that already belongs to this uid it only looks.
+hand_over_target_volume() {
+  local platform="$1" volume
+  volume="$(target_volume "$platform")"
+  docker run --rm --platform "$platform" --user 0:0 \
+    -v "$volume:/tmp/target" \
+    "$(gate_image "$platform")" \
+    sh -c "[ \"\$(stat -c %u:%g /tmp/target)\" = \"$GATE_UID:$GATE_GID\" ] || { \
+             echo \"ci.sh: $volume holds root-owned files; handing them to $GATE_UID:$GATE_GID\" >&2; \
+             chown -R \"$GATE_UID:$GATE_GID\" /tmp/target; }"
+}
+
 ensure_gate_image() {
   local platform="$1" image
   image="$(gate_image "$platform")"
@@ -245,7 +283,15 @@ in_the_container() {
   local platform="$1" mode="$2"
   need docker "$mode"
   ensure_gate_image "$platform"
+  hand_over_target_volume "$platform"
+  # `--user` is the fix for the root defect, and the only thing the container
+  # needs to be honest: the suite runs as the user who invoked the gate, which
+  # is CI's own arrangement (the runner is not root) and what makes the 0o000
+  # fixture mean anything (GATE_UID, above). Nothing in the run needs a
+  # privileged uid: the target directory has just been handed over, and the /w
+  # mount is written by cargo only through CARGO_TARGET_DIR=/tmp/target.
   docker run --rm --platform "$platform" \
+    --user "$GATE_UID:$GATE_GID" \
     -v "$root:/w" -w /w \
     -v "$(target_volume "$platform"):/tmp/target" \
     -e CARGO_TARGET_DIR=/tmp/target \

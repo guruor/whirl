@@ -312,7 +312,7 @@ proves:
 | `guards` | zero third-party dependencies, and the release binaries fit the caps in `docs/architecture.md` R2 |
 | `artifacts` | the release build produces the three binaries |
 | `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
-| `linux` | CI's `clippy`, `test` and `artifacts` jobs as they run on `ubuntu-latest`, plus `guards`, again in the gate's container, so a Linux-only failure surfaces here rather than in CI. `fmt` is not repeated there: rustfmt's output does not depend on the operating system, and `local` has already run it |
+| `linux` | CI's `clippy`, `test` and `artifacts` jobs as they run on `ubuntu-latest`, plus `guards`, again in the gate's container, as the invoking user rather than root (`--user "$(id -u):$(id -g)"`, below), so a Linux-only failure surfaces here rather than in CI. `fmt` is not repeated there: rustfmt's output does not depend on the operating system, and `local` has already run it |
 | `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails two tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
 
 **What `all` leaves unproven**, so that the answer is here rather than inferred:
@@ -382,6 +382,25 @@ base image is pinned by OCI index digest and each architecture's `cargo-nextest`
 binary by the sha256 the release publishes next to it, and `scripts/ci.sh` builds
 the tag from both pins, so changing either builds a new image rather than reusing
 the old one.
+
+The suite runs as the user who invoked the gate, never as root: `scripts/ci.sh`
+passes `--user "$(id -u):$(id -g)"`. That is the same arrangement CI has (its
+runner is not root) and it is what makes the mode worth running: one test in
+`crates/whirl-worker/src/sources/local.rs` plants a file with mode `0o000` and
+asserts that reading it fails, because a fixture a privileged uid can read proves
+nothing. A root container therefore could not be green on a clean tree, and
+`linux` exited 100 with that one failure while the host suite was green (card
+t_207186c7).
+Nothing in the run wants a privileged uid: `CARGO_HOME` and `RUSTUP_HOME` are
+mode `0777` in the `rust` image, and the one path that needed handing over is the
+target volume, which Docker creates root-owned.
+
+`scripts/ci.sh` hands it over before the suite runs, with one short root
+container that does nothing else: it chowns the tree in place, so the warm cache
+survives instead of being deleted and rebuilt, and it prints the line
+`ci.sh: whirl-gate-target-<arch> holds root-owned files; handing them to
+<uid>:<gid>` the first time it has to. On a volume that already belongs to that
+uid it only looks, which is the normal case from the second run on.
 
 Two image-and-volume pairs are left on the machine on purpose, one per
 architecture the gate has run on:
