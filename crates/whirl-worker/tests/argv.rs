@@ -302,6 +302,18 @@ fn help_prints_the_argv_contract_and_exits_zero() {
 /// processes agreed. What a relative value costs is visible in the answer - the
 /// path in the `set:` line is relative, because the root it came from is - and
 /// that is a property of the operator's override rather than of this resolution.
+///
+/// The two roots this spawn does **not** name are its own as well. 4.3 resolves
+/// what a process is not given from the platform default, and on this machine the
+/// platform default is the human's own `~/Library/Application Support/whirl` and
+/// `~/Library/Caches/whirl`; `set` is a rotation, so the worker took
+/// `<that>/locks/rotate.lock` (7.2, and `main.rs` takes it for `Verb::Set` too).
+/// A spawn with only the two names below therefore rewrote the human's real lock
+/// file on every run of this suite, and contended with his own worker for it if
+/// he rotated at that moment. `WHIRL_STATE_DIR` and `HOME` now point inside the
+/// same scratch directory, which also stops this test reading whatever history
+/// ring the human's state directory happens to hold: the recent window it builds
+/// is empty rather than his.
 #[test]
 fn set_finds_a_digest_under_whirl_cache_dir() {
     const DIGEST: &str = "264e1a838572fcf30c2e019ed8760ea0c8134f318097718fcfac1390af19cd37";
@@ -326,6 +338,11 @@ fn set_finds_a_digest_under_whirl_cache_dir() {
         .args(["--verb", "set", "--target", DIGEST, "--run", "3"])
         .env("WHIRL_BACKEND", "noop")
         .env("WHIRL_CACHE_DIR", "cache")
+        // The other two roots of 4.3, inside this test's own tree: the state
+        // directory the lock lives in, and `HOME`, which 4.3's platform default
+        // is resolved from (`paths::home`) so no other default escapes either.
+        .env("WHIRL_STATE_DIR", dir.join("state"))
+        .env("HOME", &dir)
         .current_dir(&dir)
         .output()
         .expect("the worker runs");
