@@ -312,6 +312,16 @@ pub fn stage_type(input: Vec<Seeking>, platform: Platform) -> Stage {
 /// 2.5 step 5, the cheap half of dedupe: a candidate whose `origin_key` (or
 /// whose id) is in the recent window of 4.1, "the whole history ring (50 entries
 /// by default) plus the current index".
+///
+/// A window that holds every candidate therefore empties this stage, and 4.1
+/// says that is the answer rather than a case to work around: the rotation ends
+/// as `no_candidates` with nothing set, because architecture.md 1711's row 3
+/// makes "everything filtered out" that outcome and architecture.md 655 defines
+/// the code as "every configured source yielded nothing admissible". The
+/// alternative, relaxing the window until something matches, sets the image the
+/// rule exists to keep off the screen; the larger window of architecture.md 9's
+/// table buys "fewer repeats of an image the user liked", which is a preference,
+/// not a licence to break the rule.
 pub fn stage_recent(input: Vec<Seeking>, window: &Window) -> Stage {
     let mut stage = Stage::default();
     for seeking in input {
@@ -1089,6 +1099,11 @@ impl Run<'_> {
             };
             let filtered = filter_pipeline(self.config, self.platform, self.window, candidates);
             if filtered.kept.is_empty() {
+                // 4.1's exhaustion case is this branch: the source offered
+                // candidates and the recent window removed all of them, so
+                // nothing is set and the reason carries the counters. The daemon
+                // spent the slot, and architecture.md 1711's row 3 keeps it spent
+                // rather than letting the rotation reach past the window.
                 reasons.push(format!(
                     "{}: {:?} candidates, {:?} admitted",
                     entry.config.id, filtered.counters.candidates, filtered.counters.admitted
