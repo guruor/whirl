@@ -66,7 +66,7 @@ pub fn refused(_code: ErrorCode) -> u8 {
 /// run against a protocol it does not know rather than misreading answers.
 #[cfg(unix)]
 pub fn check_greeting(line: &str) -> Result<(), String> {
-    let fields:Vec<&str>=line.split(' ').collect();
+    let fields: Vec<&str> = line.split(' ').collect();
     if fields.len() != 5 || fields[0] != "OK" {
         return Err(format!(
             "the greeting is not `OK <product> <version> protocol <n>`: {line:?}"
