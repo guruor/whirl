@@ -507,6 +507,55 @@ mod tests {
         }
     }
 
+    /// The daemon's own resolved state and cache directories reach the worker,
+    /// and they are this daemon's values rather than whatever the test process's
+    /// session had.
+    ///
+    /// This is the seam the recent window of 4.1 was dropped across.
+    /// `whirl_worker::pipeline::Window::load` reads `history.json` from
+    /// `WHIRL_STATE_DIR` and `index.json` from `WHIRL_CACHE_DIR`, so a scrub that
+    /// left the child to re-derive both from `HOME` and the compiled defaults
+    /// handed it a window built from a directory the daemon never wrote: the
+    /// window came out empty, and consecutive rotations set the same image while
+    /// an unused candidate sat in the source's own list.
+    #[test]
+    fn the_daemons_resolved_directories_reach_the_worker() {
+        let scripts = Scripts::new("resolved-paths");
+        let dump = scripts.path("paths.txt");
+        let program = scripts.script(
+            "paths.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s %s' \"$WHIRL_STATE_DIR\" \"$WHIRL_CACHE_DIR\" > '{}'\n",
+                dump.display()
+            ),
+        );
+        // Deliberately not the platform defaults, and deliberately not this
+        // process's environment: a scrub that forwarded the ambient values would
+        // pass with the defaults and fail here.
+        let state_dir = scripts.path("state");
+        let cache_dir = scripts.path("cache");
+        let worker = Worker::new(
+            program,
+            PathBuf::from("/nonexistent/whirl/config.json"),
+            Backend::Noop,
+            state_dir.clone(),
+            cache_dir.clone(),
+        );
+
+        let outcome = worker.run(Verb::Rotate, None, 1, generous());
+        assert!(
+            matches!(outcome, Err(WorkerError::Failed { .. })),
+            "the script prints no set: line: {outcome:?}"
+        );
+
+        assert_eq!(
+            scripts.text("paths.txt"),
+            format!("{} {}", state_dir.display(), cache_dir.display()),
+            "the worker must be told the directories the daemon resolved; re-deriving its own \
+             leaves the recent window of 4.1 empty"
+        );
+    }
+
     /// How closely the test can pin the *early* side of the deadline: how much
     /// before `DEADLINE` a `SIGTERM` may be and still count as at it.
     ///
