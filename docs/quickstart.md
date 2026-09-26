@@ -57,6 +57,15 @@ It prints `queued` and then `set: <digest> <origin_key> <via> <path>`, naming th
 `whirl config check` prints what a source did, `candidates=` and `admitted=` and the rejection
 counters; it asks the daemon, so it only works while `whirld` is up.
 
+When the collection turns out smaller than the folder is, read the terminal `whirld` is running in
+rather than `whirl config check`: that record's field set is fixed and its counters are the
+candidates removed per stage (docs/architecture.md 2.6, docs/spec/features.md 2.5), so a file the
+source drops before it becomes a candidate moves none of them. `whirld` appends the worker's own
+words to that same stderr, where such a file reads `warning: source pictures: entries skipped: 1
+unreadable, 0 symlink, 0 revisited`; under the launchd agent of docs/architecture.md 5.2 the
+identical line lands in the log file, `~/Library/Logs/whirl/whirl.log` (docs/spec/state-and-cache.md
+1.1).
+
 ## 4. Stop it
 
 Ctrl-C in the daemon's terminal. Nothing else is left running.
