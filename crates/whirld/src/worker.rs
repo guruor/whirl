@@ -535,10 +535,25 @@ mod tests {
     /// busy loops plus the eight test binaries of `cargo test --workspace` in
     /// parallel): 1 run in 8 failed on `elapsed >= TERM_GRACE` with the child
     /// dead in about 1 s, which is that race and not a daemon defect. Three
-    /// seconds is 100x below the documented default and comfortably longer than
-    /// any process start-up observed here; the trap is also installed before the
-    /// pid file is written, so a child that is slow to start survives the signal
-    /// whenever the two orderings can still be reconciled.
+    /// seconds is 100x below the documented default; the trap is also installed
+    /// before the pid file is written, so a child that is slow to start survives
+    /// the signal whenever the two orderings can still be reconciled.
+    ///
+    /// It is not enough on its own, and `t_b2545ae0` is where that became plain.
+    /// The child's arming - fork, exec, trap, pid file - took 0.57 s to 2.83 s
+    /// across 28 runs under the card's 12-spinner load, so this deadline sits
+    /// barely above the worst run rather than the order of magnitude above it the
+    /// paragraph above claims; and in 1 of the card's 14 loaded full-suite runs
+    /// the child had still not armed when the deadline fired, the `SIGTERM` killed
+    /// it by default action, and the run failed at the marker assertion (the
+    /// `worker.rs:829` run: 3.51 s of test, no marker, child dead at the
+    /// deadline) with nothing wrong with the daemon.
+    ///
+    /// That is a premise, not an assertion, and no fixed deadline can hold it on
+    /// a machine whose load is not this test's to bound. So the test no longer
+    /// assumes it: a run whose child had no trap in place when the deadline fired
+    /// is discarded and re-run, `ARMED_ATTEMPTS` times, and only a child that
+    /// could have trapped the signal is allowed to speak about the daemon.
     const DEADLINE: Duration = Duration::from_secs(3);
 
     /// Two files are the same file: the device and inode comparison behind
@@ -678,15 +693,44 @@ mod tests {
     /// before `DEADLINE` a `SIGTERM` may be and still count as at it.
     ///
     /// The reading it is applied to is a late-biased one and can never lead the
-    /// signal: the watcher polls every `WATCH_POLL`, and the shell runs a trap
-    /// only once the command it is executing returns, which in the script below
-    /// is one `sleep 0.05`. So the marker lags the true `SIGTERM` by up to about
-    /// 52 ms plus however long the watching thread waited for a core, and 500 ms
-    /// covers that with room to spare on a load-parallel `cargo test
-    /// --workspace`. It is also six times below the 3 s the defect this asserts
-    /// against is off by, so the mutation in the pull request still fails by
-    /// thousands of milliseconds rather than by a hair.
+    /// signal: the watcher polls every `WATCH_POLL`, and a shell runs a trap only
+    /// between the commands it is executing, so the marker lags the true
+    /// `SIGTERM` by however long the command in flight takes to return plus
+    /// however long the shell and the watching thread waited for a core. Both of
+    /// those are the machine's, and `t_b2545ae0` measured them at the card's load
+    /// (12 busy loops on 8 cores) in the same runs, which is where the script
+    /// below got its shape:
+    ///
+    /// - a shell blocked in the `wait` builtin, which is what the script does
+    ///   now, ran the trap 5.8 ms to 23.8 ms after the signal;
+    /// - the same loop with a foreground `sleep 0.05` in flight, which is what it
+    ///   did before, ran it 47.8 ms to 531 ms after the signal - the handler
+    ///   cannot run until the command in flight returns - and the card's two
+    ///   failures at `worker.rs:848` (a measured grace of 4.3953 s and 4.3763 s
+    ///   against this 5 s minus this tolerance) are that same lag one load-step
+    ///   deeper, at 0.60 s and 0.62 s;
+    /// - the watcher's own observation lagged the marker write by 1 ms to 9 ms.
+    ///
+    /// 500 ms is therefore an order of magnitude above the handler's measured
+    /// tail rather than a blanket over it, and it leaves the grace assertion
+    /// below (which subtracts this same reading from the total) about 470 ms of
+    /// room. It is also six times below the 3 s the defect this asserts against
+    /// is off by, so the mutation in the pull request still fails by thousands of
+    /// milliseconds rather than by a hair.
     const TOLERANCE: Duration = Duration::from_millis(500);
+
+    /// How many runs the test gives the child to arm inside the deadline before
+    /// it gives up on the machine.
+    ///
+    /// The premise a run needs is that the child has its `TERM` trap in place
+    /// when the deadline fires; that is the child's arming racing the deadline,
+    /// and the arming is the machine's, not the daemon's. Three, because the
+    /// card's box missed it in 1 run of 14 (0.57 s to 2.83 s of arming against a
+    /// 3 s deadline): three misses in a row are then about 1 in 2700, and the
+    /// extra time is only paid when a run is discarded - about 3.5 s for a child
+    /// that died on the signal, and the grace on top if it armed and the handler
+    /// was starved instead.
+    const ARMED_ATTEMPTS: usize = 3;
 
     /// The tolerance on the *late* side: how much after the deadline the
     /// `SIGTERM` may be, and how much after `DEADLINE + TERM_GRACE` the total
@@ -717,41 +761,53 @@ mod tests {
     /// here rather than beside `SIGTERM` because this test is its only caller.
     const SIGNAL_NONE: i32 = 0;
 
-    /// When a `TERM` trap was seen to run, on the test's own clock.
+    /// When the child's two files appeared, on the test's own clock.
+    ///
+    /// `[armed, trapped]`, in that order: the pid file the child writes with its
+    /// `TERM` trap already installed, and the marker that trap appends to. The
+    /// first is the child saying it could trap a signal at all, which the test
+    /// needs to read separately from the second, because only the second proves
+    /// one was trapped.
     ///
     /// A timestamp written by the trap itself would be a wall-clock reading
     /// taken in another process, and the test has no way to compare that with
-    /// the `Instant` it takes before the spawn. So the trap keeps its one job,
-    /// appending to the marker file, and this thread watches for that file and
-    /// records an `Instant` the moment it exists: one clock, one process,
-    /// nothing to correlate.
+    /// the `Instant` it takes before the spawn. So the child's files keep their
+    /// one job, and this thread watches for them and records an `Instant` when
+    /// each exists: one clock, one process, nothing to correlate.
     ///
-    /// The reading is always at or after the signal, never before it, as
+    /// The reading is always at or after the write, never before it, as
     /// described on `TOLERANCE`.
     struct TermWatch {
         stop: Arc<AtomicBool>,
         running: JoinHandle<()>,
-        seen: mpsc::Receiver<Instant>,
+        seen: mpsc::Receiver<(usize, Instant)>,
     }
 
     impl TermWatch {
-        fn new(marker: PathBuf) -> TermWatch {
+        fn new(files: [PathBuf; 2]) -> TermWatch {
             let (sender, seen) = mpsc::channel();
             let stop = Arc::new(AtomicBool::new(false));
             let watching = Arc::clone(&stop);
             let running = std::thread::spawn(move || {
                 let give_up = Instant::now() + WATCH_BOUND;
+                let mut reported = [false; 2];
                 loop {
-                    if marker.exists() {
-                        let _ = sender.send(Instant::now());
-                        return;
+                    let mut pending = false;
+                    for (index, path) in files.iter().enumerate() {
+                        if !reported[index] && path.exists() {
+                            reported[index] = true;
+                            let _ = sender.send((index, Instant::now()));
+                        }
+                        pending |= !reported[index];
                     }
-                    if watching.load(Ordering::SeqCst) || Instant::now() >= give_up {
-                        // A marker written in the same instant the test stopped
+                    if !pending || watching.load(Ordering::SeqCst) || Instant::now() >= give_up {
+                        // A file written in the same instant the test stopped
                         // watching is still reported rather than lost to the
                         // race, since the file outlives both threads.
-                        if marker.exists() {
-                            let _ = sender.send(Instant::now());
+                        for (index, path) in files.iter().enumerate() {
+                            if !reported[index] && path.exists() {
+                                let _ = sender.send((index, Instant::now()));
+                            }
                         }
                         return;
                     }
@@ -765,12 +821,16 @@ mod tests {
             }
         }
 
-        /// The reading, once the watcher has stopped. `None` if the marker never
-        /// appeared at all.
-        fn moment(self) -> Option<Instant> {
+        /// The two readings, once the watcher has stopped: `None` for a file the
+        /// child never wrote.
+        fn moment(self) -> [Option<Instant>; 2] {
             self.stop.store(true, Ordering::SeqCst);
             let _ = self.running.join();
-            self.seen.try_recv().ok()
+            let mut moments = [None; 2];
+            while let Ok((index, moment)) = self.seen.try_recv() {
+                moments[index] = Some(moment);
+            }
+            moments
         }
     }
 
@@ -805,31 +865,75 @@ mod tests {
     /// The `trap` is the script's first statement and the pid file its second:
     /// both orderings are load-sensitive, and installing the handler before
     /// anything that can block keeps the window in which a `SIGTERM` would kill
-    /// the child by default action as small as the shell can make it.
+    /// the child by default action as small as the shell can make it. The loop
+    /// that follows blocks in `wait` rather than inside a `sleep`, so the trap
+    /// runs when the signal arrives instead of when the command in flight
+    /// returns (numbers on `TOLERANCE`).
+    ///
+    /// A run whose child could not arm before the deadline is discarded and
+    /// re-run, and the two ways a run can end with no marker are pulled apart
+    /// rather than assumed: a child that had its trap in place and never trapped
+    /// the signal is the daemon failing to deliver it politely, which is a
+    /// failure, while a child that had no trap to trap with is the machine, which
+    /// is a re-run (`ARMED_ATTEMPTS`). Read as one shape, the second is
+    /// `t_b2545ae0`'s second window.
     #[test]
     fn a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace() {
         let scripts = Scripts::new("escalate");
         let marker = scripts.path("term.txt");
         let pid = scripts.path("pid.txt");
-        let program = scripts.script(
-            "slow.sh",
-            &format!(
-                "#!/bin/sh\ntrap 'echo term >> \"{}\"' TERM\necho $$ > '{}'\nwhile :; do sleep 0.05; done\n",
-                marker.display(),
-                pid.display()
-            ),
-        );
 
-        let started = Instant::now();
-        let watch = TermWatch::new(marker.clone());
-        let outcome = worker(program).run(Verb::Rotate, None, 7, DEADLINE);
-        let elapsed = started.elapsed();
-        let termed_at = match watch.moment() {
-            Some(moment) => moment.duration_since(started),
-            None => panic!(
-                "no SIGTERM trap ran in {WATCH_BOUND:?}: {} never appeared",
-                marker.display()
-            ),
+        let mut arming = Vec::new();
+        let (outcome, elapsed, termed_at) = loop {
+            // A discarded run leaves its own pid file behind, and a stale one
+            // would tell the arm check below about the run before it.
+            let _ = fs::remove_file(&pid);
+            let _ = fs::remove_file(&marker);
+            let program = scripts.script(
+                "slow.sh",
+                &format!(
+                    "#!/bin/sh\ntrap 'echo term >> \"{}\"' TERM\necho $$ > '{}'\nwhile :; do sleep 0.05 & wait; done\n",
+                    marker.display(),
+                    pid.display()
+                ),
+            );
+
+            let started = Instant::now();
+            // The pid file is watched for first: it is the child saying it could
+            // trap a signal at all, and the check below needs that answer even
+            // when the marker never appears.
+            let watch = TermWatch::new([pid.clone(), marker.clone()]);
+            let outcome = worker(program).run(Verb::Rotate, None, 7, DEADLINE);
+            let elapsed = started.elapsed();
+            let [armed_at, termed_at] = watch.moment();
+            let armed_at = armed_at.map(|moment| moment.duration_since(started));
+            let termed_at = termed_at.map(|moment| moment.duration_since(started));
+            arming.push(armed_at);
+
+            if let Some(termed_at) = termed_at {
+                break (outcome, elapsed, termed_at);
+            }
+
+            // No trap ran. A child whose handler was in place before the deadline
+            // could have trapped the signal, so a run that also ended at once has
+            // the signal going undelivered or the kill travelling alongside it.
+            assert!(
+                armed_at.is_none_or(|moment| moment > DEADLINE),
+                "the child had its TERM trap in place {armed_at:?} after the spawn, before the \
+                 {DEADLINE:?} deadline, and the run was over {elapsed:?} after the spawn with no \
+                 trap run: the polite SIGTERM was not delivered, or the child was killed \
+                 alongside it"
+            );
+            // The other shape: nothing was armed to trap with, so the deadline
+            // met a shell with the default disposition for `SIGTERM`. That is
+            // start-up latency, and the run is worth discarding and repeating.
+            assert!(
+                arming.len() < ARMED_ATTEMPTS,
+                "no child of {ARMED_ATTEMPTS} armed inside the {DEADLINE:?} deadline, so no run \
+                 could trap a signal: the arming came {arming:?} after the spawns, against a \
+                 {DEADLINE:?} deadline. That is this machine's start-up latency, not the daemon's \
+                 escalation"
+            );
         };
         let after_term = elapsed - termed_at;
 
