@@ -96,11 +96,12 @@ crates/
 docs/
   architecture.md           process model, protocol, platform verdict, resident rules
   development.md            this file
-  README.md                 index and status of every document
+  README.md                 index and status of the design documents
   spec/                     features, state and cache layout
   research/                 per-platform findings, with the real-hardware checklists
   decisions/                ADRs: NNNN-title.md, template in 0000-template.md
-  reviews/                  review reports, one per reviewed document
+  reviews/                  review reports; the index in `README.md` says what
+                            each one covers
   releases/                 one file per release: vX.Y.Z.md, the notes the tag
                             workflow publishes, written before the tag (section 5)
 .github/workflows/ci.yml    the gate: push to `main` or `development`, pull request
@@ -908,9 +909,10 @@ the pull request body, read the diff against the acceptance criteria, and answer
 with either "done" or a numbered list of specific changes. A review that could
 have been written by reading the diff alone has not been done.
 
-Reviews of a document use the same rule. `docs/reviews/` holds one report per
-reviewed document: what the reviewer ran, what they observed, and what they could
-not check, marked as unverified rather than assumed either way.
+Reviews of a document use the same rule. The reports live in `docs/reviews/`,
+and the index in `README.md` says what each one covers. Each report records
+what the reviewer ran, what they observed, and what they could not check,
+marked as unverified rather than assumed either way.
 
 ### Commit messages
 
