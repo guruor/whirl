@@ -45,6 +45,15 @@ const EWOULDBLOCK: i32 = 11;
 /// (docs/development.md, "Upgrading, and what happens to a running daemon").
 const SIGTERM: i32 = 15;
 
+/// The bound this harness waits on the daemon with, read off the spec's timeout
+/// table rather than chosen: `docs/architecture.md:715` gives the rotation
+/// request timeout 300 s because "a client must not give up before the daemon
+/// does", and `:714` gives a client waiting on the daemon the same 300 s. 2.8's
+/// table has no daemon-startup row at all, so 15 s here was this file asserting
+/// more than the daemon promised. The same constant, for the same reason, is in
+/// `control_socket.rs`; the two files are separate crates and cannot share it.
+const CLIENT_BOUND: Duration = Duration::from_secs(300);
+
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
@@ -90,18 +99,31 @@ fn command(dir: &Path) -> Command {
 /// One running daemon, waited for by its socket: a daemon that has taken the lock
 /// of 1.5 step 1, loaded its state and bound 2.1's socket.
 fn start(dir: &Path) -> Child {
-    let log = std::fs::File::create(dir.join("daemon.log")).expect("a log file");
-    let child = command(dir)
+    let log_path = dir.join("daemon.log");
+    let log = std::fs::File::create(&log_path).expect("a log file");
+    let mut child = command(dir)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .spawn()
         .expect("the daemon starts");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // The bound is the spec's, not this file's: `docs/architecture.md:714-715`
+    // gives a client waiting on the daemon 300 s, and 2.8's table has no
+    // daemon-startup row for a tighter bound to come from. A daemon that refused
+    // or died fails at once on the child check instead of waiting it out.
+    let deadline = Instant::now() + CLIENT_BOUND;
     while UnixStream::connect(socket(dir)).is_err() {
+        if let Some(status) = child.try_wait().expect("the daemon child is waited on") {
+            panic!(
+                "the daemon exited ({status}) before it bound {}; see {}",
+                socket(dir).display(),
+                log_path.display()
+            );
+        }
         assert!(
             Instant::now() < deadline,
-            "the daemon did not bind {} in 15 s",
-            socket(dir).display()
+            "the daemon did not bind {} in {} s",
+            socket(dir).display(),
+            CLIENT_BOUND.as_secs()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
