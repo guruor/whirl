@@ -215,17 +215,28 @@ impl Local {
         })
     }
 
-    /// 2.2's `include`/`exclude`, matched against the path relative to the
-    /// source root, with "exclude wins over include". An empty `include` admits
+    /// 2.2's `include`/`exclude`: "Matched against the path relative to the
+    /// source root. Exclude wins over include." An empty `include` admits
     /// nothing, because it is the whitelist and it lists nothing; the default
-    /// list is the five extensions 2.2's example carries, and the extension
+    /// list is the five extensions 2.2's example carries, so the extension
     /// capability 2.5 gives `local` is answered here and not by the filename's
     /// case (a `.JPG` is a JPEG on every filesystem this build runs on).
+    ///
+    /// The text a pattern sees carries a leading separator
+    /// (`/walls/sub/screenshots/one.png` for a root of `walls`). That is what
+    /// makes 2.2's own defaults reach a `.git` or `screenshots` directory that
+    /// sits directly under the configured path: `*/.git/*` needs a separator
+    /// before `.git` to match against, and `.git/cached.png` has none, so
+    /// without the leading separator the default list would exclude only
+    /// *nested* ones and an operator's `screenshots/` folder would be rotated
+    /// onto the desktop. The path is still the one "relative to the source
+    /// root"; the root is simply spelled `/`.
     fn admits(&self, relative: &str) -> bool {
-        if self.exclude.iter().any(|glob| matches(glob, relative)) {
+        let text = format!("/{relative}");
+        if self.exclude.iter().any(|glob| matches(glob, &text)) {
             return false;
         }
-        self.include.iter().any(|glob| matches(glob, relative))
+        self.include.iter().any(|glob| matches(glob, &text))
     }
 
     /// One directory's entries, in a fixed order: `read_dir`'s order is the
@@ -581,10 +592,20 @@ mod tests {
     /// [`Sources::from_config`] and not a hand-made entry, so a test cannot pass
     /// against a source the dispatch table does not ship (features.md 2.6).
     fn table(dir: &Path, extra: &str) -> Sources {
+        sources_of(&[&dir.join("walls")], extra)
+    }
+
+    /// The same table over other paths, in order: 2.2's `paths` is "one or more
+    /// directories" and the order is the config's.
+    fn sources_of(paths: &[&Path], extra: &str) -> Sources {
+        let listed = paths
+            .iter()
+            .map(|path| quoted(&path.display().to_string()))
+            .collect::<Vec<String>>()
+            .join(", ");
         parsed(&format!(
             "{{\n  \"config_schema\": 1,\n  \"sources\": [ {{ \"id\": \"pictures\", \"kind\": \
-             \"local\", \"weight\": 1, \"paths\": [{}]{extra} }} ]\n}}\n",
-            quoted(&dir.join("walls").display().to_string())
+             \"local\", \"weight\": 1, \"paths\": [{listed}]{extra} }} ]\n}}\n"
         ))
     }
 
@@ -895,6 +916,406 @@ mod tests {
         assert_eq!(
             id_of(&after, &renamed),
             digest_of(&renamed.display().to_string())
+        );
+    }
+
+    // Item 3's edge cases, one test each. features.md 2.2 and
+    // architecture.md 4.3 decide them; where the spec is silent the test says
+    // what was chosen and why. What a skipped file is *reported* as is asserted
+    // where the worker's stderr can be read (crates/whirl-worker/tests/argv.rs);
+    // what is asserted here is what the enumeration returned.
+
+    /// The empty directory. `enumerate` yields nothing and `validate` is `Ok`,
+    /// which is the distinction 1.4 draws: a source that honestly found nothing
+    /// is `no_candidates` at the stage (1.4's "the source answered but the
+    /// filter pipeline left nothing"), and a source that cannot be asked is
+    /// `enabled=0 reason=<...>` (4.3). Both are pinned at the process level.
+    #[test]
+    fn an_empty_directory_enumerates_to_nothing_and_is_not_a_failure() {
+        let dir = scratch("empty");
+        fs::create_dir_all(dir.join("walls")).expect("the source directory");
+        let sources = table(&dir, "");
+        let entry = &sources.entries()[0];
+        assert!(
+            entry.source.validate(&entry.config).is_ok(),
+            "an empty directory is not an error: 2.2 refuses a path that is missing or \
+             unreadable, not one that is merely empty"
+        );
+        assert!(enumerate(&sources, &[]).is_empty());
+    }
+
+    /// 2.2's `paths` rule: "a path that is missing or unreadable is a warning;
+    /// it is an error only if every path fails". One missing root leaves the
+    /// source enabled and the other root enumerated; both missing is the refusal
+    /// 4.3 renders as `enabled=0 reason=<...>`, which is what the daemon's
+    /// `config check` shows.
+    #[test]
+    fn a_missing_path_is_a_failure_only_when_every_path_misses() {
+        let dir = scratch("missing");
+        let present = dir.join("walls");
+        let absent = dir.join("gone");
+        plant(&present.join("one.png"), 2560, 1440);
+
+        let half = sources_of(&[&present, &absent], "");
+        let entry = &half.entries()[0];
+        assert!(
+            entry.source.validate(&entry.config).is_ok(),
+            "one of two paths is a warning, not a refusal"
+        );
+        assert_eq!(
+            origins(&enumerate(&half, &[])),
+            vec![present.join("one.png").display().to_string()],
+            "and the rest of the tree is enumerated anyway"
+        );
+
+        let both = sources_of(&[&absent, &dir.join("also-gone")], "");
+        let entry = &both.entries()[0];
+        let reason = entry
+            .source
+            .validate(&entry.config)
+            .expect_err("every path fails")
+            .to_string();
+        assert!(
+            reason.contains("sources[id=pictures].paths"),
+            "the reason names the key: {reason}"
+        );
+        assert!(
+            reason.contains(&absent.display().to_string()),
+            "and the path that failed: {reason}"
+        );
+        assert!(
+            reason.contains("No such file or directory"),
+            "and why: {reason}"
+        );
+    }
+
+    /// Absolute paths only. The parser accepts a relative path (it is a string
+    /// to it), so the guard is [`Local::validate`]: it refuses the value and
+    /// names the key, which is what 4.3's `enabled=0 reason=<...>` renders. The
+    /// reading is 2.5's own rule for `set path`: a relative path is never
+    /// resolved against the daemon's working directory, which is `/` under
+    /// launchd and therefore not the directory the operator typed in.
+    #[test]
+    fn a_relative_path_is_refused_and_never_resolved_against_the_working_directory() {
+        let relative = "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"pictures\", \
+                        \"kind\": \"local\", \"weight\": 1, \"paths\": [\"walls\"] } ]\n}\n";
+        let config = Config::parse(relative)
+            .expect("the parser takes a relative path: it is a string to the parser")
+            .config;
+        assert_eq!(
+            config.sources[0]
+                .local
+                .as_ref()
+                .expect("a local section")
+                .paths,
+            vec!["walls".to_string()],
+            "nothing normalised it away before the source saw it"
+        );
+
+        let sources = Sources::from_config(&config);
+        let entry = &sources.entries()[0];
+        let reason = entry
+            .source
+            .validate(&entry.config)
+            .expect_err("a relative path is refused")
+            .to_string();
+        assert!(
+            reason.contains("sources[id=pictures].paths[0]"),
+            "the key is named: {reason}"
+        );
+        assert!(
+            reason.contains("walls is relative"),
+            "and so is the value: {reason}"
+        );
+    }
+
+    /// 2.2: "`~` is expanded". The home it expands against is the one
+    /// [`EnumContext`] carries, not this process's own environment, because the
+    /// daemon that reads the config is not necessarily the shell that wrote it
+    /// (the same reason 2.5 refuses a relative `set path`); the pipeline passes
+    /// `paths::home()`.
+    #[test]
+    fn a_tilde_path_expands_against_the_home_the_context_carries() {
+        let dir = scratch("tilde");
+        let home = dir.join("home");
+        let file = home.join("walls").join("one.png");
+        plant(&file, 2560, 1440);
+
+        let sources = sources_of(&[Path::new("~/walls")], "");
+        let candidates = sources.entries()[0].source.enumerate(&EnumContext {
+            run: 1,
+            home: Some(home.clone()),
+            recent: Vec::new(),
+        });
+        assert_eq!(
+            origins(&candidates),
+            vec![file.display().to_string()],
+            "`~` is expanded against `EnumContext::home`"
+        );
+        assert_eq!(
+            id_of(&candidates, &file),
+            digest_of(&file.display().to_string()),
+            "and the id is the expanded path's, so a config that moves is a cache that \
+             moves with it"
+        );
+    }
+
+    /// 2.2's `include`/`exclude`, which are this source's answer to Layer 1's
+    /// `extension` capability ("a local filesystem can answer these with a glob
+    /// and a header read", 2.5). The default lists are
+    /// `whirl_core::config::LocalSource`'s: five extensions, and `*/.git/*` and
+    /// `*/screenshots/*` excluded. The extension, not the bytes, is what decides
+    /// here, so `vector.svg` is not a candidate even though its contents are a
+    /// PNG, and `UPPER.PNG` is one because a filename's case is not a type.
+    #[test]
+    fn the_default_include_list_admits_five_extensions_and_names_two_exclusions() {
+        let dir = scratch("globs-default");
+        let walls = dir.join("walls");
+        plant(&walls.join("kept.png"), 2560, 1440);
+        plant(&walls.join("also.jpg"), 2000, 1200);
+        plant(&walls.join("UPPER.PNG"), 2000, 1200);
+        plant(&walls.join("vector.svg"), 2000, 1200);
+        plant(&walls.join("notes.txt"), 2000, 1200);
+        plant(&walls.join(".git").join("cached.png"), 2000, 1200);
+        plant(&walls.join("screenshots").join("wall.png"), 2000, 1200);
+
+        let mut expected = vec![
+            walls.join("UPPER.PNG").display().to_string(),
+            walls.join("also.jpg").display().to_string(),
+            walls.join("kept.png").display().to_string(),
+        ];
+        expected.sort();
+        assert_eq!(origins(&enumerate(&table(&dir, ""), &[])), expected);
+    }
+
+    /// "Exclude wins over include" (2.2), with both lists configured: the file
+    /// both lists name is not a candidate, and one that only `include` names is.
+    #[test]
+    fn a_configured_exclude_wins_over_the_include_that_admits_the_same_file() {
+        let dir = scratch("globs-config");
+        let walls = dir.join("walls");
+        plant(&walls.join("kept.png"), 2560, 1440);
+        plant(&walls.join("skip-me.png"), 2000, 1200);
+        let sources = table(
+            &dir,
+            ", \"include\": [\"*.png\"], \"exclude\": [\"*skip-*\"]",
+        );
+        assert_eq!(
+            origins(&enumerate(&sources, &[])),
+            vec![walls.join("kept.png").display().to_string()]
+        );
+    }
+
+    /// 2.2: "a file whose header cannot be read is excluded and logged at debug,
+    /// because a file we cannot measure is a file we cannot promise will
+    /// display". A file the include list names whose bytes are not an image is
+    /// the first of the two ways that happens, and it must not take the
+    /// enumeration down with it.
+    #[test]
+    fn a_file_whose_header_cannot_be_read_is_not_a_candidate() {
+        let dir = scratch("no-header");
+        let walls = dir.join("walls");
+        plant(&walls.join("good.png"), 2560, 1440);
+        fs::write(walls.join("liar.png"), b"not a PNG, whatever the name says").expect("a file");
+        fs::write(walls.join("empty.png"), b"").expect("an empty file");
+
+        assert_eq!(
+            origins(&enumerate(&table(&dir, ""), &[])),
+            vec![walls.join("good.png").display().to_string()],
+            "a zero-byte file and a file of the wrong bytes are both unmeasurable"
+        );
+    }
+
+    /// The other way a header cannot be read: the file cannot be opened at all.
+    /// The mode is the fixture: if this ever runs as a user who can read
+    /// anything, the fixture's own assertion fails rather than the test passing
+    /// for the wrong reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_is_skipped_and_the_rest_is_enumerated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("locked");
+        let walls = dir.join("walls");
+        let good = walls.join("good.png");
+        let locked = walls.join("locked.png");
+        plant(&good, 2560, 1440);
+        plant(&locked, 2000, 1200);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("a mode");
+        assert!(
+            fs::read(&locked).is_err(),
+            "the fixture has to be unreadable for this test to mean anything"
+        );
+
+        assert_eq!(
+            origins(&enumerate(&table(&dir, ""), &[])),
+            vec![good.display().to_string()]
+        );
+    }
+
+    /// The symlink case. 2.2 is explicit about the *directory* half
+    /// ("`follow_symlinks`: off by default to make loops impossible rather than
+    /// merely unlikely", and "a symlinked wallpaper folder has to be named as a
+    /// real path") and silent about a symlinked *file*. The reading this source
+    /// takes, and why: with `follow_symlinks` false the walk follows no link at
+    /// all. Following file links while refusing directory ones would let a file
+    /// outside the configured tree become a candidate, which is the same escape
+    /// the directory rule closes; and the safe reading is also the simpler one to
+    /// state. With the flag on, a followed link's candidate carries the path the
+    /// config named, which is the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_is_not_followed_until_follow_symlinks_is_on() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("symlink-file");
+        let real = dir.join("elsewhere").join("real.png");
+        plant(&real, 2560, 1440);
+        let link = dir.join("walls").join("linked.png");
+        fs::create_dir_all(dir.join("walls")).expect("the source directory");
+        symlink(&real, &link).expect("the link");
+
+        let refused = enumerate(&table(&dir, ""), &[]);
+        assert!(
+            refused.is_empty(),
+            "follow_symlinks is false (2.2's default): {:?}",
+            origins(&refused)
+        );
+
+        let followed = enumerate(&table(&dir, ", \"follow_symlinks\": true"), &[]);
+        assert_eq!(origins(&followed), vec![link.display().to_string()]);
+        assert_eq!(
+            followed[0].width,
+            Some(2560),
+            "the header read follows the link, and the identity stays the path that was named"
+        );
+    }
+
+    /// The same rule for a symlinked directory: not walked, and with the flag on,
+    /// walked under the link's own path.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_not_walked_either() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("symlink-dir");
+        let walls = dir.join("walls");
+        plant(&walls.join("real.png"), 2560, 1440);
+        plant(&dir.join("elsewhere").join("linked.png"), 2000, 1200);
+        symlink(dir.join("elsewhere"), walls.join("link")).expect("the link");
+
+        assert_eq!(
+            origins(&enumerate(&table(&dir, ""), &[])),
+            vec![walls.join("real.png").display().to_string()],
+            "a symlinked folder has to be named as a real path (2.2)"
+        );
+
+        let followed = enumerate(&table(&dir, ", \"follow_symlinks\": true"), &[]);
+        let mut expected = vec![
+            walls.join("link").join("linked.png").display().to_string(),
+            walls.join("real.png").display().to_string(),
+        ];
+        expected.sort();
+        assert_eq!(origins(&followed), expected);
+    }
+
+    /// A configured root that is a symlink is the same decision one level up:
+    /// with `follow_symlinks` false the source cannot be walked at all, so it is
+    /// refused by name and the operator sees `enabled=0 reason=<...>` instead of a
+    /// source that silently finds nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_refused_and_the_reason_is_the_flag() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("symlink-root");
+        let real = dir.join("real");
+        plant(&real.join("walls").join("one.png"), 2560, 1440);
+        let link = dir.join("linked");
+        symlink(&real, &link).expect("the link");
+
+        let sources = sources_of(&[&link], "");
+        let entry = &sources.entries()[0];
+        let reason = entry
+            .source
+            .validate(&entry.config)
+            .expect_err("a symlinked root is refused")
+            .to_string();
+        assert!(
+            reason.contains(&link.display().to_string()) && reason.contains("follow_symlinks"),
+            "the reason names the path and the key that would change the answer: {reason}"
+        );
+
+        let followed = sources_of(&[&link], ", \"follow_symlinks\": true");
+        let entry = &followed.entries()[0];
+        assert!(entry.source.validate(&entry.config).is_ok());
+        assert_eq!(
+            origins(&enumerate(&followed, &[])),
+            vec![link.join("walls").join("one.png").display().to_string()]
+        );
+    }
+
+    /// A loop is impossible at the walk level, not merely by the depth bound: with
+    /// `follow_symlinks` on, `max_depth` would make a cycle terminate eventually,
+    /// and the set of directories this walk has already entered is what makes it
+    /// terminate at the second visit. The bound here is 40 so that a failure of
+    /// the visited set shows up as repeated candidates and not as a stack.
+    #[cfg(unix)]
+    #[test]
+    fn a_followed_loop_terminates_at_the_second_visit() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("loop");
+        let walls = dir.join("walls");
+        plant(&walls.join("one.png"), 2560, 1440);
+        symlink(&walls, &walls.join("again")).expect("the loop");
+
+        let candidates = enumerate(
+            &table(&dir, ", \"follow_symlinks\": true, \"max_depth\": 40"),
+            &[],
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "one file, one candidate, however many times the tree can be re-entered: {:?}",
+            origins(&candidates)
+        );
+    }
+
+    /// 2.2's `recursive` and `max_depth` ("the default is true with a bound", in
+    /// the schema's own words), so a rotation cannot scan a runaway tree: the
+    /// bounds are the spec's and not a policy of this file.
+    #[test]
+    fn the_walk_honours_recursive_and_the_depth_bound() {
+        let dir = scratch("depth");
+        let walls = dir.join("walls");
+        plant(&walls.join("top.png"), 2560, 1440);
+        plant(&walls.join("one").join("mid.png"), 2000, 1200);
+        plant(&walls.join("one").join("two").join("deep.png"), 2000, 1200);
+
+        assert_eq!(
+            origins(&enumerate(&table(&dir, ", \"recursive\": false"), &[])),
+            vec![walls.join("top.png").display().to_string()],
+            "`recursive` false is one level"
+        );
+        assert_eq!(
+            origins(&enumerate(&table(&dir, ", \"max_depth\": 1"), &[])),
+            vec![walls.join("top.png").display().to_string()],
+            "and the bound counts the same way"
+        );
+        let mut expected = vec![
+            walls.join("top.png").display().to_string(),
+            walls.join("one").join("mid.png").display().to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            origins(&enumerate(&table(&dir, ", \"max_depth\": 2"), &[])),
+            expected
+        );
+        assert_eq!(
+            enumerate(&table(&dir, ""), &[]).len(),
+            3,
+            "the default bound (8) reaches all of it"
         );
     }
 }
