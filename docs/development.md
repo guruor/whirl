@@ -1131,11 +1131,15 @@ scripts, and the restore is the last thing you run.
 This is macOS only. macOS is the only platform with a setter to test
 (`crates/whirl-worker/src/backend/macos.rs`), and that setter is real: `set()`
 calls `setDesktopImageURL:forScreen:options:error:` once per screen in
-`NSScreen.screens` order and reports `set_failed` if any screen refuses, so a
-`WHIRL_BACKEND=native` rotation either changes the desktop or tells you it did
-not. (Windows and Linux still answer `set_failed`, which is their truth: on those
-platforms nothing is set.) The per-platform checklists in section 3 stay where
-they are; this is the part of that work that must not leave a trace.
+`NSScreen.screens` order and reports `set_failed` if any screen refuses.
+`set_failed` does not mean nothing changed: the screens are written one at a time
+in that order and the call returns at the first screen that refuses, so the whole
+rotation is reported as a failure while the screens before the refusing one have
+already been set. A `WHIRL_BACKEND=native` rotation that ends in `set_failed` may
+therefore have moved some screens and not others. (Windows and Linux still answer
+`set_failed`, which is their truth: on those platforms nothing is set.) The
+per-platform checklists in section 3 stay where they are; this is the part of
+that work that must not leave a trace.
 
 ```sh
 # 1. The default, and what every test uses: no real set at all.

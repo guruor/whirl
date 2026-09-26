@@ -29,7 +29,7 @@ one, for a first pull request.
 ## Where the code is
 
 `crates/` is the Cargo workspace: `whirl-core`, `whirld`, `whirl-cli` and
-`whirl-worker`, four members and no third-party dependency, the tree
-`development.md` section 1 lays out. It landed with the first slice of the engine,
+`whirl-worker`, four members and no third-party dependency, the four crates
+`development.md` section 1 names. It landed with the first slice of the engine,
 pull request #1. Which of `development.md`'s commands have been run, and against
 what, is the status table at the top of that document.
