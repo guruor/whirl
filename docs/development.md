@@ -309,7 +309,7 @@ proves:
 | `artifacts` | the release build produces the three binaries |
 | `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
 | `linux` | CI's `clippy`, `test` and `artifacts` jobs as they run on `ubuntu-latest`, plus `guards`, again in the gate's container, so a Linux-only failure surfaces here rather than in CI. `fmt` is not repeated there: rustfmt's output does not depend on the operating system, and `local` has already run it |
-| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails three tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
+| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails two tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
 
 **What `all` leaves unproven**, so that the answer is here rather than inferred:
 
@@ -320,7 +320,7 @@ proves:
   nothing; `test (windows-latest)` on a Windows runner is the only thing that runs
   Windows code, and it is not something this machine can do (below).
 - **`linux-amd64`.** Deliberately outside `all`: on Apple silicon it is emulated
-  and it fails three tests that pass on real x86_64. Run it by hand when a change
+  and it fails two tests that pass on real x86_64. Run it by hand when a change
   touches something an architecture decides.
 
 `WHIRL_BACKEND=noop` is not a contributor's business any more: the script sets it
