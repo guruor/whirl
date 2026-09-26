@@ -200,14 +200,13 @@ impl Worker {
     /// `excl_file` fallback (8.8, 7.3 step 4): the parent holds the exit status,
     /// so the holder is provably gone and no liveness probe is needed.
     ///
-    /// It stays `None` wherever no child was reaped: the spawn paths that never
-    /// produced a worker, a `try_wait` that failed, and 1.7.1's deadline, where
-    /// `terminate` kills the child and this process does not wait for it. The
-    /// last one is deliberate and not a gap: 8.8's exception is "the worker the
-    /// daemon has just reaped", a killed child that was never waited for is not
-    /// that, and its `rotate.lock` is therefore left where it is and the sweep
-    /// defers (5.5 step 1) rather than being taken from a holder whose death this
-    /// process cannot vouch for.
+    /// It stays `None` wherever this process has no exit status to show: the
+    /// spawn paths that never produced a worker, and a `try_wait` that failed.
+    /// 1.7.1's deadline is the third. `terminate` does reap the child it kills
+    /// (it polls through `TERM_GRACE`, then sends `SIGKILL` and waits), but the
+    /// exit status stops there, because `WorkerError::Timeout` carries no pid.
+    /// Under 8.7's fallback a timed-out worker's `rotate.lock` is therefore left
+    /// where it is, and the sweep after it defers (5.5 step 1).
     pub(crate) fn run_reporting_reaped(
         &self,
         verb: Verb,
