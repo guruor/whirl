@@ -383,9 +383,11 @@ binary by the sha256 the release publishes next to it, and `scripts/ci.sh` build
 the tag from both pins, so changing either builds a new image rather than reusing
 the old one.
 
-The suite runs as the user who invoked the gate, never as root: `scripts/ci.sh`
-passes `--user "$(id -u):$(id -g)"`. That is the same arrangement CI has (its
-runner is not root) and it is what makes the mode worth running: one test in
+The suite runs as the user who invoked the gate, and as root only when the gate
+itself was invoked as root: `scripts/ci.sh` passes `--user "$(id -u):$(id -g)"`,
+the invoker's uid, so `sudo ./scripts/ci.sh linux` runs the suite as root and
+the `0o000` fixture fails again. That is the same arrangement CI has (its runner
+is not root) and it is what makes the mode worth running: one test in
 `crates/whirl-worker/src/sources/local.rs` plants a file with mode `0o000` and
 asserts that reading it fails, because a fixture a privileged uid can read proves
 nothing. A root container therefore could not be green on a clean tree, and
