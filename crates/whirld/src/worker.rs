@@ -258,8 +258,26 @@ fn failure_from(stderr: &str) -> WorkerError {
 /// `SIGTERM`, five seconds, then `SIGKILL` (1.7.1).
 ///
 /// `Child::kill` is `SIGKILL` on Unix and the standard library has no signal
-/// API, so the polite half goes through `kill(1)`, which exists on every Unix
-/// this build targets. A missing `kill` falls straight through to `SIGKILL`.
+/// API, so the polite half is handed to a `kill` program. What this module may
+/// not assume is that such a program is installed. The `kill` binary is
+/// `procps`' on Debian, `procps` is priority `important` rather than
+/// `required`, and the slim images this project builds and reviews in
+/// (`rust:1.85-slim`, `rust:1.94-slim-bookworm`, both arm64) therefore have no
+/// `kill` on `PATH`: `Command::new("kill")` there fails with `ENOENT` (code 2)
+/// before any signal exists. The error is discarded, so the shape of that
+/// failure is a silent one: the grace below runs its whole five seconds
+/// against a worker that was never told anything, and the run ends in
+/// `SIGKILL` alone. That is 1.7.1's grace with the polite half missing, not
+/// `SIGTERM` then `SIGKILL`, and it is why
+/// `a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace` fails
+/// in a container while passing on macOS.
+///
+/// It is not a PID 1 story, and measuring says so: under `cargo test` in that
+/// image, PID 1 is `cargo`, which forks the test binary, which forks the
+/// worker, so the worker is a grandchild with an ordinary PID (probe: worker
+/// PID 33, the script's own `$$` 33, while PID 1 held `sh`). Nothing here
+/// depends on PID 1's default dispositions; everything here depends on whether
+/// a `kill` binary exists.
 fn terminate(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
