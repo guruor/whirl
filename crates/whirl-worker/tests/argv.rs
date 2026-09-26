@@ -148,9 +148,15 @@ fn a_path_that_does_not_exist_is_no_candidates_and_names_the_path() {
         errors.contains(&absent.display().to_string()),
         "the path that failed is named: {errors}"
     );
+    // The errno text is the platform's, so the test asks the platform for it
+    // rather than hardcoding Unix's: the source reports the same
+    // `symlink_metadata` failure this line provokes.
+    let why = std::fs::symlink_metadata(&absent)
+        .expect_err("the path is still missing")
+        .to_string();
     assert!(
-        errors.contains("No such file or directory"),
-        "and so is the reason it failed: {errors}"
+        errors.contains(&why),
+        "and so is the reason it failed ({why}): {errors}"
     );
 }
 
