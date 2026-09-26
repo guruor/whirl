@@ -1,16 +1,18 @@
 //! The source factory: docs/spec/features.md 2.6's "one dispatch table", and the
 //! only place that knows which `kind`s this build can actually serve.
 //!
-//! **Empty on purpose.** `local` and `wallhaven` are each their own card, and
-//! neither has landed. Until one does, [`build`] answers `None` for every kind,
-//! [`Sources::from_config`] returns a table with no entries, and a rotation fails
-//! with `no_candidates` and the reason [`missing_reason`] names. That is the
-//! honest state of the build: the alternative, a test-only source compiled into
-//! this binary, would ship a `kind` the configuration schema does not describe.
+//! **One kind landed, one has not.** `local` is [`local`], behind the arm below.
+//! `wallhaven` is its own card: until it lands [`build`] answers `None` for it,
+//! a rotation cannot pick it, and `config check` reports it as `enabled=0` with
+//! the reason [`missing_reason`] names. That is the honest state of the build:
+//! the alternative, a test-only source compiled into this binary, would ship a
+//! `kind` the configuration schema does not describe.
 //!
 //! This module does not stand in for the sources. What it does is keep the
 //! pipeline's dependency one trait wide, so a source card adds an arm to
 //! [`build`] and a test in `pipeline.rs` supplies its own.
+
+mod local;
 
 use whirl_core::config::{Config, SourceConfig, SourceKind};
 use whirl_core::source::Source;
@@ -73,17 +75,20 @@ impl Sources {
     }
 }
 
-/// The dispatch table of features.md 2.6: one arm per kind, no logic. Both arms
-/// answer `None` until their card lands.
+/// The dispatch table of features.md 2.6: one arm per kind, no logic. Each arm is
+/// the whole line a source contributes, and a kind with no implementation answers
+/// `None` until its card lands.
 fn build(source: &SourceConfig) -> Option<Box<dyn Source>> {
     match source.kind {
-        SourceKind::Local => None,
+        SourceKind::Local => Some(local::source(source)),
         SourceKind::Wallhaven => None,
     }
 }
 
 /// Why a source could not be asked, for `enabled=0 reason=<...>`
-/// (docs/architecture.md 4.3).
+/// (docs/architecture.md 4.3). Only a kind with no arm in [`build`] can reach it,
+/// which today is `wallhaven`: a kind that has landed answers with its own
+/// `enabled=0 reason=...` from [`Source::validate`] instead.
 pub fn missing_reason(source: &SourceConfig) -> String {
     format!(
         "no implementation for kind {} in this build",

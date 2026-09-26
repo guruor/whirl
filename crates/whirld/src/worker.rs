@@ -191,6 +191,30 @@ impl Worker {
         run: u64,
         deadline: Duration,
     ) -> Result<Outcome, WorkerError> {
+        self.run_reporting_reaped(verb, target, run, deadline, &mut None)
+    }
+
+    /// The same run, with 8.8's proof attached: `reaped` is where the pid of the
+    /// child this process **has reaped** goes. That pid is the one thing that
+    /// entitles a take of `rotate.lock` to remove a lock file under 8.7's
+    /// `excl_file` fallback (8.8, 7.3 step 4): the parent holds the exit status,
+    /// so the holder is provably gone and no liveness probe is needed.
+    ///
+    /// It stays `None` wherever this process has no exit status to show: the
+    /// spawn paths that never produced a worker, and a `try_wait` that failed.
+    /// 1.7.1's deadline is **not** one of them. `terminate` reaps the child it
+    /// kills, in the grace window or after `SIGKILL`, and returns the pid of the
+    /// exit status it holds; the deadline branch reports that pid here, so a
+    /// timed-out worker's `rotate.lock` is removed by the sweep that follows
+    /// under 8.7's fallback like any other reaped worker's (7.3 step 4, 8.8).
+    pub(crate) fn run_reporting_reaped(
+        &self,
+        verb: Verb,
+        target: Option<&str>,
+        run: u64,
+        deadline: Duration,
+        reaped: &mut Option<u32>,
+    ) -> Result<Outcome, WorkerError> {
         let mut command = Command::new(&self.program);
         command
             .arg("--config")
@@ -253,11 +277,24 @@ impl Worker {
                 }
             }
             if Instant::now() >= deadline_at {
-                terminate(&mut child);
+                // 8.8's proof, on the path where the daemon does the killing:
+                // `terminate` reaped the child, so this pid's holder is provably
+                // gone and 7.3 step 4's sweep may remove that worker's
+                // `rotate.lock` under 8.7's `excl_file` fallback. Nothing extra
+                // is waited for -- the reap is the `try_wait`/`wait` 1.7.1's
+                // escalation already performed -- so a hung rotation still
+                // cannot keep this daemon from answering `status`.
+                *reaped = terminate(&mut child);
                 return Err(WorkerError::Timeout);
             }
             std::thread::sleep(POLL);
         };
+
+        // 8.8's proof, and the only place it is obtained: `try_wait` returned the
+        // exit status, so this process has reaped the child that held that pid.
+        // Every path that returns above this line leaves `reaped` exactly as the
+        // caller left it.
+        *reaped = Some(child.id());
 
         // Read after the exit. The contract caps stdout at two lines and stderr
         // at one, so the pipe buffer cannot be full; a worker that ignored the
@@ -386,10 +423,31 @@ fn failure_from(stderr: &str) -> WorkerError {
 ///   from this code, which passes `SIGTERM` and (in the test) `SIGNAL_NONE`,
 ///   both valid on every Unix here. It is a programming error, and it gets the
 ///   same line as the other two.
-fn terminate(child: &mut std::process::Child) {
+///
+/// **What it returns, and why that is now a value.** `Some(pid)` means this
+/// process holds that child's exit status: the grace-window `try_wait` returned
+/// it, or the `wait` after `SIGKILL` did. Holding the exit status of `pid` is
+/// 8.8's proof that the holder of `pid` is gone, and it is the one thing that
+/// entitles a take of `rotate.lock` to remove a lock file under 8.7's
+/// `excl_file` fallback (7.3 step 4), so the deadline branch of
+/// `run_reporting_reaped` reports it rather than dropping it. `None` is the two
+/// answers that show nothing: a `try_wait` that failed, and a `wait` that
+/// failed.
+///
+/// The `wait` is not new and its bound is not new: it is the blocking wait
+/// 1.7.1's escalation already performed after `SIGKILL`, read instead of
+/// discarded. It is bounded by the killed process's exit: a process the kernel
+/// cannot deliver `SIGKILL` to yet (uninterruptible I/O) has the kill pending,
+/// so the wait ends when that process does, and no poll loop changes that.
+/// Dropping the wait would leave this process without an exit status and the
+/// daemon without 8.8's exception, which is what this function is here to
+/// supply. A rotation that hangs costs the deadline path exactly what it cost
+/// before, and the daemon keeps answering `status` throughout, because the wait
+/// is on the rotation's own thread (1.7.1, 1.8).
+fn terminate(child: &mut std::process::Child) -> Option<u32> {
+    let pid = child.id();
     #[cfg(unix)]
     {
-        let pid = child.id();
         if let Err(error) = send_signal(pid, SIGTERM) {
             eprintln!("whirld: worker {pid}: SIGTERM: {error}");
         }
@@ -397,13 +455,15 @@ fn terminate(child: &mut std::process::Child) {
     let grace = Instant::now() + TERM_GRACE;
     while Instant::now() < grace {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            // The exit status, in hand: the child is reaped by this process.
+            Ok(Some(_)) => return Some(pid),
             Ok(None) => std::thread::sleep(POLL),
             Err(_) => break,
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    // `Ok` is the exit status of the killed child, so it too is a reap.
+    child.wait().ok().map(|_| pid)
 }
 
 /// `SIGTERM`: the polite half of 1.7.1. 15 on every Unix this build targets,
@@ -755,6 +815,19 @@ mod tests {
     /// one needs no `cfg`.
     const ESRCH: i32 = 3;
 
+    /// How many times a deadline test repeats a run in which the worker never
+    /// reached its own first write, with the deadline tripled each time.
+    ///
+    /// `DEADLINE` owns the reason the first attempt can lose that race: the child
+    /// has to be forked, exec'd and given a slice of CPU before anything of the
+    /// script runs, and the deadline is already counting. `DEADLINE`'s evidence
+    /// was a busy machine losing it once in eight; a machine at load average 44
+    /// on eight cores loses it about once in ten, which is what this corrects
+    /// for. The retries are of the *precondition* only: every run still has to
+    /// end in the deadline, the reap is asserted on the first run that has the
+    /// worker's pid, and a first attempt that gets there is the only attempt.
+    const START_UP_ATTEMPTS: u32 = 3;
+
     /// `kill(2)`'s own existence question: signal 0 is never delivered, it only
     /// asks whether the pid is there and whether this process could signal it.
     /// The test below leans on that to prove the killed worker is gone. It lives
@@ -855,6 +928,15 @@ mod tests {
     /// that killed alongside the signal fails 3 and 4; one that returned without
     /// killing leaves the process alive and fails the `kill(pid, 0)` probe.
     ///
+    /// A fifth fact, and it is 8.8's rather than 1.7.1's: the deadline's
+    /// `SIGKILL` is a reap, so `run_reporting_reaped` reports the pid whose exit
+    /// status this process holds, and 7.3 step 4's sweep can therefore remove
+    /// that worker's `rotate.lock` under 8.7's `excl_file` fallback. This is the
+    /// branch of `terminate` where `SIGKILL` was needed and the `wait` after it
+    /// supplied the exit status; the run that dies on `SIGTERM` alone is the
+    /// other branch, and `the_deadline_reports_the_pid_of_a_worker_that_dies_on_sigterm`
+    /// is that one.
+    ///
     /// What it still cannot see: the instant of the signal itself, any closer
     /// than `TOLERANCE` early and `SLACK` late, and the signal by number. The
     /// signal is observed only through the shell's trap table, so this says
@@ -884,7 +966,7 @@ mod tests {
         let pid = scripts.path("pid.txt");
 
         let mut arming = Vec::new();
-        let (outcome, elapsed, termed_at) = loop {
+        let (outcome, elapsed, termed_at, reaped) = loop {
             // A discarded run leaves its own pid file behind, and a stale one
             // would tell the arm check below about the run before it.
             let _ = fs::remove_file(&pid);
@@ -903,7 +985,12 @@ mod tests {
             // trap a signal at all, and the check below needs that answer even
             // when the marker never appears.
             let watch = TermWatch::new([pid.clone(), marker.clone()]);
-            let outcome = worker(program).run(Verb::Rotate, None, 7, DEADLINE);
+            // Declared inside the loop, so every attempt reports the child it
+            // spawned: a discarded attempt spawns and reaps one too, and the pid
+            // it holds must not outlive the attempt it belongs to.
+            let mut reaped = None;
+            let outcome =
+                worker(program).run_reporting_reaped(Verb::Rotate, None, 7, DEADLINE, &mut reaped);
             let elapsed = started.elapsed();
             let [armed_at, termed_at] = watch.moment();
             let armed_at = armed_at.map(|moment| moment.duration_since(started));
@@ -911,7 +998,7 @@ mod tests {
             arming.push(armed_at);
 
             if let Some(termed_at) = termed_at {
-                break (outcome, elapsed, termed_at);
+                break (outcome, elapsed, termed_at, reaped);
             }
 
             // No trap ran. A child whose handler was in place before the deadline
@@ -972,6 +1059,11 @@ mod tests {
         );
 
         let pid: u32 = scripts.text("pid.txt").trim().parse().expect("a pid");
+        assert_eq!(
+            reaped,
+            Some(pid),
+            "8.8: 1.7.1's `SIGKILL` is a reap, so the run reports the pid whose exit status it holds, which is what 7.3 step 4's sweep removes a leftover `rotate.lock` on"
+        );
         // Through the same syscall the daemon just used, so this probe is not
         // itself a reason for the test to fail on an image with no `kill(1)`
         // binary (see `terminate`): signal 0 is `kill(2)`'s own existence
@@ -982,6 +1074,122 @@ mod tests {
         assert!(
             matches!(&probe, Err(error) if error.raw_os_error() == Some(ESRCH)),
             "the worker was killed and reaped, so {pid} is gone: {probe:?}"
+        );
+    }
+
+    /// The deadline's other reap, and the cheap one: a worker that dies on
+    /// `SIGTERM` alone is reaped inside the grace window, so `terminate` reports
+    /// it from the `try_wait` of that loop rather than from the `wait` after a
+    /// `SIGKILL`. The fact is the same one 8.8 rests on -- this process holds
+    /// the exit status, so the holder of that pid is provably gone -- and it
+    /// arrives earlier and without an escalation, which is the branch a worker
+    /// honouring 1.7.1's polite signal actually takes.
+    ///
+    /// Both branches are asserted, because a `terminate` that reported the pid
+    /// only after `SIGKILL` (or only in the grace window) would satisfy one test
+    /// and not the other.
+    ///
+    /// The run is retried while the machine loses the worker's start-up race to
+    /// the deadline, per `START_UP_ATTEMPTS`; the reap below is not retried.
+    #[test]
+    fn the_deadline_reports_the_pid_of_a_worker_that_dies_on_sigterm() {
+        let scripts = Scripts::new("deadline-term");
+        let pid = scripts.path("pid.txt");
+        // No `trap` line: the shell's default action for `SIGTERM` is to die, so
+        // this worker is gone within a poll of the signal and the grace window
+        // never elapses. The cost is the deadline, not the deadline plus the
+        // grace.
+        let program = scripts.script(
+            "polite.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nwhile :; do sleep 0.05; done\n",
+                pid.display()
+            ),
+        );
+
+        // `START_UP_ATTEMPTS` is why this is a loop and not one run: the child has
+        // to be forked, exec'd and given a slice of CPU before it can write its
+        // pid, and a machine under load can lose that race to `DEADLINE`. A run
+        // whose worker never wrote is a run with no worker in it -- nothing is
+        // reaped in it that the daemon could be blamed for -- so it is the
+        // precondition that is retried, with the deadline tripled. The assertion
+        // below is made on the first run that has the file and is never retried.
+        let mut worker_pid: Option<u32> = None;
+        let mut reaped = None;
+        let mut run = 3;
+        for attempt in 0..START_UP_ATTEMPTS {
+            run += 1;
+            reaped = None;
+            let outcome = worker(program.clone()).run_reporting_reaped(
+                Verb::Rotate,
+                None,
+                run,
+                DEADLINE * 3u32.pow(attempt),
+                &mut reaped,
+            );
+
+            assert!(
+                matches!(outcome, Err(WorkerError::Timeout)),
+                "the deadline expired, whatever the worker did on the way out: {outcome:?}"
+            );
+            match fs::read_to_string(&pid) {
+                Ok(text) => {
+                    worker_pid = Some(text.trim().parse().expect("a pid"));
+                    break;
+                }
+                // The child never reached its first statement. That is the
+                // start-up race and not a reading about the daemon: retry.
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => panic!("the worker's pid file: {error}"),
+            }
+        }
+        let worker_pid = worker_pid.unwrap_or_else(|| {
+            panic!(
+                "no worker reached its pid in {START_UP_ATTEMPTS} runs of {DEADLINE:?} and wider: this machine could not start a process inside any of them, so this is the start-up race `DEADLINE` describes and nothing is known about the daemon"
+            )
+        });
+        assert_eq!(
+            reaped,
+            Some(worker_pid),
+            "the grace window reaped it, and the exit status is the proof 8.8 asks for"
+        );
+        let probe = send_signal(worker_pid, SIGNAL_NONE);
+        assert!(
+            matches!(&probe, Err(error) if error.raw_os_error() == Some(ESRCH)),
+            "the reap is real: {worker_pid} is gone: {probe:?}"
+        );
+    }
+
+    /// The other answer of `terminate`, pinned so that the deadline's assignment
+    /// is not read as "always a pid": a spawn that never produced a worker has
+    /// no exit status to show, so `reaped` is left exactly as the caller left it
+    /// and 8.8's exception has nothing to act on.
+    #[test]
+    fn a_spawn_that_never_produced_a_worker_reports_no_reaped_pid() {
+        let scripts = Scripts::new("no-worker");
+        let mut reaped = None;
+
+        let outcome = worker(scripts.path("absent.sh")).run_reporting_reaped(
+            Verb::Rotate,
+            None,
+            1,
+            generous(),
+            &mut reaped,
+        );
+
+        assert!(
+            matches!(
+                outcome,
+                Err(WorkerError::Failed {
+                    code: ErrorCode::WorkerFailed,
+                    ..
+                })
+            ),
+            "a program that is not there is 2.7's `worker_failed`: {outcome:?}"
+        );
+        assert_eq!(
+            reaped, None,
+            "no worker existed, so this process holds no exit status and names no pid"
         );
     }
 

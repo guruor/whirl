@@ -21,6 +21,29 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The harness's own bound for every wait on the daemon, read off the spec's
+/// timeout table rather than chosen. The row that decides it is
+/// `docs/architecture.md:715` (the card that sent this work cites the same row
+/// as `:699`, which is where it sat before the table moved down 16 lines at
+/// `3e2c84c`):
+///
+/// > rotation request timeout | 300 s | Deliberately equal to the worker
+/// > deadline: a client must not give up before the daemon does, or it will
+/// > report a failure for a rotation that then succeeds
+///
+/// `:714` (`connection_idle_timeout`, 300 s: "no client that waits as long as
+/// the prototype's does is ever cut off") and `:716`
+/// (`schedule.worker_deadline_seconds`, 300 s) set the same number from the
+/// daemon's side. A harness bound tighter than that asserts a contract the
+/// daemon never made: 30 s here against a 300 s worker deadline is a client
+/// giving up while the rotation it waits on is still running, and it reports
+/// that as a test failure.
+///
+/// One constant, cited once, because the defect it fixes was drift: `ask` said
+/// 30 s per recv, the bind wait 15 s, the CLI wait 30 s, and each was tighter
+/// than the contract it waited on.
+const CLIENT_BOUND: Duration = Duration::from_secs(300);
+
 struct Daemon {
     child: Child,
     dir: PathBuf,
@@ -40,8 +63,10 @@ impl Daemon {
     /// the greeting, in order.
     fn ask(&self, request: &str) -> Vec<String> {
         let stream = UnixStream::connect(&self.socket).expect("a connection to the daemon");
+        // `docs/architecture.md:715`: the rotation request timeout is 300 s, so a
+        // client reading this connection never gives up before the daemon does.
         stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(CLIENT_BOUND))
             .expect("a read timeout");
         let mut reader = BufReader::new(stream.try_clone().expect("a clone for reading"));
         let mut writer = stream;
@@ -101,9 +126,7 @@ fn start_without_whirl_config(name: &str) -> Daemon {
 /// One temporary tree per test, and the one place `spawn_daemon`'s third
 /// argument is decided.
 fn start_with(name: &str, whirl_config: bool, prepare: impl FnOnce(&Path)) -> Daemon {
-    let dir = std::env::temp_dir().join(format!("whirl-t{}-{}", std::process::id(), short(name)));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a temporary directory");
+    let dir = tree(name);
     let socket = dir.join("run").join("whirl.sock");
     prepare(&dir);
     Daemon {
@@ -113,9 +136,45 @@ fn start_with(name: &str, whirl_config: bool, prepare: impl FnOnce(&Path)) -> Da
     }
 }
 
+/// The empty tree a test owns: `cargo test` runs these in parallel inside one
+/// process, so the name carries the test's own identity and the pid.
+fn tree(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("whirl-t{}-{}", std::process::id(), short(name)));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a temporary directory");
+    dir
+}
+
 /// The config file this daemon read: `WHIRL_CONFIG`, resolved in `spawn_daemon`.
 fn config_path(daemon: &Daemon) -> PathBuf {
     daemon.dir.join("config.json")
+}
+
+/// A config this test owns and can predict, written before the daemon starts and
+/// therefore the file it reads instead of 4.2's annotated default.
+///
+/// It exists because the default's `local` source points at `~/Pictures/Wallpapers`
+/// and `/Volumes/Media/walls`, and the `local` kind has an implementation: the
+/// `candidates=`/`admitted=` counters in a `config check` response would then be
+/// this machine's count, which is the one thing a byte-for-byte assertion cannot
+/// be built on. Here the source's directory is inside the test's own tree and is
+/// left empty, so every counter is zero on every machine, and the two sources and
+/// their weights are 4.2's own (`sources=2` in the `plan:` line is unchanged).
+///
+/// This file is `#![cfg(unix)]`, so the path needs no JSON escaping.
+fn write_local_config(dir: &Path) {
+    let walls = dir.join("walls");
+    std::fs::create_dir_all(&walls).expect("the source's directory");
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"sources\": [\n    \
+             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [\"{}\"] }},\n    \
+             {{ \"id\": \"space\", \"kind\": \"wallhaven\", \"weight\": 3, \"query\": \"landscape\" }}\n  ]\n}}\n",
+            walls.display()
+        ),
+    )
+    .expect("the test's own config");
 }
 
 /// The platform default config path of docs/architecture.md 4.2's `socket`
@@ -145,7 +204,19 @@ fn default_config_path(home: &Path) -> PathBuf {
 /// one) and points `HOME` at `dir`, so the daemon resolves the documented
 /// platform default: inside this test's tree, never the user's own config.
 fn spawn_daemon(dir: &Path, socket: &Path, whirl_config: bool) -> Child {
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_whirld"));
+    spawn_daemon_at(&daemon_binary(), dir, socket, whirl_config)
+}
+
+/// The daemon `cargo test` built.
+fn daemon_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_whirld"))
+}
+
+/// The same spawn, from a program path the caller names: the daemon resolves
+/// `whirl-worker` next to its own executable (`whirld`'s `worker::default_program`),
+/// so a test that copies the daemon into its own tree is how the slow-worker test
+/// gives the daemon a worker of its own.
+fn spawn_daemon_at(executable: &Path, dir: &Path, socket: &Path, whirl_config: bool) -> Child {
     let worker = executable
         .parent()
         .expect("the executable has a directory")
@@ -158,8 +229,9 @@ fn spawn_daemon(dir: &Path, socket: &Path, whirl_config: bool) -> Child {
 
     // The daemon's stderr goes to a file, never to this process's: a child that
     // inherited the test harness's pipe would hold it open past the run.
-    let log = std::fs::File::create(dir.join("daemon.log")).expect("a log file");
-    let mut command = Command::new(&executable);
+    let log_path = dir.join("daemon.log");
+    let log = std::fs::File::create(&log_path).expect("a log file");
+    let mut command = Command::new(executable);
     command
         .env("WHIRL_SOCKET", socket)
         .env("WHIRL_STATE_DIR", dir.join("state"))
@@ -178,24 +250,70 @@ fn spawn_daemon(dir: &Path, socket: &Path, whirl_config: bool) -> Child {
             // `socket` comment); removing it makes `~/.config` the arm in force.
             .env_remove("XDG_CONFIG_HOME");
     }
-    let child = command.spawn().expect("the daemon starts");
+    let mut child = command.spawn().expect("the daemon starts");
 
     // Ready means "accepting connections", not "the path exists": a restart over
     // the same directory has a stale socket file from the daemon that just died,
     // and the new one has to remove it before it can bind.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    //
+    // The bound is the spec's, not this file's (`docs/architecture.md:714-715`:
+    // a client waiting on the daemon waits 300 s, and 2.8's table has no
+    // daemon-startup row at all). 15 s was the harness asserting more than the
+    // daemon promised, and start-up latency past 5 s has been measured under
+    // load. What keeps the wider bound honest is the child check: a daemon that
+    // refused, exited or crashed fails here at once, with its exit status and
+    // its log, instead of waiting the deadline out.
+    let deadline = Instant::now() + CLIENT_BOUND;
     loop {
         if UnixStream::connect(socket).is_ok() {
             break;
         }
+        if let Some(status) = child.try_wait().expect("the daemon child is waited on") {
+            panic!(
+                "the daemon exited ({status}) before it bound {}; see {}",
+                socket.display(),
+                log_path.display()
+            );
+        }
         assert!(
             Instant::now() < deadline,
-            "the daemon did not bind {} in 15 s",
-            socket.display()
+            "the daemon did not bind {} in {} s",
+            socket.display(),
+            CLIENT_BOUND.as_secs()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
     child
+}
+
+/// A daemon whose `whirl-worker` is this test's own program: a copy of the real
+/// `whirld` inside the test's tree, so the sibling the daemon resolves is the
+/// file the closure writes. Nothing here replaces anything the rest of the suite
+/// runs: the copy is why the shim cannot leak into the built `whirl-worker` that
+/// every other daemon in this file spawns.
+fn start_with_its_own_worker(name: &str, worker: impl FnOnce(&Path) -> String) -> Daemon {
+    let dir = tree(name);
+    let executable = dir.join("whirld");
+    std::fs::copy(daemon_binary(), &executable).expect("a copy of the daemon");
+    make_executable(&executable);
+    let script = dir.join("whirl-worker");
+    std::fs::write(&script, worker(&dir)).expect("the worker program");
+    make_executable(&script);
+    let socket = dir.join("run").join("whirl.sock");
+    Daemon {
+        child: spawn_daemon_at(&executable, &dir, &socket, true),
+        dir,
+        socket,
+    }
+}
+
+/// A path this process may exec.
+fn make_executable(path: &Path) {
+    let mut permissions = std::fs::metadata(path)
+        .expect("the file exists")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("an executable file");
 }
 
 fn mode(path: &Path) -> u32 {
@@ -495,15 +613,19 @@ const PLAN_CHECK: &str = "plan: schedule.interval_seconds=1800 schedule.worker_d
 /// config order, then exactly one `plan:` line. The two sources are 4.2's, in its
 /// order, with its weights.
 ///
-/// `last` is `-` here because a check has no outcome to report (2.6). `enabled=0`
-/// with the reason and no bracketed counter group: no `kind` has an
-/// implementation in this build, so no source can be enumerated and nothing can
-/// be counted. 4.3 fixes that form and 2.6 says the group is optional; the group
-/// arrives with each source's own card.
+/// `last` is `-` here because a check has no outcome to report (2.6). The
+/// `local` source has `enabled=1` and its counter group, because its kind has an
+/// implementation in this build; `wallhaven` keeps `enabled=0` and the reason,
+/// because its kind does not. 4.3 fixes the second form and 2.6 says the group is
+/// optional, which is what lets one response carry both.
+///
+/// Every counter is zero and the reason is `-`: `write_local_config` points the
+/// source at an empty directory inside this test's own tree, so the assertion is
+/// the record's shape rather than a machine's count of its own pictures.
 fn config_check_lines() -> Vec<String> {
     vec![
         "queued".to_string(),
-        "source: pictures local weight=1 enabled=0 last=- reason=no implementation for kind local in this build"
+        "source: pictures local weight=1 enabled=1 last=- candidates=0 admitted=0 rejected_resolution=0 rejected_ratio=0 rejected_size=0 rejected_type=0 rejected_dedupe=0 reason=-"
             .to_string(),
         "source: space wallhaven weight=3 enabled=0 last=- reason=no implementation for kind wallhaven in this build"
             .to_string(),
@@ -522,7 +644,10 @@ fn config_check_lines() -> Vec<String> {
 /// asserted separately.
 #[test]
 fn config_check_reports_the_sources_and_the_plan() {
-    let daemon = start("config_check_reports_the_sources_and_the_plan");
+    let daemon = start_prepared(
+        "config_check_reports_the_sources_and_the_plan",
+        write_local_config,
+    );
     let lines = daemon.ask("config check");
     assert_eq!(lines[0], "OK whirl 0.1.0 protocol 2", "the greeting (2.4)");
     assert_eq!(lines.last().map(String::as_str), Some("OK"));
@@ -836,8 +961,24 @@ fn refusals_name_their_code_and_the_line_protocol_holds() {
         "{unknown:?}"
     );
     // A second daemon on the same socket refuses rather than unlinks it (1.5).
+    //
+    // Its state and cache roots are its own, inside this test's tree: 4.3 makes
+    // a daemon that is spawned without those two names resolve them from the
+    // platform default, and on this machine the platform default is the user's
+    // own `~/Library/Application Support/whirl` and `~/Library/Caches/whirl`.
+    // Leaving them out is two defects rather than one: the run locks and writes
+    // the user's real state directory and sweeps the user's real cache root, and
+    // the refusal the assertion below reads becomes whichever one start-up
+    // reaches first, so a suite run fails against another suite run's daemon
+    // (`state/locks/daemon.lock is held by pid ...`) instead of against this
+    // test's own live socket. They are separate from the first daemon's for the
+    // same reason: 1.5 step 1 takes the state lock before step 5 probes the
+    // socket, so sharing the state directory would refuse it one step too early
+    // and never reach the socket this test is about.
     let second = Command::new(env!("CARGO_BIN_EXE_whirld"))
         .env("WHIRL_SOCKET", &daemon.socket)
+        .env("WHIRL_STATE_DIR", daemon.dir.join("second-state"))
+        .env("WHIRL_CACHE_DIR", daemon.dir.join("second-cache"))
         .env("WHIRL_CONFIG", daemon.dir.join("config.json"))
         .output()
         .expect("the second daemon runs");
@@ -881,7 +1022,9 @@ fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
         .spawn()
         .expect("the CLI starts");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // The CLI is a client waiting on the daemon, so its bound is the spec's too:
+    // `docs/architecture.md:715` gives a client 300 s before it may give up.
+    let deadline = Instant::now() + CLIENT_BOUND;
     let status = loop {
         match child.try_wait().expect("the CLI is waited on") {
             Some(status) => break status,
@@ -890,9 +1033,10 @@ fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!(
-                        "`whirl {}` did not answer in 30 s: the client is waiting for a line \
+                        "`whirl {}` did not answer in {} s: the client is waiting for a line \
                          that never arrived",
-                        args.join(" ")
+                        args.join(" "),
+                        CLIENT_BOUND.as_secs()
                     );
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -919,7 +1063,10 @@ fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
 /// has to terminate its request line, or both ends wait forever.
 #[test]
 fn the_clis_quickstart_commands_answer_over_the_real_socket() {
-    let daemon = start("the_clis_quickstart_commands_answer_over_the_real_socket");
+    let daemon = start_prepared(
+        "the_clis_quickstart_commands_answer_over_the_real_socket",
+        write_local_config,
+    );
 
     let (ok, status) = whirl(&daemon, &["status"]);
     assert!(ok, "{status}");
@@ -941,8 +1088,10 @@ fn the_clis_quickstart_commands_answer_over_the_real_socket() {
     // `OK` is the terminator and is not printed as a data line (2.5.1).
     assert!(!status.contains("\nOK\n"), "{status}");
 
-    // `set <path>` rather than `next`: no source has an implementation in this
-    // build, so only a manual set reaches a real worker and a real `set:` line.
+    // `set <path>` rather than `next`: this daemon runs 4.2's default config,
+    // whose `local` source points into the user's own home and whose `wallhaven`
+    // has no implementation in this build. A manual set is the route to a real
+    // worker and a real `set:` line that does not depend on the machine.
     let file = daemon.dir.join("quickstart.png");
     std::fs::write(&file, b"a file the quickstart sets").expect("a file to set");
     let (ok, next) = whirl(&daemon, &["set", &file.display().to_string()]);
@@ -1231,7 +1380,7 @@ fn subscribe_streams_one_event_per_state_change() {
     let daemon = start("subscribe_streams_one_event_per_state_change");
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone for reading"));
     let mut writer = stream;
@@ -1263,9 +1412,10 @@ fn subscribe_streams_one_event_per_state_change() {
     // to rotate on. Two events is what [M 12]'s duplicate wake had to be
     // replaced by (2.9).
     //
-    // The state change is a manual `set path`: no source has an implementation in
-    // this build, so `next` would reach the worker and fail, which is the test
-    // below. Either route takes a slot and produces the two events.
+    // The state change is a manual `set path`: this daemon runs 4.2's default
+    // config, so what a rotation finds is the machine's business (`wallhaven`
+    // has no implementation in this build, and the `local` source points into
+    // the user's home). Either route takes a slot and produces the two events.
     let file = daemon.dir.join("streamed.png");
     std::fs::write(&file, b"a file the stream set").expect("a file to set");
     let rotation = daemon.ask(&format!("set path {}", file.display()));
@@ -1357,7 +1507,7 @@ fn a_failed_rotation_is_visible_on_both_planes() {
 
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1444,7 +1594,7 @@ fn subscribe_reports_the_gap_for_a_resume_point() {
     assert_eq!(daemon.ask("resume").last().map(String::as_str), Some("OK"));
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1469,9 +1619,9 @@ fn subscribe_reports_the_gap_for_a_resume_point() {
 #[test]
 fn the_state_files_are_written_and_read_back_across_a_restart() {
     let mut daemon = start("the_state_files_are_written_and_read_back_across_a_restart");
-    // A manual `set path` rather than `next`: no source has an implementation in
-    // this build, so only a manual set reaches a real worker and a real `set:`
-    // line to record.
+    // A manual `set path` rather than `next`: this daemon runs 4.2's default
+    // config, so whether a rotation finds anything is the machine's business. A
+    // manual set is the route to a real worker and a real `set:` line to record.
     let file = daemon.dir.join("state.png");
     std::fs::write(&file, b"a file the state test set").expect("a file to set");
     assert_eq!(
@@ -1679,7 +1829,7 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     // An unknown verb: refused, and the connection keeps answering (2.7).
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1701,7 +1851,7 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     // A line past `MAX_REQUEST_LINE`: refused, and the connection ends (2.2).
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1725,7 +1875,7 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     // A line that is not UTF-8: the framing refusal, and the connection ends.
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1747,7 +1897,7 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     // code, and the connection ends.
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1772,4 +1922,359 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     assert_eq!(value(&lines, "seq"), "1");
     assert_eq!(value(&lines, "rotating"), "0");
     assert_eq!(value(&lines, "state_corrupt"), "-");
+}
+
+/// A PNG header only: the magic and the IHDR chunk, which is all 2.5's
+/// `resolution` stage reads (the `whirl-worker` fixtures plant the same shape).
+/// The two sizes are above the 1600x900 floors 4.2 ships, so nothing in the
+/// pipeline rejects them on this machine or on any other.
+fn rotation_png(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes
+}
+
+/// A config whose only source is `walls`, so a rotation has exactly the images
+/// the test planted: no second source, and no counter that depends on the
+/// machine the test runs on.
+///
+/// `mode` is written into the source's own object, which is where `local.mode`
+/// lives (features.md 2.2). Each rotation test below names the arm it is about:
+/// `None` is the config a user who never touches `mode` has, and a test that
+/// asserts a cache file while the config means `reference` would assert the
+/// defect this key is read for in the first place.
+fn write_rotation_config(dir: &Path, walls: &Path, mode: Option<&str>) {
+    let mode_key = match mode {
+        Some(mode) => format!(", \"mode\": \"{mode}\""),
+        None => String::new(),
+    };
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"sources\": [\n    \
+             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [\"{}\"]{mode_key} }}\n  ]\n}}\n",
+            walls.display()
+        ),
+    )
+    .expect("the test's own config");
+}
+
+/// How many files a directory holds, at any depth, counting a directory that is
+/// not there as none. `cache/sha256/` is made by the first store and by nothing
+/// else (state-and-cache section 3 step 2), so in reference mode it need not
+/// exist at all.
+fn count_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += count_files(&path);
+        } else {
+            total += 1;
+        }
+    }
+    total
+}
+
+/// The four fields of 2.6's `set:` line: `<digest> <origin_key> <via> <path>`.
+fn set_fields(lines: &[String]) -> Vec<String> {
+    let line = lines
+        .iter()
+        .find(|line| line.starts_with("set: "))
+        .unwrap_or_else(|| panic!("a set line in {lines:?}"));
+    line["set: ".len()..]
+        .split(' ')
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `local` source's rotation in features.md 2.2's `copy`, end to end and
+/// over the real socket: two images in the configured directory, `next` twice,
+/// and the second answer is the other image rather than the one already set
+/// (4.1's window).
+///
+/// Every claim is checked against the filesystem, not against the answer alone:
+/// the `set:` line's path has to exist inside this daemon's own cache root, the
+/// bytes there have to be one of the two planted files, and `history.json` has
+/// to name both origins. The third `next` is 4.1's exhaustion case: with two
+/// candidates and both in the window, the source stage has nothing left, and the
+/// failure is the named one rather than a repeat.
+///
+/// The mode is named because every assertion above is a claim about the cache,
+/// and 2.2's default is the arm that writes none: without the key this test ran
+/// in `reference` while asserting a cache file, which is what made it pass over
+/// a rotation that was pointing the platform at the user's own folder.
+/// `a_local_source_in_reference_mode_sets_the_planted_file_and_admits_nothing`
+/// is the same rotation in the other arm.
+///
+/// The worker the daemon spawns is the binary `cargo test --workspace` builds
+/// next to the daemon (this file's module doc), so a `-p whirld` run after a
+/// `whirl-worker` edit can test a stale one: build the workspace when the source
+/// changed.
+#[test]
+fn a_local_source_in_copy_mode_rotates_and_the_second_next_is_the_other_image() {
+    let planted: Vec<(&str, Vec<u8>)> = vec![
+        ("wide.png", rotation_png(2560, 1440)),
+        ("narrow.png", rotation_png(2048, 1152)),
+    ];
+    let daemon = start_prepared(
+        "a_local_source_in_copy_mode_rotates_and_the_second_next_is_the_other_image",
+        |dir| {
+            let walls = dir.join("walls");
+            std::fs::create_dir_all(&walls).expect("the source's directory");
+            for (name, bytes) in &planted {
+                std::fs::write(walls.join(name), bytes).expect("a planted image");
+            }
+            write_rotation_config(dir, &walls, Some("copy"));
+        },
+    );
+
+    let cache_root = daemon.dir.join("cache");
+    let first = set_fields(&daemon.ask("next"));
+    assert_eq!(first.len(), 4, "set: <digest> <origin_key> <via> <path>");
+    assert_eq!(first[2], "source", "a rotation sets through a source (2.6)");
+    assert!(
+        first[1].starts_with("pictures:"),
+        "the origin key is the source's id and its candidate's id: {}",
+        first[1]
+    );
+    let first_path = PathBuf::from(&first[3]);
+    assert!(
+        first_path.starts_with(&cache_root),
+        "the cache file is inside the root this daemon resolved: {}",
+        first_path.display()
+    );
+    let first_bytes = std::fs::read(&first_path).expect("the first cache file");
+    assert!(
+        planted.iter().any(|(_, bytes)| bytes == &first_bytes),
+        "the bytes in the cache are the image the source offered"
+    );
+
+    let second = set_fields(&daemon.ask("next"));
+    assert_ne!(
+        first[0], second[0],
+        "the second `next` is a different image: one candidate was set and the other was not (4.1)"
+    );
+    assert_ne!(first[1], second[1], "two files, two origins");
+    let second_bytes = std::fs::read(Path::new(&second[3])).expect("the second cache file");
+    assert!(
+        planted.iter().any(|(_, bytes)| bytes == &second_bytes),
+        "the second cache file is the other planted image"
+    );
+    assert_ne!(first_bytes, second_bytes, "two images, not one twice");
+
+    let history = std::fs::read_to_string(daemon.dir.join("state").join("history.json"))
+        .expect("the history ring");
+    for fields in [&first, &second] {
+        assert!(
+            history.contains(&fields[0]) && history.contains(&fields[1]),
+            "history.json records {} / {}: {history}",
+            fields[0],
+            fields[1]
+        );
+    }
+    assert_eq!(
+        history.matches("\"origin_key\"").count(),
+        2,
+        "two rotations, two entries: {history}"
+    );
+    assert_eq!(value(&daemon.ask("history 5"), "count"), "2");
+
+    let third = daemon.ask("next");
+    assert!(
+        third
+            .iter()
+            .any(|line| line.starts_with("ERR no_candidates")),
+        "both candidates are in the window, so the third `next` is exhaustion, not a repeat: {third:?}"
+    );
+}
+
+/// The same rotation in features.md 2.2's default, which is `reference`: the
+/// platform is pointed at the user's own file and the cache gains nothing.
+///
+/// The config writes no `mode`, so this is the arm a user who never edits the
+/// key actually runs. The claims: the `set:` line's path is one of the two
+/// planted files and not a cache path; `cache/sha256/` holds what it held
+/// before, which is nothing, on both sides of the rotation; the planted bytes
+/// are untouched, because whirl set the file the user already had rather than a
+/// copy of it; the second `next` is the other image, because 4.1's window is
+/// built from the `origin_key` and not from a cache entry; and the third is the
+/// named exhaustion rather than a repeat.
+///
+/// features.md 105's no-op pin is that same fact from the cache's side, and the
+/// `sha256/` assertion is where it is pinned: a pin is a digest, the digest is
+/// the cache filename (state-and-cache 6.2), and there is no file here to name.
+#[test]
+fn a_local_source_in_reference_mode_sets_the_planted_file_and_admits_nothing() {
+    let planted: Vec<(&str, Vec<u8>)> = vec![
+        ("wide.png", rotation_png(2560, 1440)),
+        ("narrow.png", rotation_png(2048, 1152)),
+    ];
+    let name = "a_local_source_in_reference_mode_sets_the_planted_file_and_admits_nothing";
+    let daemon = start_prepared(name, |dir| {
+        let walls = dir.join("walls");
+        std::fs::create_dir_all(&walls).expect("the source's directory");
+        for (file, bytes) in &planted {
+            std::fs::write(walls.join(file), bytes).expect("a planted image");
+        }
+        write_rotation_config(dir, &walls, None);
+    });
+
+    let cache_root = daemon.dir.join("cache");
+    assert_eq!(
+        count_files(&cache_root.join("sha256")),
+        0,
+        "the fixture starts with nothing in the cache"
+    );
+
+    let first = set_fields(&daemon.ask("next"));
+    assert_eq!(first.len(), 4, "set: <digest> <origin_key> <via> <path>");
+    assert_eq!(first[2], "source", "a rotation sets through a source (2.6)");
+    assert!(
+        first[1].starts_with("pictures:"),
+        "the origin key is the source's id and its candidate's id: {}",
+        first[1]
+    );
+    let first_path = PathBuf::from(&first[3]);
+    assert!(
+        !first_path.starts_with(&cache_root),
+        "reference mode sets the user's own file, never a copy: {}",
+        first_path.display()
+    );
+    let planted_path = planted
+        .iter()
+        .map(|(file, _)| daemon.dir.join("walls").join(file))
+        .find(|path| *path == first_path)
+        .unwrap_or_else(|| {
+            panic!(
+                "the path the platform was given is one of the planted files: {}",
+                first_path.display()
+            )
+        });
+    let planted_bytes = planted
+        .iter()
+        .find(|(file, _)| daemon.dir.join("walls").join(file) == planted_path)
+        .map(|(_, bytes)| bytes.clone())
+        .expect("the planted bytes");
+    assert_eq!(
+        std::fs::read(&planted_path).expect("the planted file"),
+        planted_bytes,
+        "the user's own file is what was set, byte for byte"
+    );
+    assert_eq!(
+        count_files(&cache_root.join("sha256")),
+        0,
+        "and nothing was admitted to the cache"
+    );
+
+    let second = set_fields(&daemon.ask("next"));
+    assert_ne!(
+        first[0], second[0],
+        "the second `next` is a different image: 4.1's window is the origin key, not a cache entry"
+    );
+    assert_ne!(first[1], second[1], "two files, two origins");
+    assert_ne!(first[3], second[3], "two files, two paths");
+    assert_eq!(
+        count_files(&cache_root.join("sha256")),
+        0,
+        "two rotations in reference mode, and the cache still holds nothing"
+    );
+    assert_eq!(
+        value(&daemon.ask("status"), "anchor_verified"),
+        "1",
+        "the daemon recorded the set it was told about (1.7.3)"
+    );
+
+    let third = daemon.ask("next");
+    assert!(
+        third
+            .iter()
+            .any(|line| line.starts_with("ERR no_candidates")),
+        "both candidates are in the window, so the third `next` is exhaustion: {third:?}"
+    );
+}
+
+/// The bound of 2.8 pinned with the failure mode it was moved for.
+///
+/// `docs/architecture.md:715` sets the rotation request timeout at 300 s,
+/// "deliberately equal to the worker deadline: a client must not give up before
+/// the daemon does, or it will report a failure for a rotation that then
+/// succeeds", and `ask` used to give up at 30 s. The worker here is the shim
+/// shape that proved the mechanism: a shell script named `whirl-worker` beside a
+/// copy of the daemon (`start_with_its_own_worker`), which reports its `set:`
+/// line only after `SHIM_DELAY`. That is past the 30 s the harness used to
+/// allow and far inside the 300 s the daemon itself allows (`:716` is the worker
+/// deadline, `:714` the connection the answer rides on), so this test passes at
+/// the spec's bound and, at 30 s, failed with `a response line` -- the panic the
+/// suite reports -- as a client that gave up on a rotation that was still
+/// running.
+///
+/// The delay is the subject, so the elapsed time is asserted rather than
+/// tolerated: `waited >= SHIM_DELAY` also fails a version of this test that
+/// quietly stopped reaching a worker at all.
+#[test]
+fn the_client_outlasts_a_worker_that_is_slower_than_the_old_bound() {
+    /// Longer than the 30 s `ask` used to allow, and well short of the 300 s
+    /// the daemon waits (2.8): the window the defect lived in.
+    const SHIM_DELAY: Duration = Duration::from_secs(35);
+    // A digest of the shape 2.5 requires and no file's real one: this test is
+    // about the line the daemon forwards, not about a hash it computed.
+    let digest = "a1".repeat(32);
+
+    let daemon = start_with_its_own_worker(
+        "the_client_outlasts_a_worker_that_is_slower_than_the_old_bound",
+        |dir| {
+            let file = dir.join("slow.png");
+            std::fs::write(&file, b"a file the slow worker reports").expect("a file to set");
+            format!(
+                "#!/bin/sh\nsleep {}\necho 'set: {digest} external:slow-worker {}'\n",
+                SHIM_DELAY.as_secs(),
+                file.display()
+            )
+        },
+    );
+
+    let file = daemon.dir.join("slow.png");
+    assert!(file.exists(), "the shim reports the file this test planted");
+    let started = Instant::now();
+    let lines = daemon.ask(&format!("set path {}", file.display()));
+    let waited = started.elapsed();
+
+    assert_eq!(lines.last().map(String::as_str), Some("OK"), "{lines:?}");
+    assert_eq!(
+        lines[1], "queued",
+        "the interim line reaches the client before the daemon blocks (2.5): {lines:?}"
+    );
+    let forwarded = format!(
+        "set: {digest} external:slow-worker manual {}",
+        file.display()
+    );
+    assert!(
+        lines.iter().any(|line| line == &forwarded),
+        "the slow worker's own record, forwarded as `via: manual` (2.6): {lines:?}"
+    );
+    assert!(
+        waited >= SHIM_DELAY,
+        "the worker really was slower than the old 30 s bound: waited {waited:?}"
+    );
+
+    let status = daemon.ask("status");
+    assert_eq!(
+        value(&status, "rotation_count"),
+        "1",
+        "the rotation the client waited out is a real one, recorded (2.10)"
+    );
+    assert_eq!(
+        value(&status, "rotating"),
+        "0",
+        "and it is done, not still in flight"
+    );
 }

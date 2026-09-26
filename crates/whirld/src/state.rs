@@ -241,6 +241,16 @@ pub struct Daemon {
     /// (2.10 `lock_mode`), and reading that from the lock is what stops the key
     /// from being a constant.
     lock: DaemonLock,
+    /// The filesystem's answer for `rotate.lock`, supplied by a test instead of
+    /// asked of the kernel. 8.7's `excl_file` fallback is a direction no
+    /// filesystem this machine offers can produce, and it is the only direction
+    /// in which 8.8's removal exists at all, so a daemon-side test of the
+    /// removal needs to say so rather than probe for it. Production is `None`:
+    /// [`Daemon::take_rotate`] then probes at every take, because the answer
+    /// belongs to the filesystem and 8.7 makes it a property of the filesystem
+    /// rather than of one lock.
+    #[cfg(test)]
+    rotate_attempt: Option<crate::lock::Attempt>,
     /// Every subscribed connection, and the quiet period a heartbeat is
     /// measured from (2.9).
     pub bus: Bus,
@@ -293,6 +303,8 @@ impl Daemon {
             worker,
             store,
             lock,
+            #[cfg(test)]
+            rotate_attempt: None,
             bus: Bus::new(),
             state: Mutex::new(state),
             started: Instant::now(),
@@ -616,7 +628,19 @@ impl Daemon {
     pub fn rotation(&self, run: u64, via: Via, verb: Verb, target: Option<&str>) -> Rotation {
         let deadline = self.worker_deadline();
         let mut reported = None;
-        let outcome = match self.worker.run(verb, target, run, deadline) {
+        // 7.3 step 4's input for 8.8: the pid of the worker this run has reaped,
+        // written by the two places that hold an exit status -- the `try_wait`
+        // that saw a normal exit, and `terminate` on the deadline (1.7.1). A
+        // path that holds no exit status leaves it `None`: a spawn that never
+        // produced a worker, a `try_wait` or `wait` that failed. `None` is not
+        // "the holder is gone" but "this daemon cannot say", and the take then
+        // defers and leaves the file alone (5.5 step 1) -- which is why a
+        // timed-out rotation's reap is worth reporting rather than dropping.
+        let mut reaped = None;
+        let result = self
+            .worker
+            .run_reporting_reaped(verb, target, run, deadline, &mut reaped);
+        let outcome = match result {
             Ok(Outcome::Set(record)) => {
                 self.record_success(
                     &record.digest,
@@ -667,8 +691,9 @@ impl Daemon {
         // 7.3 step 4 and 5.5's second trigger: the index entry, then the sweep,
         // after the worker has exited. A failed rotation runs the sweep too
         // ("including failed ones") and records no entry, because there is
-        // nothing the worker reported.
-        self.finish_rotation(reported.as_ref());
+        // nothing the worker reported. `reaped` goes with it: under 8.7's
+        // fallback it is what lets the sweep remove that worker's lock file (8.8).
+        self.finish_rotation(reported.as_ref(), reaped);
         outcome
     }
 
@@ -711,13 +736,49 @@ impl Daemon {
     /// has no call site in this build, because 2.5's verb set is closed and holds
     /// no such verb and 6.5's `whirl reset` is a CLI verb that has not landed.
     /// Never on a timer: "a timer is a resident thing to wake up for".
+    ///
+    /// This is the daemon's own take of the lock, so it carries no 8.8 exception:
+    /// see [`Daemon::sweep_with`] for the trigger that does.
     pub fn sweep(&self) {
+        self.sweep_with(None);
+    }
+
+    /// 5.5 step 1's take of `rotate.lock`, in one place because 8.8's exception
+    /// belongs to the take and not to the sweep that triggers it, and because
+    /// the daemon has three triggers and one take.
+    ///
+    /// `reaped` is the pid the rotation's own process has just reaped, or `None`
+    /// for the triggers that have reaped nothing (5.5's startup trigger, and
+    /// `reset` when it lands).
+    fn take_rotate(&self, reaped: Option<u32>) -> Result<Option<crate::lock::RotateLock>, String> {
+        // A test's answer, when it supplied one: see the field. Everything else
+        // asks the filesystem, which is the only thing that can answer (8.7).
+        #[cfg(test)]
+        if let Some(attempt) = self.rotate_attempt {
+            return crate::lock::take_rotate_as(&self.effective.state_dir, attempt, reaped);
+        }
+        match reaped {
+            Some(pid) => crate::lock::take_rotate_after_reaping(&self.effective.state_dir, pid),
+            None => crate::lock::take_rotate(&self.effective.state_dir),
+        }
+    }
+
+    /// The same sweep, with 7.3 step 4's exception in hand: `reaped` is the pid
+    /// of the worker this daemon has **just reaped**, which is the one holder
+    /// whose `rotate.lock` a take may remove under 8.7's `excl_file` fallback
+    /// (8.8, `crate::lock::take_rotate_after_reaping`). Every other trigger
+    /// passes `None`, and there is then no lock file this can take from a holder.
+    fn sweep_with(&self, reaped: Option<u32>) {
         let config = cache::CacheConfig::from(&self.effective.config.cache);
-        // Step 1: the rotation lock, non-blocking. The worker's own half of 7.2
-        // (it takes `rotate.lock` for its run) is not in this build:
-        // `crates/whirl-worker` has no lock module yet, so a hand-run worker is
-        // the only other process this can meet.
-        let guard = match crate::lock::take_rotate(&self.effective.state_dir) {
+        // Step 1: the rotation lock, non-blocking. Both roles hold it: the worker
+        // for its run (7.3 step 2, `crates/whirl-worker/src/lock.rs`), so a second
+        // rotation's worker exits `busy` rather than queueing, and this sweep for
+        // the work it does (7.2). Under the fallback a file that is already there
+        // is a holder -- a live rotation, or 5.5 step 3's hand-run worker -- and
+        // the answer is the deferral below, unless it is the reaped worker's file
+        // and 8.8's report says so.
+        let taken = self.take_rotate(reaped);
+        let guard = match taken {
             Ok(Some(guard)) => guard,
             Ok(None) => {
                 // 5.5 step 7's one line, with `deferred=1`: the shape is fixed,
@@ -800,7 +861,11 @@ impl Daemon {
     /// what the worker reported (7.2 makes the daemon the writer of
     /// `cache/index.json`), then the sweep. Both run after every rotation,
     /// including a failed one (5.5).
-    fn finish_rotation(&self, reported: Option<&Reported>) {
+    ///
+    /// `reaped` is the pid of the worker this rotation's process has reaped, and
+    /// it is the sweep's alone: 8.8's one exception to the refusal is the
+    /// `rotate.lock` of that worker, under 8.7's `excl_file` fallback.
+    fn finish_rotation(&self, reported: Option<&Reported>, reaped: Option<u32>) {
         if let Some(reported) = reported {
             let protected = {
                 let state = self.state();
@@ -814,7 +879,7 @@ impl Daemon {
                 Err(message) => eprintln!("whirld: index entry not written: {message}"),
             }
         }
-        self.sweep();
+        self.sweep_with(reaped);
     }
 
     pub fn resolve_id(&self, id: &str) -> Option<Resolved> {
@@ -1400,6 +1465,15 @@ mod tests {
 
     /// The same, with the config of the test's choosing: the caps of 5.1 and the
     /// graces of 5.3 are the inputs every eviction decision is made from.
+    ///
+    /// A test that builds the daemon on 8.7's `excl_file` fallback builds its
+    /// rotation lock the same way, because 8.7 makes the fallback "a property of
+    /// the filesystem and not of one lock, so it covers both locks of 7.2": the
+    /// daemon lock's answer is the filesystem's and the rotation lock's is the
+    /// same one, and 8.8's removal exists only in that direction. In the other
+    /// direction the real probe is left in place, because it is the one this
+    /// machine can answer -- including the `EWOULDBLOCK` that says a holder is
+    /// live, which a supplied `Acquired` would erase.
     fn daemon_with(dir: &Path, attempt: Attempt, config: Config) -> Daemon {
         let state_dir = dir.join("state");
         let effective = Effective {
@@ -1416,7 +1490,11 @@ mod tests {
             Backend::Noop,
         );
         let lock = crate::lock::take_as(&state_dir, attempt).expect("the lock is taken");
-        Daemon::load(effective, worker, lock)
+        let mut daemon = Daemon::load(effective, worker, lock);
+        if attempt == Attempt::Unsupported {
+            daemon.rotate_attempt = Some(Attempt::Unsupported);
+        }
+        daemon
     }
 
     /// 2.10's `lock_mode` row: "the primitive actually holding
@@ -1571,6 +1649,183 @@ mod tests {
         assert!(
             whirl_core::state::content_path(&cache_dir, &digests[2], "jpg").exists(),
             "the newest is still there"
+        );
+
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 8.8's exception, seen from the daemon's own side: the sweep that follows a
+    /// rotation must not take the lock out from under a holder that is still
+    /// there. The holder here is this process's own `flock` on `rotate.lock` --
+    /// the shape of 5.5 step 3's hand-run worker -- and the sweep is handed that
+    /// very pid as the worker it has just reaped, which is the strongest form of
+    /// the question: the pid matches, and the primitive is the reason nothing is
+    /// removed (8.8 keeps the removal to 8.7's `excl_file` fallback).
+    ///
+    /// The sweep defers (5.5 step 1), and both the file and its record are still
+    /// there afterwards, which is what the `sweep_deferred: 1` in `status` claims.
+    #[test]
+    fn a_sweep_after_a_rotation_does_not_remove_a_live_holders_lock_file() {
+        let root = std::env::temp_dir().join(format!("whirl-sweep-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let daemon = daemon(&root, Attempt::Acquired);
+        let state_dir = root.join("state");
+        let path = state_dir.join(crate::lock::ROTATE_FILE);
+        // The record 8.7 asks a holder to write, naming this process, which is
+        // the live holder the `flock` below makes it.
+        let record = format!("pid: {}\nstart: 2026-09-26T06:00:00Z\n", std::process::id());
+        std::fs::write(&path, &record).expect("the holder's record");
+        let holder = crate::lock::take_rotate(&state_dir)
+            .expect("a take that cannot fail")
+            .expect("the lock is free to begin with");
+
+        daemon.sweep_with(Some(std::process::id()));
+
+        assert_eq!(kv(&daemon.status(), "sweep_deferred"), "1");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the holder's file"),
+            record,
+            "the live holder's file, and its record, are untouched"
+        );
+
+        drop(holder);
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 1.7.1's deadline and 8.8's exception, together and from the daemon's own
+    /// side: a rotation whose worker hangs is ended by the deadline, the daemon
+    /// reaps what it killed, and the `rotate.lock` that worker left behind -- a
+    /// file whose record names that worker -- is removed by the sweep that
+    /// follows the rotation (7.3 step 4), so the sweep runs instead of deferring
+    /// behind a holder that is provably gone (5.5 step 1).
+    ///
+    /// The whole rotation is real: a script worker that plants 8.7's record and
+    /// then hangs, a 3 s deadline, `SIGTERM`, and `terminate`'s reap. Only the
+    /// filesystem's answer is supplied, and `daemon_with` supplies it for both
+    /// locks of 7.2, because 8.7 makes the fallback "a property of the filesystem
+    /// and not of one lock" and no filesystem this machine offers produces the
+    /// `ENOTSUP` direction 8.8's removal lives in.
+    ///
+    /// Before the deadline branch reported the pid it reaped, the sweep was handed
+    /// `None`: the take deferred, `sweep_deferred` was 1, and the worker's lock
+    /// file was left on disk for the operator to remove by hand. Both of those
+    /// readings are asserted here, so a `terminate` that dropped the exit status
+    /// again cannot pass this test by deferring quietly.
+    ///
+    /// The rotation is retried while the machine loses the worker's start-up race
+    /// to the deadline, which is the one thing the deadline cannot buy; the
+    /// readings above are not retried, as the loop below spells out.
+    #[test]
+    fn a_timed_out_rotation_removes_the_workers_lock_file_under_the_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("whirl-timeout-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let state_dir = root.join("state");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("the cache root");
+
+        // The worker of this rotation. It is 8.7's holder: it writes the record
+        // "its pid, and the platform's own start time for that pid" into
+        // `state/locks/rotate.lock` (the start time is a constant here, because
+        // nothing in this path reads it), leaves its pid where the test can find
+        // it, and then hangs past the deadline. No `trap`, so 1.7.1's `SIGTERM`
+        // ends it inside the grace window: the reap is real and it is the cheap
+        // branch of `terminate`.
+        //
+        // Every step is `|| exit 1`, so the pid file *is* the claim below: this
+        // script reached its fourth line only if the record is on disk. A worker
+        // whose writes failed exits at once, and the test then fails on the
+        // deadline assertion with the shell's own message rather than on a
+        // missing file that says nothing about why.
+        let lock = state_dir.join(crate::lock::ROTATE_FILE);
+        let worker_pid_file = root.join("worker.pid");
+        let program = root.join("slow.sh");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nmkdir -p '{locks}' || exit 1\nprintf 'pid: %s\\nstart: 2026-09-26T06:00:00Z\\n' \"$$\" > '{lock}' || exit 1\necho $$ > '{worker}' || exit 1\nwhile :; do sleep 0.05; done\n",
+                locks = lock.parent().expect("the locks directory").display(),
+                lock = lock.display(),
+                worker = worker_pid_file.display(),
+            ),
+        )
+        .expect("the worker script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("an executable script");
+
+        // 4.2 puts a floor of 60 s on this in a config file. A test builds the
+        // struct rather than parsing one, and 1.7.1's default of 300 s is 300 s
+        // of dead time: 3 s is the same deadline `worker.rs`'s own deadline test
+        // uses, and the two wider ones behind it are for the start-up race below.
+        const DEADLINES: [u64; 3] = [3, 9, 27];
+        let mut config = Config::default();
+        config.schedule.worker_deadline_seconds = DEADLINES[0];
+
+        let mut daemon = daemon_with(&root, Attempt::Unsupported, config);
+        daemon.worker =
+            crate::worker::Worker::new(program, root.join("config.json"), Backend::Noop);
+
+        // 1.7.1's deadline races the worker's own start-up, and that race is the
+        // one thing this test cannot remove: the child has to be forked, exec'd
+        // and given a slice of CPU before it can write anything, and the
+        // deadline's clock is already running. `worker.rs`'s `DEADLINE` doc names
+        // the race and calls the loss the machine's rather than the daemon's (one
+        // run in eight at a 1 s deadline there; this machine measured a load
+        // average of 44 against eight cores while this test was written, and lost
+        // it about once in ten at 3 s). So a rotation whose worker never reached
+        // its record is not evidence about the code under test: it is retried
+        // with the deadline tripled.
+        //
+        // Nothing else is retried. Every rotation still has to end in the
+        // deadline, and the two readings that carry 8.8 -- the worker's file is
+        // gone, and the sweep ran instead of deferring -- are asserted on the
+        // first rotation that has the worker's own pid. If no deadline in
+        // `DEADLINES` was enough, the panic says so and says that it is the
+        // machine: a stall that long must not be read as a passing test either.
+        let mut worker: Option<u32> = None;
+        for (attempt, deadline) in DEADLINES.iter().enumerate() {
+            daemon.effective.config.schedule.worker_deadline_seconds = *deadline;
+            let outcome = daemon.rotation(attempt as u64 + 1, Via::Source, Verb::Rotate, None);
+
+            assert!(
+                matches!(
+                    outcome,
+                    Rotation::Failed {
+                        code: ErrorCode::Timeout,
+                        ..
+                    }
+                ),
+                "1.7.1: the deadline ({deadline} s) is what ended this rotation: {outcome:?}"
+            );
+
+            match std::fs::read_to_string(&worker_pid_file) {
+                Ok(pid) => {
+                    worker = Some(pid.trim().parse().expect("a pid"));
+                    break;
+                }
+                // The child never reached its first write. That is the start-up
+                // race and says nothing about the daemon: retry.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("the worker's pid file: {error}"),
+            }
+        }
+        let worker = worker.unwrap_or_else(|| {
+            panic!(
+                "no worker reached its lock file and its pid in {DEADLINES:?} of deadline: this machine could not start a process inside any of them, so this run is the start-up race `DEADLINE` describes and nothing is known about the daemon"
+            )
+        });
+        assert!(
+            !lock.exists(),
+            "8.8: pid {worker} is gone -- the daemon reaped the worker it killed -- so the record naming it is not a holder and the sweep removed the file rather than leaving it for the operator"
+        );
+        assert_eq!(
+            kv(&daemon.status(), "sweep_deferred"),
+            "0",
+            "and the sweep after the timed-out rotation ran, rather than 5.5 step 1's deferral"
         );
 
         drop(daemon);
