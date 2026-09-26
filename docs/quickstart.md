@@ -14,6 +14,9 @@ cargo install --path crates/whirld       --locked
 cargo install --path crates/whirl-worker --locked
 ```
 
+The `cargo install` lines above need Rust on your `PATH`; if `cargo` is missing, install it from
+<https://rustup.rs>.
+
 `development` and not `main`, which cannot set a wallpaper yet. The three binaries land in
 `$CARGO_HOME/bin` (`~/.cargo/bin`), already on your `PATH`; keep them in that one directory, because
 `whirld` looks for `whirl-worker` beside itself and not on `PATH`.
@@ -33,7 +36,7 @@ JSON
 ```
 
 `~/Pictures/Wallpapers` is the line to change. The `local` source walks that folder and takes any
-`jpg`, `jpeg`, `png`, `heic` or `webp` at least 1600x900.
+`jpg`, `jpeg`, `png` or `webp` at least 1600x900.
 
 ## 3. Start it, and rotate
 
@@ -50,7 +53,7 @@ terminal, paste that same `export` line, then:
 whirl next
 ```
 
-It prints `queued` and then `set: <digest> <origin_key> <path>`, naming the picture it set.
+It prints `queued` and then `set: <digest> <origin_key> <via> <path>`, naming the picture it set.
 `whirl config check` prints what a source did, `candidates=` and `admitted=` and the rejection
 counters; it asks the daemon, so it only works while `whirld` is up.
 
