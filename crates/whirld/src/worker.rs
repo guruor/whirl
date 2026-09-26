@@ -10,7 +10,7 @@
 //! `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` - because the worker reads the
 //! recent window of 4.1 out of the two files the daemon wrote (7.2).
 
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -79,6 +79,30 @@ const POLL: Duration = Duration::from_millis(5);
 
 /// How long the worker gets after `SIGTERM` before `SIGKILL` (1.7.1).
 const TERM_GRACE: Duration = Duration::from_secs(5);
+
+/// How many times the spawn is attempted when the kernel refuses it with
+/// `ETXTBSY`: the first, plus nine retries.
+///
+/// `ETXTBSY` means the kernel refused **before anything ran**. Linux refuses to
+/// `execve` a file that any process holds open for writing (`deny_write_access`
+/// on the exec target), so no worker existed, no `rotate.lock` was taken and
+/// nothing was written: re-attempting is free. The alternative is a
+/// `worker_failed` report (2.7) about a process that never started.
+///
+/// The condition is transient **by construction**, not by luck: *any* open-for-
+/// write descriptor on the file being exec'd causes it, and the holder is always
+/// someone who is about to be done with it. Under `cargo test` it is a forked
+/// child of a sibling thread that inherited the descriptor `Scripts::script`
+/// wrote with (`fork` duplicates the descriptor into the child, which can
+/// outlive the write in the parent). In an install it is the process replacing
+/// the binary, which holds it open for write only while it copies.
+const SPAWN_ATTEMPTS: usize = 10;
+
+/// The sleep between two spawn attempts: nine of them is 450 ms of waiting in
+/// the worst case, and it is only ever reached on a real `ETXTBSY`. Every other
+/// errno (a missing program, a directory, a permission denial) returns on the
+/// first attempt with today's message and today's immediacy.
+const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(50);
 
 pub struct Worker {
     program: PathBuf,
@@ -180,15 +204,36 @@ impl Worker {
             }
         }
 
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| WorkerError::Failed {
-                code: ErrorCode::WorkerFailed,
-                message: format!("cannot spawn {}: {error}", self.program.display()),
-            })?;
+        // `ETXTBSY` is the kernel refusing before anything ran, so a retry costs
+        // nothing and a report would be about a worker that never existed. Every
+        // other refusal is today's first-attempt failure.
+        let mut attempt = 1;
+        let mut child = loop {
+            match command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
+                    if attempt >= SPAWN_ATTEMPTS {
+                        return Err(WorkerError::Failed {
+                            code: ErrorCode::WorkerFailed,
+                            message: format!("cannot spawn {}: {error}", self.program.display()),
+                        });
+                    }
+                    attempt += 1;
+                    std::thread::sleep(SPAWN_RETRY_PAUSE);
+                }
+                Err(error) => {
+                    return Err(WorkerError::Failed {
+                        code: ErrorCode::WorkerFailed,
+                        message: format!("cannot spawn {}: {error}", self.program.display()),
+                    });
+                }
+            }
+        };
 
         let deadline_at = Instant::now() + deadline;
         let status = loop {
@@ -291,17 +336,58 @@ fn failure_from(stderr: &str) -> WorkerError {
 /// `SIGTERM`, five seconds, then `SIGKILL` (1.7.1).
 ///
 /// `Child::kill` is `SIGKILL` on Unix and the standard library has no signal
-/// API, so the polite half goes through `kill(1)`, which exists on every Unix
-/// this build targets. A missing `kill` falls straight through to `SIGKILL`.
+/// API, so the polite half is one `kill(2)` call, through the declaration and
+/// the `send_signal` wrapper below. A syscall has no program that can be
+/// missing, so the absent-`kill`-binary class is gone rather than covered by a
+/// second program that could be absent as well, and no `exec` is left anywhere
+/// on the signal path. What this module may not assume is that a `kill` program
+/// is installed, and the history is kept here because the failure mode was
+/// silence:
+///
+/// `kill(1)` is `procps`' on Debian, `procps` is priority `important` rather
+/// than `required`, and the slim images this project builds and reviews in
+/// (`rust:1.85-slim`, `rust:1.94-slim-bookworm`, both arm64) have no `kill`
+/// anywhere on `PATH`. `Command::new("kill")` there failed with `ENOENT` (code
+/// 2) before any signal existed, and because that error was discarded, the
+/// grace below ran its whole five seconds against a worker that was never told
+/// anything before the run ended in `SIGKILL` alone. That is 1.7.1's grace with
+/// the polite half missing, and it is what
+/// `a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace` reported
+/// as "no SIGTERM trap ran in 30s" in a container, identically on base
+/// `7e22e1a` and on `origin/development`, with the run taking exactly
+/// `DEADLINE` plus `TERM_GRACE` (8.01s) because nothing had been signalled.
+///
+/// It was not a PID 1 story, and measuring said so: under `cargo test` in that
+/// image PID 1 is `cargo`, which forks the test binary, which forks the worker,
+/// so the worker is a grandchild with an ordinary PID (probe: worker PID 33 and
+/// the script's own `$$` 33, while PID 1 held `sh`). Nothing in this path turns
+/// on PID 1's default dispositions; all of it turns on whether a `kill` program
+/// exists, which is why the answer is a route that cannot be missing rather than
+/// a second program that might be.
+///
+/// The route changed the failure mode, so this is what the syscall can return
+/// and what each one is worth here. It is printed, not discarded:
+///
+/// - `ESRCH`, no such process: the child exited by itself between the deadline
+///   that put us here and this call, which is the one race this path always had
+///   and is not a defect. Worth the line anyway, because a pid that is already
+///   gone is exactly the case where a polite half that never landed leaves no
+///   trace in the outcome: the run still ends in `Timeout` either way.
+/// - `EPERM`, this process may not signal that pid: a child of ours is not a
+///   candidate for it outside a sandbox or a uid change, and nothing here could
+///   fix it if it were. Not fatal, `SIGKILL` below is attempted either way, and
+///   the run ends in `Timeout` exactly as 1.7.1 says.
+/// - `EINVAL`, the signal number is not one this platform accepts: unreachable
+///   from this code, which passes `SIGTERM` and (in the test) `SIGNAL_NONE`,
+///   both valid on every Unix here. It is a programming error, and it gets the
+///   same line as the other two.
 fn terminate(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let pid = child.id();
+        if let Err(error) = send_signal(pid, SIGTERM) {
+            eprintln!("whirld: worker {pid}: SIGTERM: {error}");
+        }
     }
     let grace = Instant::now() + TERM_GRACE;
     while Instant::now() < grace {
@@ -313,6 +399,43 @@ fn terminate(child: &mut std::process::Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// `SIGTERM`: the polite half of 1.7.1. 15 on every Unix this build targets,
+/// macOS included.
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+
+// `kill(2)`, declared by hand because this workspace has no third-party
+// dependencies (v0.1) and there is no `libc` to borrow the declaration from.
+// `flock` is declared the same way in `lock.rs` and `tests/daemon_lock.rs`, and
+// `umask` in `socket.rs`.
+//
+// `pid_t` is `i32` on macOS and on Linux, and this module is Unix-only (every
+// module of this binary is: `main.rs`), so one declaration covers both.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+/// Send `signal` to `pid`, through `kill(2)` and nothing else.
+///
+/// `Ok(())` means the kernel accepted the signal for delivery. `Err` carries
+/// the errno, which is what `terminate` above prints and what the test below
+/// asserts on. There is no second route: on every Unix this builds for, the
+/// syscall is the thing that exists, and it is the only thing that has to.
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: `kill(2)` takes two integers, reads no memory and dereferences no
+    // pointer, so no argument can make it fault and the most a bad one buys is
+    // `EINVAL`. `pid` is a live child's own id from `Child::id`, which is a
+    // `pid_t` widened to `u32` on Unix, so the cast narrows nothing back.
+    let sent = unsafe { kill(pid as i32, signal) };
+    if sent == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +711,17 @@ mod tests {
     /// deadline plus the grace, which is all the run can take.
     const WATCH_BOUND: Duration = Duration::from_secs(30);
 
+    /// `ESRCH`: the errno `kill(pid, 0)` returns once the pid is gone. macOS and
+    /// Linux agree on 3, so unlike `EWOULDBLOCK` in `tests/daemon_lock.rs` this
+    /// one needs no `cfg`.
+    const ESRCH: i32 = 3;
+
+    /// `kill(2)`'s own existence question: signal 0 is never delivered, it only
+    /// asks whether the pid is there and whether this process could signal it.
+    /// The test below leans on that to prove the killed worker is gone. It lives
+    /// here rather than beside `SIGTERM` because this test is its only caller.
+    const SIGNAL_NONE: i32 = 0;
+
     /// When a `TERM` trap was seen to run, on the test's own clock.
     ///
     /// A timestamp written by the trap itself would be a wall-clock reading
@@ -664,14 +798,14 @@ mod tests {
     ///
     /// A daemon that skipped `SIGTERM` fails 1 and the marker assertion; one
     /// that killed alongside the signal fails 3 and 4; one that returned without
-    /// killing leaves the process alive and fails the `kill -0` probe.
+    /// killing leaves the process alive and fails the `kill(pid, 0)` probe.
     ///
     /// What it still cannot see: the instant of the signal itself, any closer
     /// than `TOLERANCE` early and `SLACK` late, and the signal by number. The
     /// signal is observed only through the shell's trap table, so this says
     /// "the trap the script installed for `TERM` ran", which on every shell
-    /// here means `SIGTERM` and not that the daemon used `kill(1)` rather than
-    /// a syscall.
+    /// here means `SIGTERM` and not that the daemon sent it with `kill(2)`
+    /// rather than by any other route to the same signal.
     ///
     /// The `trap` is the script's first statement and the pid file its second:
     /// both orderings are load-sensitive, and installing the handler before
@@ -739,16 +873,16 @@ mod tests {
         );
 
         let pid: u32 = scripts.text("pid.txt").trim().parse().expect("a pid");
-        let probe = Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("kill -0");
+        // Through the same syscall the daemon just used, so this probe is not
+        // itself a reason for the test to fail on an image with no `kill(1)`
+        // binary (see `terminate`): signal 0 is `kill(2)`'s own existence
+        // question and is never delivered. `ESRCH` is a stricter answer than
+        // the `kill(1)` exit status this replaces, which said only that the
+        // command was unhappy, not why.
+        let probe = send_signal(pid, SIGNAL_NONE);
         assert!(
-            !probe.success(),
-            "the worker was killed and reaped, so {pid} is gone"
+            matches!(&probe, Err(error) if error.raw_os_error() == Some(ESRCH)),
+            "the worker was killed and reaped, so {pid} is gone: {probe:?}"
         );
     }
 
@@ -877,6 +1011,69 @@ mod tests {
                 assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"))
             }
             other => panic!("the worker's stdin must be the null device: {other:?}"),
+        }
+    }
+
+    /// How long the writer of `a_spawn_that_finds_the_script_busy_is_retried`
+    /// holds the script open for write.
+    ///
+    /// It is held before the run and released 100 ms into it, which is what makes
+    /// the first spawn attempt find the writer still there: without the retry
+    /// this test is red on Linux, and red with the CI's own message. It is also
+    /// short enough that a release thread descheduled for hundreds of
+    /// milliseconds still lands inside `SPAWN_ATTEMPTS`'s 450 ms budget, and long
+    /// enough that a pass cannot come from the release winning the race to the
+    /// first spawn.
+    const WRITER_HELD: Duration = Duration::from_millis(100);
+
+    /// A spawn the kernel refuses with `ETXTBSY` is re-attempted, and the retry
+    /// really runs the worker: the assertion is the parsed `Outcome::Set` and its
+    /// fields, not "the spawn did not return an error".
+    ///
+    /// The rule being exercised is Linux's: `execve` refuses a file that any
+    /// process holds open for writing (`deny_write_access` on the exec target)
+    /// with `ETXTBSY`. In the CI failure that produced this test the holder was a
+    /// child forked from a *sibling* thread while `Scripts::script`'s writable
+    /// descriptor was still open, because `fork` duplicates the descriptor into
+    /// the child and the child can keep it past the write in the parent. That
+    /// interleaving cannot be constructed deterministically from a test, so the
+    /// writer here stands in for it: the same kernel rule, the same refusal, the
+    /// same release.
+    ///
+    /// Darwin does not enforce the rule at all, so on macOS this test is vacuous
+    /// (the first spawn simply succeeds); only Linux makes it bite.
+    #[test]
+    fn a_spawn_that_finds_the_script_busy_is_retried() {
+        let scripts = Scripts::new("busy");
+        let digest = "c".repeat(64);
+        let program = scripts.script(
+            "busy.sh",
+            &format!(
+                "#!/bin/sh\nprintf 'set: {digest} pictures:0123456789abcdef /tmp/candidate.jpg\\n'\n"
+            ),
+        );
+
+        // Held before the run, so the first attempt cannot miss it.
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .expect("a writable handle on the script");
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(WRITER_HELD);
+            drop(writer);
+        });
+
+        let outcome = worker(program).run(Verb::Rotate, None, 1, generous());
+        releasing.join().expect("the writer thread");
+
+        match outcome {
+            Ok(Outcome::Set(record)) => {
+                assert_eq!(record.digest, digest);
+                assert_eq!(record.origin_key, "pictures:0123456789abcdef");
+                assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"));
+                assert_eq!(record.via, Via::Source);
+            }
+            other => panic!("a script that is busy for 100 ms is not a failed spawn: {other:?}"),
         }
     }
 }
