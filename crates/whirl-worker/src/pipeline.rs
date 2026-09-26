@@ -25,6 +25,7 @@
 use crate::backend::{self, SetError};
 use crate::sources::Sources;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -478,16 +479,29 @@ fn read_file(path: &Path) -> Result<Option<String>, String> {
 /// recent window is built from lives (4.1). The daemon owns every file in it;
 /// this process only reads.
 pub fn state_directory() -> Option<PathBuf> {
-    env_path("WHIRL_STATE_DIR").or_else(paths::state_dir)
+    state_directory_with(&|name| std::env::var_os(name))
 }
 
-/// An environment variable read as an absolute path only: a relative value is
-/// treated as unset, which is the rule the platform paths already follow
-/// (docs/spec/state-and-cache.md 1.2).
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
+/// The same resolution with its environment supplied, so the precedence is a
+/// function of three arms rather than of this process's environment, which a
+/// test cannot change without racing every other test in the binary.
+fn state_directory_with(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env_path_with(lookup, "WHIRL_STATE_DIR").or_else(paths::state_dir)
+}
+
+/// An environment variable read as a path, **verbatim**: the rule the daemon
+/// follows for the same names (`env_path` in crates/whirld/src/plan.rs). A
+/// relative value is used against the working directory, which the worker
+/// inherits from the daemon rather than replacing.
+///
+/// It is not filtered further on purpose. 1.2's "a relative value is treated as
+/// unset" is about the four XDG variables that pick the platform defaults; 4.3
+/// gives `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` no such rule, and a process
+/// that dropped a value the daemon accepted would be resolving one knob two
+/// ways: the daemon reporting the directory it honoured while this one wrote
+/// into the default.
+fn env_path_with(lookup: &dyn Fn(&str) -> Option<OsString>, name: &str) -> Option<PathBuf> {
+    lookup(name).map(PathBuf::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -721,8 +735,25 @@ impl Cache {
     /// then `cache.root` then the platform default. The daemon resolves the same
     /// three in `whirld::plan::resolve`, which this crate cannot link; the whole
     /// point of the three is that both processes land on the same directory.
+    /// `WHIRL_CACHE_DIR` reaches this process because the daemon passes its own
+    /// value through the scrub (`Worker::run`, docs/architecture.md 1.6).
     pub fn resolve(config: &Config) -> Result<Cache, Failure> {
-        if let Some(path) = env_path("WHIRL_CACHE_DIR") {
+        Cache::resolve_with(config, &|name| std::env::var_os(name))
+    }
+
+    /// The same three arms with the environment supplied, so the one arm that is
+    /// not a value out of `config` can be stated by a test without mutating this
+    /// process's environment (which would race every other test in the binary).
+    ///
+    /// A directory named here need not exist: `create` makes the root, `sha256/`
+    /// and `tmp/` mode 0700 on the first write (section 3 step 2), and a root it
+    /// cannot create is `cache_unwritable` (8.4), which is a degraded cache and
+    /// not a refusal - the same rule the daemon's own probe follows.
+    fn resolve_with(
+        config: &Config,
+        lookup: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Cache, Failure> {
+        if let Some(path) = env_path_with(lookup, "WHIRL_CACHE_DIR") {
             return Ok(Cache::at(path));
         }
         if let Some(path) = &config.cache.root {
@@ -1631,6 +1662,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a temporary directory");
         dir
+    }
+
+    /// 4.3's order for the cache root, arm by arm: the environment beats the
+    /// file, the file beats the compiled default, and the platform default is
+    /// what is left. `WHIRL_CACHE_DIR` is the one arm that is not a value out of
+    /// the config, so it arrives as a lookup: a test that set this process's own
+    /// environment would race every other test in this binary, and the daemon
+    /// passes its own value to this process anyway (`Worker::run`, 1.6).
+    #[test]
+    fn the_cache_root_follows_4_3s_precedence() {
+        let dir = scratch("cache-precedence");
+        let from_the_file = config(&dir, "");
+        let environment = dir.join("from-environment");
+        let from_the_environment = |name: &str| match name {
+            "WHIRL_CACHE_DIR" => Some(OsString::from(environment.clone())),
+            _ => None,
+        };
+
+        assert_eq!(
+            Cache::resolve_with(&from_the_file, &from_the_environment)
+                .expect("a cache")
+                .root(),
+            environment.as_path(),
+            "the environment wins over the `cache.root` the file sets"
+        );
+        assert_eq!(
+            Cache::resolve_with(&from_the_file, &|_| None)
+                .expect("a cache")
+                .root(),
+            dir.join("cache").as_path(),
+            "`cache.root` wins over the compiled default"
+        );
+
+        let bare = Config::parse("{\n  \"sources\": []\n}\n")
+            .expect("a config with no cache root")
+            .config;
+        assert_eq!(bare.cache.root, None, "the empty arm is really empty");
+        assert_eq!(
+            Cache::resolve_with(&bare, &|_| None)
+                .expect("a cache")
+                .root(),
+            paths::cache_dir()
+                .expect("this platform has a cache directory")
+                .as_path(),
+            "the compiled default is the floor"
+        );
+    }
+
+    /// The state directory's two arms, resolved the same way (4.3 gives it no
+    /// config-file arm, because the config lives in the state directory's own
+    /// tree). Tested here rather than through a real state file because the
+    /// resolution is the thing the scrub could have dropped.
+    #[test]
+    fn the_state_directory_prefers_the_environment_over_the_platform_default() {
+        let dir = scratch("state-precedence");
+        let environment = dir.join("from-environment");
+        assert_eq!(
+            state_directory_with(&|name| match name {
+                "WHIRL_STATE_DIR" => Some(OsString::from(environment.clone())),
+                _ => None,
+            }),
+            Some(environment),
+            "the environment wins"
+        );
+        assert_eq!(
+            state_directory_with(&|_| None),
+            paths::state_dir(),
+            "the platform default is what is left"
+        );
+    }
+
+    /// A directory the environment names need not exist: section 3 step 2 makes
+    /// the cache root, `sha256/` and `tmp/` mode 0700 on the first write. This is
+    /// the state directory's rule too (the daemon creates it at startup,
+    /// crates/whirld/src/plan.rs), so it is the one `WHIRL_CACHE_DIR` follows.
+    #[test]
+    fn a_cache_root_that_does_not_exist_is_created_owner_only() {
+        let root = scratch("cache-create").join("a").join("cache");
+        assert!(!root.exists(), "the fixture starts with no cache root");
+
+        Cache::at(&root)
+            .create()
+            .expect("the directories are created");
+
+        for directory in [root.clone(), root.join("sha256"), root.join("tmp")] {
+            assert!(directory.is_dir(), "{} is a directory", directory.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for directory in [&root, &root.join("sha256"), &root.join("tmp")] {
+                let mode = std::fs::metadata(directory)
+                    .expect("the directory")
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o700, "{} is owner-only", directory.display());
+            }
+        }
     }
 
     /// A config with one `local` source whose path is fake: the pipeline never
