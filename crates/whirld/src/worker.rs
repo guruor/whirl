@@ -7,6 +7,7 @@
 //! the daemon's whole environment) and what lets the Linux adapters see the
 //! session signals they need.
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -16,6 +17,19 @@ use whirl_core::protocol::{self, ErrorCode, SetRecord, Via};
 
 /// The variables the worker always gets (docs/architecture.md 1.6).
 const ALWAYS: [&str; 2] = ["PATH", "HOME"];
+
+/// The two path knobs of docs/architecture.md 4.3's environment layer that the
+/// worker resolves for itself, passed through with the daemon's own values when
+/// the daemon's environment has them (1.6 says so; the list is 1.6's).
+///
+/// They are here because 4.3 puts the environment ahead of the config file for
+/// the cache root and the state directory, and the worker resolves both on its
+/// own (`whirl_worker::pipeline::Cache::resolve` and `state_directory()`). A
+/// scrub that dropped them left the daemon reporting the directory the
+/// environment named while the worker fell through to the compiled default and
+/// wrote somewhere else: two processes, two directories, one rotation. Each name
+/// is passed only when set, which is the rule the API key below already follows.
+const PASSED_THROUGH: [&str; 2] = ["WHIRL_CACHE_DIR", "WHIRL_STATE_DIR"];
 
 /// The nine Linux-only variables: the four decisive session signals (five
 /// names, because sway and i3 share a row) plus the four a session bus or a
@@ -31,6 +45,18 @@ const LINUX_ONLY: [&str; 9] = [
     "WAYLAND_DISPLAY",
     "DISPLAY",
 ];
+
+/// The names the scrub lets through, in one place so the spawn, its test and
+/// 1.6's list cannot drift: `ALWAYS`, then 4.3's two path knobs, each one only
+/// when the lookup finds it. The daemon's own environment is the lookup in
+/// production; a test supplies its own table and asks the same question.
+fn forwarded(lookup: &dyn Fn(&str) -> Option<OsString>) -> Vec<(String, OsString)> {
+    ALWAYS
+        .iter()
+        .chain(PASSED_THROUGH.iter())
+        .filter_map(|name| lookup(name).map(|value| (name.to_string(), value)))
+        .collect()
+}
 
 /// The worker's verb (1.6). `prev` is not one: `prev`'s job is a `set` of a
 /// candidate the daemon already knows, so it spawns `--verb set --target`.
@@ -125,10 +151,8 @@ impl Worker {
         }
         command.arg("--run").arg(run.to_string());
         command.env_clear();
-        for name in ALWAYS {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
+        for (name, value) in forwarded(&|name| std::env::var_os(name)) {
+            command.env(name, value);
         }
         // The daemon resolved the backend, so the worker is told rather than
         // asked to re-resolve it (docs/development.md section 7).
@@ -391,10 +415,10 @@ mod tests {
 
     /// 1.6's environment rule, as a set equality rather than a membership test:
     /// the child sees the two names that are always set, the two the daemon
-    /// adds, the API key when the daemon has one, the nine Linux session
-    /// variables on Linux when they are set, and nothing else. The shell sets
-    /// `PWD`, `SHLVL` and `_` for itself, which is why they are named here
-    /// instead of silently tolerated.
+    /// adds, 4.3's two path knobs when the daemon's own environment has them, the
+    /// API key when the daemon has one, the nine Linux session variables on Linux
+    /// when they are set, and nothing else. The shell sets `PWD`, `SHLVL` and `_`
+    /// for itself, which is why they are named here instead of silently tolerated.
     ///
     /// An implementation that forgot `env_clear()` fails on the extra names: the
     /// test process's own environment has at least `CARGO_*` in it under
@@ -424,6 +448,11 @@ mod tests {
         let mut expected: Vec<String> = ALWAYS.iter().map(|name| name.to_string()).collect();
         expected.push("WHIRL_CONFIG".to_string());
         expected.push("WHIRL_BACKEND".to_string());
+        for name in PASSED_THROUGH {
+            if std::env::var_os(name).is_some() {
+                expected.push(name.to_string());
+            }
+        }
         if std::env::var_os("WHIRL_WALLHAVEN_API_KEY").is_some() {
             expected.push("WHIRL_WALLHAVEN_API_KEY".to_string());
         }
@@ -461,6 +490,50 @@ mod tests {
                 names.join(" ")
             );
         }
+    }
+
+    /// The pure half of the same rule, so the spawn and the list cannot drift:
+    /// `PASSED_THROUGH` reaches the worker when the daemon's own environment has
+    /// it, and is absent - not empty - when it does not. The lookup is the
+    /// parameter here rather than the process environment, because a test that
+    /// mutated its own environment would be racing every other test in this
+    /// binary.
+    #[test]
+    fn the_4_3_path_knobs_are_passed_through_only_when_the_daemon_has_them() {
+        fn names(environment: Vec<(String, OsString)>) -> Vec<String> {
+            environment.into_iter().map(|(name, _)| name).collect()
+        }
+
+        let scratch = |name: &str| match name {
+            "PATH" | "HOME" | "WHIRL_CACHE_DIR" | "WHIRL_STATE_DIR" => {
+                Some(OsString::from(format!("/{name}")))
+            }
+            _ => None,
+        };
+        assert_eq!(
+            names(forwarded(&scratch)),
+            ["PATH", "HOME", "WHIRL_CACHE_DIR", "WHIRL_STATE_DIR"],
+            "1.6's list, and the two knobs carry the daemon's own values"
+        );
+        assert_eq!(
+            forwarded(&scratch)
+                .into_iter()
+                .filter(|(name, _)| name == "WHIRL_CACHE_DIR")
+                .map(|(_, value)| value)
+                .collect::<Vec<OsString>>(),
+            [OsString::from("/WHIRL_CACHE_DIR")],
+            "the value the worker is given is the daemon's, not a re-resolution"
+        );
+
+        let bare = |name: &str| match name {
+            "PATH" | "HOME" => Some(OsString::from("/x")),
+            _ => None,
+        };
+        assert_eq!(
+            names(forwarded(&bare)),
+            ["PATH", "HOME"],
+            "an unset knob is not passed through as an empty value"
+        );
     }
 
     /// How closely the test can pin the *early* side of the deadline: how much
