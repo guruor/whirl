@@ -116,8 +116,10 @@ LINUX_PLATFORM="linux/amd64"
 #
 #   whirld::bin/whirld worker::tests::a_spawn_that_never_produced_a_worker_reports_no_reaped_pid
 #
-# Measured 2026-09-27 on this arm64 host at this head, four runs -- three as the
-# invoking user and one as root -- the same one every time:
+# Measured 2026-09-27 on this arm64 host, every run the same one. The runs are
+# the mode as it now runs, as the invoking user (`--user`, below): the root
+# invocation an earlier card measured had a second red, the `0o000` fixture in
+# `crates/whirl-worker/src/sources/local.rs` that flag exists to avoid.
 #
 #   ./scripts/ci.sh linux-amd64
 #   -> exit 100, 247 tests run (with .config/nextest.toml's fail-fast = false),
