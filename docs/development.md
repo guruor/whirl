@@ -16,8 +16,8 @@ decision.
 |---|---|
 | `docs/`, `prototype/` | exist |
 | the Cargo workspace (`crates/`) | exists on pull request #1: `whirl-core`, `whirld`, `whirl-cli`, `whirl-worker`, four members and no third-party dependency |
-| `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36126085459`, twelve jobs |
-| `.github/workflows/release.yml` | written here, lints clean, and **has run**: a throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag |
+| `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36240381639`, thirteen jobs, on the tip of `development` |
+| `.github/workflows/release.yml` | written here, lints clean, and **has run** three times: green once, on the throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag; and red twice since, on the throwaway guard probes `v0.0.1-rc.test-guard`, run `36156068912`, and `v0.0.1-rc.review-guard-t6d652592`, run `36157463795`, where the `guard` job failed because the tag was not on `main` and `build` and `release` were skipped, so neither probe built or published anything. No tag and no release exists on `origin` today |
 | a running daemon reachable from a checkout | yes: the section 7 sequence below, driven from a fresh clone of pull request #1 on a scratch socket, no wallpaper touched |
 | anything that sets a real wallpaper in CI | never, by design (see "What CI cannot prove") |
 
