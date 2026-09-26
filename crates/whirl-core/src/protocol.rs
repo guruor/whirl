@@ -1069,8 +1069,96 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
-/// SHA-256 (FIPS 180-4), one shot: pad, then compress each 64-byte block.
-fn sha256(data: &[u8]) -> [u8; 32] {
+/// The incremental SHA-256 of docs/spec/state-and-cache.md section 3 step 4:
+/// "Stream the response into the part file, feeding the same bytes to a SHA-256
+/// hasher", one pass over bytes that are being written anyway rather than a
+/// second read of the finished file.
+///
+/// One implementation of the algorithm: [`sha256`] and [`sha256_hex`] are this
+/// type fed in one call, so a chunked digest and a whole-buffer digest cannot
+/// disagree.
+pub struct Sha256 {
+    state: [u32; 8],
+    pending: Vec<u8>,
+    length: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Sha256::new()
+    }
+}
+
+impl Sha256 {
+    pub fn new() -> Sha256 {
+        Sha256 {
+            state: H,
+            pending: Vec::with_capacity(64),
+            length: 0,
+        }
+    }
+
+    /// Feed the next bytes. Blocks are compressed as they complete; at most 63
+    /// bytes are held back.
+    pub fn update(&mut self, data: &[u8]) {
+        self.length = self.length.wrapping_add(data.len() as u64);
+        let mut rest = data;
+        if !self.pending.is_empty() {
+            let want = 64 - self.pending.len();
+            let take = want.min(rest.len());
+            self.pending.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.pending.len() == 64 {
+                let block = std::mem::take(&mut self.pending);
+                compress(&mut self.state, &block);
+            }
+        }
+        let mut blocks = rest.chunks_exact(64);
+        for block in &mut blocks {
+            compress(&mut self.state, block);
+        }
+        self.pending.extend_from_slice(blocks.remainder());
+    }
+
+    /// The padding of the algorithm: one `1` bit, zeros, then the length in bits
+    /// big-endian.
+    pub fn finish(mut self) -> [u8; 32] {
+        let bit_len = self.length.wrapping_mul(8);
+        let mut tail = std::mem::take(&mut self.pending);
+        tail.push(0x80);
+        while tail.len() % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&bit_len.to_be_bytes());
+        for block in tail.chunks_exact(64) {
+            compress(&mut self.state, block);
+        }
+        let mut digest = [0u8; 32];
+        for (index, word) in self.state.iter().enumerate() {
+            digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+
+    /// The digest as the protocol spells it: 64 lower-case hex characters.
+    pub fn hex(self) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in self.finish() {
+            for nibble in [byte >> 4, byte & 0x0f] {
+                out.push(char::from_digit(nibble as u32, 16).unwrap_or('0'));
+            }
+        }
+        out
+    }
+}
+
+/// The fractional parts of the square roots of the first 8 primes.
+const H: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+/// One 64-byte block, folded into the running state.
+fn compress(state: &mut [u32; 8], chunk: &[u8]) {
     // The fractional parts of the cube roots of the first 64 primes.
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -1084,69 +1172,52 @@ fn sha256(data: &[u8]) -> [u8; 32] {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
     ];
-    // The fractional parts of the square roots of the first 8 primes.
-    const H: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
 
-    let mut message = data.to_vec();
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
+    let mut w = [0u32; 64];
+    for (index, word) in chunk.chunks_exact(4).enumerate() {
+        w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
     }
-    message.extend_from_slice(&bit_len.to_be_bytes());
+    for index in 16..64 {
+        let s0 =
+            w[index - 15].rotate_right(7) ^ w[index - 15].rotate_right(18) ^ (w[index - 15] >> 3);
+        let s1 =
+            w[index - 2].rotate_right(17) ^ w[index - 2].rotate_right(19) ^ (w[index - 2] >> 10);
+        w[index] = w[index - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[index - 7])
+            .wrapping_add(s1);
+    }
+    let mut v = *state;
+    for (index, constant) in K.iter().enumerate() {
+        let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+        let choose = (v[4] & v[5]) ^ (!v[4] & v[6]);
+        let temp1 = v[7]
+            .wrapping_add(s1)
+            .wrapping_add(choose)
+            .wrapping_add(*constant)
+            .wrapping_add(w[index]);
+        let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+        let majority = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+        let temp2 = s0.wrapping_add(majority);
+        v[7] = v[6];
+        v[6] = v[5];
+        v[5] = v[4];
+        v[4] = v[3].wrapping_add(temp1);
+        v[3] = v[2];
+        v[2] = v[1];
+        v[1] = v[0];
+        v[0] = temp1.wrapping_add(temp2);
+    }
+    for index in 0..8 {
+        state[index] = state[index].wrapping_add(v[index]);
+    }
+}
 
-    let mut state = H;
-    for chunk in message.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (index, word) in chunk.chunks_exact(4).enumerate() {
-            w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for index in 16..64 {
-            let s0 = w[index - 15].rotate_right(7)
-                ^ w[index - 15].rotate_right(18)
-                ^ (w[index - 15] >> 3);
-            let s1 = w[index - 2].rotate_right(17)
-                ^ w[index - 2].rotate_right(19)
-                ^ (w[index - 2] >> 10);
-            w[index] = w[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[index - 7])
-                .wrapping_add(s1);
-        }
-        let mut v = state;
-        for (index, constant) in K.iter().enumerate() {
-            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
-            let choose = (v[4] & v[5]) ^ (!v[4] & v[6]);
-            let temp1 = v[7]
-                .wrapping_add(s1)
-                .wrapping_add(choose)
-                .wrapping_add(*constant)
-                .wrapping_add(w[index]);
-            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
-            let majority = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
-            let temp2 = s0.wrapping_add(majority);
-            v[7] = v[6];
-            v[6] = v[5];
-            v[5] = v[4];
-            v[4] = v[3].wrapping_add(temp1);
-            v[3] = v[2];
-            v[2] = v[1];
-            v[1] = v[0];
-            v[0] = temp1.wrapping_add(temp2);
-        }
-        for index in 0..8 {
-            state[index] = state[index].wrapping_add(v[index]);
-        }
-    }
-
-    let mut digest = [0u8; 32];
-    for (index, word) in state.iter().enumerate() {
-        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    digest
+/// SHA-256 (FIPS 180-4) of a whole buffer: [`Sha256`] fed in one call.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -1215,6 +1286,30 @@ mod tests {
         assert!(is_digest(&digest));
         assert!(!is_digest(&digest.to_uppercase()));
         assert!(!is_digest(&digest[..63]));
+    }
+
+    /// The streaming hasher of section 3 step 4 is the same algorithm as the
+    /// one-shot form, at every chunk boundary that matters: the padding of the
+    /// block it spills into, and a split inside a block.
+    #[test]
+    fn a_chunked_digest_equals_the_one_shot_digest() {
+        let data = "a".repeat(1_000);
+        for split in [0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 999, 1_000] {
+            let mut hasher = Sha256::new();
+            hasher.update(&data.as_bytes()[..split]);
+            hasher.update(&data.as_bytes()[split..]);
+            assert_eq!(
+                hasher.hex(),
+                sha256_hex(data.as_bytes()),
+                "a split at {split} is the same digest"
+            );
+        }
+        // Byte at a time, which walks every pending-buffer path.
+        let mut hasher = Sha256::new();
+        for byte in data.as_bytes() {
+            hasher.update(&[*byte]);
+        }
+        assert_eq!(hasher.hex(), sha256_hex(data.as_bytes()));
     }
 
     #[test]
