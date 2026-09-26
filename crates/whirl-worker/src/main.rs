@@ -16,6 +16,7 @@
 //! fails with `no_candidates` and a message that names the missing kind.
 
 mod backend;
+mod http;
 mod lock;
 mod pipeline;
 mod sources;

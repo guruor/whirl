@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn the_local_kind_is_in_the_dispatch_table_and_wallhaven_is_not() {
+    fn both_kinds_of_the_schema_are_in_the_dispatch_table() {
         let dir = scratch("dispatch");
         plant(&dir.join("walls").join("one.png"), 2000, 1200);
 
@@ -668,11 +668,14 @@ mod tests {
             "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
              \"wallhaven\", \"weight\": 3, \"query\": \"landscape\" } ]\n}\n",
         );
-        assert!(
-            wallhaven.entries().is_empty(),
-            "a kind with no card yet is not served, and `config check` says so with \
-             `missing_reason`"
+        assert_eq!(
+            wallhaven.entries().len(),
+            1,
+            "every kind of the schema has an arm now, so `config check` reports a source it \
+             can ask rather than one it cannot"
         );
+        assert_eq!(wallhaven.entries()[0].config.id, "space");
+        assert_eq!(wallhaven.weights(), vec![3], "and so it can be drawn");
     }
 
     #[test]

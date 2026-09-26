@@ -2528,30 +2528,46 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_source_prints_a_reason_and_no_counter_group() {
-        // A kind with no arm in the dispatch table. `local` has one now, so the
-        // example is `wallhaven`, which does not
-        // (crates/whirl-worker/src/sources/mod.rs).
+    fn a_source_this_build_cannot_work_with_prints_a_reason_and_no_counter_group() {
+        // The second form of 2.6's optional group: `enabled=0` and a reason, with
+        // no counter group, because nothing was counted. Every kind of the schema
+        // has an arm in the dispatch table now, so the reason is a real refusal
+        // from a source itself rather than `missing_reason`; `local` over a path
+        // that is not there is the one that needs no machine and no network to
+        // produce it, and `disabled_record` is still the group's only builder.
         let config = Config::parse(
-            "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
-             \"wallhaven\", \"weight\": 3, \"query\": \"landscape\" } ]\n}\n",
+            "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"pictures\", \"kind\": \
+             \"local\", \"weight\": 1, \"paths\": [\"/whirl-fixture-that-is-not-there\"] } ]\n}\n",
         )
         .expect("the fixture config parses")
         .config;
-        let line = disabled_record(
-            &config.sources[0],
-            crate::sources::missing_reason(&config.sources[0]),
-        );
-        assert_eq!(
-            line,
-            "source: space wallhaven weight=3 enabled=0 last=- reason=no implementation for kind wallhaven in this build"
+        let sources = crate::sources::Sources::from_config(&config);
+        let entry = sources.get("pictures").expect("the kind has an arm");
+        let reason = entry
+            .source
+            .validate(&entry.config)
+            .expect_err("the path is not there")
+            .to_string();
+        let line = disabled_record(&config.sources[0], reason);
+        assert!(
+            line.starts_with("source: pictures local weight=1 enabled=0 last=- reason="),
+            "{line}"
         );
         let parsed = protocol::parse_source_record(&line).expect("the daemon reads it");
         assert!(!parsed.enabled);
         assert!(parsed.counters.is_empty());
-        assert_eq!(
-            parsed.reason.as_deref(),
-            Some("no implementation for kind wallhaven in this build")
+        let reason = parsed.reason.expect("a reason");
+        assert!(
+            reason.contains("no configured path can be read"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("/whirl-fixture-that-is-not-there"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("sources[id=pictures].paths"),
+            "the reason names the offending key (4.3): {reason}"
         );
     }
 
