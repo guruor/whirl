@@ -28,7 +28,8 @@ one, for a first pull request.
 
 ## Where the code is
 
-`crates/` does not exist yet; the workspace scaffold is the next thing to land,
-and `development.md` section 1 is the tree it has to produce. Until it lands,
-`development.md`'s commands are verified against a throwaway scaffold rather than
-against this repository, and it says so.
+`crates/` is the Cargo workspace: `whirl-core`, `whirld`, `whirl-cli` and
+`whirl-worker`, four members and no third-party dependency, the four crates
+`development.md` section 1 names. It landed with the first slice of the engine,
+pull request #1. Which of `development.md`'s commands have been run, and against
+what, is the status table at the top of that document.

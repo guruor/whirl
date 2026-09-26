@@ -23,18 +23,17 @@ decision.
 
 **How the commands in this document were verified.** The workspace did not exist
 when this document was written, so the local-development sequence, the guard
-scripts and the CI command set were run against a throwaway scaffold kept outside
-the repository: same crate names, same binary names, same environment variable
-names, `cargo build`, `cargo test`, `cargo fmt`, `cargo clippy -D warnings`, a
-daemon on a scratch socket with the noop backend, and a real worker spawned per
-rotation. That scaffold is not product code and is not committed; it exists to
-prove the guide's commands before the guide is merged. The exact sequence, and the
-observed output, are in "Local development" and in the card's handoff note.
+scripts and the CI command set were first run against a scaffold kept outside the
+repository: same crate names, same binary names, same environment variable names,
+`cargo build`, `cargo test`, `cargo fmt`, `cargo clippy -D warnings`, a daemon on a
+scratch socket with the noop backend, and a real worker spawned per rotation. That
+scaffold is not product code and is not committed; it existed to prove the guide's
+commands before the guide was merged. The exact sequence, and the observed output,
+are in "Local development".
 
-What that means for you: the commands are correct as written, and the first thing
-the scaffold card owes this document is the same sequence passing in the real
-tree. If a command here does not work after the scaffold lands, that is a bug in
-one of the two, and this document is the one to fix.
+The workspace has since landed, as pull request #1, and the status table above is
+the record of what has run against it. If a command here does not work in the real
+tree, that is a bug, and this document is the one to fix.
 
 **Executed on this machine (macOS), for this document:** `cargo build`, `cargo
 test`, `cargo fmt --check` and `cargo clippy -- -D warnings` on the verification
@@ -1439,10 +1438,17 @@ a scratch directory and never ran. The procedure is in the repository now, as tw
 scripts, and the restore is the last thing you run.
 
 This is macOS only. macOS is the only platform with a setter to test
-(`crates/whirl-worker/src/backend/macos.rs`), and on `development` that setter is
-still a stub: a `WHIRL_BACKEND=native` rotation fails with `set_failed`, which is
-the truth until PR #14 lands. The per-platform checklists in section 3 stay where
-they are; this is the part of that work that must not leave a trace.
+(`crates/whirl-worker/src/backend/macos.rs`), and that setter is real: `set()`
+calls `setDesktopImageURL:forScreen:options:error:` once per screen in
+`NSScreen.screens` order and reports `set_failed` if any screen refuses.
+`set_failed` does not mean nothing changed: the screens are written one at a time
+in that order and the call returns at the first screen that refuses, so the whole
+rotation is reported as a failure while the screens before the refusing one have
+already been set. A `WHIRL_BACKEND=native` rotation that ends in `set_failed` may
+therefore have moved some screens and not others. (Windows and Linux still answer
+`set_failed`, which is their truth: on those platforms nothing is set.) The
+per-platform checklists in section 3 stay where they are; this is the part of
+that work that must not leave a trace.
 
 ```sh
 # 1. The default, and what every test uses: no real set at all.
@@ -1454,10 +1460,10 @@ WHIRL_BACKEND=noop target/debug/whirl-worker --config "$WHIRL_CONFIG" --verb rot
 #    node it recorded.
 scripts/desktop-snapshot.sh /tmp/desktop-snapshot.txt
 
-# 3. The real set. With the macOS setter on your branch (PR #14):
+# 3. The real set, with the macOS setter that landed in PR #14:
 WHIRL_BACKEND=native target/debug/whirl-worker --config "$WHIRL_CONFIG" --verb rotate --run 1
-#    With the setter still a stub, one set by hand does the same thing, with the
-#    harness's own setter. Both probes are built into /tmp, as the probes README does:
+#    The harness's own setter is there for a set by hand, with no worker in the
+#    loop. Both probes are built into /tmp, as the probes README does:
 clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics -o /tmp/wp_probe docs/research/probes/wp_probe.m
 clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics -o /tmp/wp_set   docs/research/probes/wp_set.m
 /tmp/wp_set "/System/Library/Desktop Pictures/Mac Pink.heic"
