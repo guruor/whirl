@@ -25,7 +25,8 @@ artifacts, and one of them contradicted itself:
   notes it assembles asked for no signing either: the `### macOS` row wanted "what
   the user has to do" for an unsigned tarball, without naming the step.
 
-The facts the decision rests on are in `docs/research/macos.md` 8:
+The facts the decision rests on are in `docs/research/macos.md` 8 and
+`docs/development.md` section 5:
 
 - **Signing is not what makes it run; notarization is what distribution needs.**
   A binary you built yourself, or one installed by a package manager, runs without
