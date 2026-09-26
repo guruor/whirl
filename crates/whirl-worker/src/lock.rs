@@ -382,17 +382,43 @@ mod tests {
     /// is the pair 8.8's daemon-side exception matches on to recognise the worker
     /// it has just reaped. Read back as text, because that is how the daemon
     /// reads it.
+    ///
+    /// The start time is a window here and not an equality against a fresh
+    /// `record`: `record` samples the clock when it is called, so an equality
+    /// made this test its own second boundary -- the file's copy was written
+    /// inside `take`, a few microseconds and occasionally a whole second before
+    /// the comparison's copy (`msrv (1.85.0)` on pull request #57: same pid,
+    /// `start` one second apart, on a docs-only head). Sampling the clock either
+    /// side of the take still names the second `take` wrote -- the write happens
+    /// inside those two readings -- without depending on where in a second the
+    /// take landed, and a stamp outside the window is still a failure.
     #[test]
     fn the_lock_file_names_its_holder() {
         let dir = scratch("record");
+        let before = unix_seconds();
         let holder = take(&dir)
             .expect("a take that cannot fail")
             .expect("the lock is free to begin with");
+        let after = unix_seconds();
+
         let text = std::fs::read_to_string(dir.join(ROTATE_FILE)).expect("the lock file");
+        let pid = std::process::id();
+        let start = text
+            .lines()
+            .find_map(|line| line.strip_prefix("start: "))
+            .and_then(whirl_core::protocol::parse_rfc3339_utc)
+            .expect("the file carries 8.7's `start:` line, in the daemon's reader's grammar");
         assert_eq!(
             text,
-            record(std::process::id()),
-            "the record is the holder's own pid and start time"
+            format!(
+                "pid: {pid}\nstart: {}\n",
+                whirl_core::protocol::rfc3339_utc(start)
+            ),
+            "the record is the holder's own pid and its start time, and nothing else"
+        );
+        assert!(
+            before <= start && start <= after,
+            "the file's start time is the one `take` wrote: {start} is outside [{before}, {after}]"
         );
         drop(holder);
     }
