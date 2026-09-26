@@ -966,6 +966,75 @@ When you build a backend, make that split explicit in the code: the setter call
 should be the only thing behind the backend boundary, so the noop path and the
 native path differ in one function.
 
+### When a check needs a real set
+
+Section 3's table is honest about the one thing `noop` cannot cover: whether the
+platform setter changes the wallpaper at all. Proving that takes one real set on
+real hardware, and the part that goes wrong is not the set, it is the state you
+leave behind. On 2026-09-26 a real-hardware check left a 95-byte test PNG as the
+live desktop picture, because the `restore.sh` that should have undone it lived in
+a scratch directory and never ran. The procedure is in the repository now, as two
+scripts, and the restore is the last thing you run.
+
+This is macOS only. macOS is the only platform with a setter to test
+(`crates/whirl-worker/src/backend/macos.rs`), and on `development` that setter is
+still a stub: a `WHIRL_BACKEND=native` rotation fails with `set_failed`, which is
+the truth until PR #14 lands. The per-platform checklists in section 3 stay where
+they are; this is the part of that work that must not leave a trace.
+
+```sh
+# 1. The default, and what every test uses: no real set at all.
+WHIRL_BACKEND=noop cargo test --workspace
+WHIRL_BACKEND=noop target/debug/whirl-worker --config "$WHIRL_CONFIG" --verb rotate --run 1
+
+# 2. Before any real set, snapshot the frontmost Space. Keep the file out of the
+#    repository: it is a property of your machine. The script prints the Space
+#    node it recorded.
+scripts/desktop-snapshot.sh /tmp/desktop-snapshot.txt
+
+# 3. The real set. With the macOS setter on your branch (PR #14):
+WHIRL_BACKEND=native target/debug/whirl-worker --config "$WHIRL_CONFIG" --verb rotate --run 1
+#    With the setter still a stub, one set by hand does the same thing, with the
+#    harness's own setter. Both probes are built into /tmp, as the probes README does:
+clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics -o /tmp/wp_probe docs/research/probes/wp_probe.m
+clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics -o /tmp/wp_set   docs/research/probes/wp_set.m
+/tmp/wp_set "/System/Library/Desktop Pictures/Mac Pink.heic"
+
+# 4. Put it back, and read the proof of it. This is the last action of the run:
+scripts/desktop-restore.sh /tmp/desktop-snapshot.txt
+
+# 5. What the desktop was left on, and the store line for the handoff. The store
+#    line for the Space node is the proof; --holds takes the path the snapshot
+#    recorded, so it needs no uuid:
+python3 docs/research/probes/wallpaper_store.py current --holds "$(sed -n 's/^path=//p' /tmp/desktop-snapshot.txt)"
+/tmp/wp_probe | sed -n 's/^  desktopImageURL: //p'
+```
+
+Step 4 prints `restored : file:///System/Library/Desktop%20Pictures/Mac%20Yellow.heic`
+and the `LastSet` it moved, for example
+`2026-09-26 07:23:09.851069 -> 2026-09-26 07:23:17.739266 (UTC)`. Step 5 prints the
+image you snapshotted, with that same new `LastSet`. Those two lines are the proof,
+and they are what goes in the handoff.
+
+Four rules, all of them consequences of a write reaching the frontmost Space only:
+
+- **Never leave the desktop on a fixture.** Step 4 is the last action of any
+  real-hardware run. If it exits non-zero the desktop is still on the fixture, and
+  that is what to fix before reporting anything: a run that quietly stopped
+  halfway is how the 95-byte PNG happened.
+- **Never check a wallpaper change with a screenshot.** Read the store (step 5).
+  `wp_probe` says what is on screen; the store says what was set and when.
+  `LastSet` is the write marker and is UTC; `LastUse` is not a write marker at all
+  (`docs/research/probes/README.md`, "Two ways to misread this store").
+- **A snapshot is per-Space**, so both scripts refuse rather than guess.
+  `desktop-snapshot.sh` refuses a picture macOS cannot set again, which is what a
+  deleted or pruned image looks like from the store (the store still names it, and
+  the file is gone). `desktop-restore.sh` refuses when the frontmost Space is not
+  the one the snapshot named, or when the write does not show up in the store.
+  Neither refusal writes anything.
+- **Say which image the desktop was left on** in the handoff, with the store line.
+  "The wallpaper is fine" is not evidence.
+
 ### Running the pieces by hand
 
 The worker is a program, not a library. Its argv, its environment and its stdout
