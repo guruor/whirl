@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 # Whirl's one gate: one mode per check, and each mode is the command the
-# matching job in .github/workflows/ci.yml runs, with the same flags. A local
-# run and a CI run cannot drift apart, because there is one copy of every
-# command (docs/development.md, "The gate" in section 3).
+# matching job in .github/workflows/ci.yml runs, with the same flags, so there
+# is one copy of every command and a local run and a CI run cannot drift apart
+# (docs/development.md, "The gate" in section 3).
+#
+# One mode is deliberately not yet the command its job runs, and this comment is
+# the whole of the difference. `test` here is `cargo nextest run --workspace
+# --no-tests=fail` then `cargo test --workspace --doc`; the `test` job still
+# inlines `cargo test --workspace`. Those are two harnesses, not two spellings of
+# one: nextest runs one process per test, which is what the ETXTBSY class needs
+# and which the shared-process harness cannot see; nextest does not run doctests,
+# so the mode runs them separately; and a test that passes only while it inherits
+# another test's state passes in CI and fails here. A green `test` here is
+# therefore not evidence about the `test` job, and the other way round. The
+# wiring pull request (card t_438e03b0; pull request #30, open and unmerged at
+# this commit) points every job at these modes and installs the pinned
+# cargo-nextest on the runners, and the identity then holds by construction.
 #
 #   ./scripts/ci.sh fmt          cargo fmt --all -- --check
 #   ./scripts/ci.sh clippy       cargo clippy --workspace --all-targets -- -D warnings

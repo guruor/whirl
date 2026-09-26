@@ -110,9 +110,9 @@ docs/
                                 and a GitHub Release (section 5)
 .github/release-notes-template.md   the shape of a release's notes, and the sections
                                     a release may not publish without (section 5)
-scripts/ci.sh               the gate: one mode per check, each mode the command the
-                            matching job runs, plus the container and msrv modes
-                            (section 3)
+scripts/ci.sh               the gate: one mode per check, each mode the matching
+                            job's command (section 3 names the one deliberate
+                            difference), plus the container and msrv modes
 scripts/gate.Dockerfile     the gate's Linux image: the pinned toolchain plus the
                             pinned cargo-nextest, one pin per architecture
 .config/nextest.toml        the test runner's repository config: the version, the
@@ -267,10 +267,26 @@ What each CI job exercises, and how to run the same thing locally.
 
 ### The gate: `scripts/ci.sh`
 
-One script, one mode per check, each mode the matching job's command with the
-same flags. That is the contract: one copy of every command, so a local run and a
-CI run cannot drift, and a check that is not a mode of the script is a preference
-rather than a gate.
+One script, one mode per check. The contract is one copy of every command: each
+mode is the matching job's command with the same flags, so a local run and a CI
+run cannot drift, and a check that is not a mode of the script is a preference
+rather than a gate. One mode is deliberately not its job's command at this
+commit, and it is the one with the most to prove:
+
+- the `test` job in `.github/workflows/ci.yml` runs `cargo test --workspace`;
+- the `test` mode here runs `cargo nextest run --workspace --no-tests=fail` and
+  then `cargo test --workspace --doc`.
+
+Different harnesses, not two spellings of one command: nextest runs one process
+per test, which is what the ETXTBSY class needs and what the shared-process
+harness cannot see; nextest does not run doctests, so the mode runs them
+separately; and a test that passes only while it inherits another test's state
+passes in CI and fails here. A green `test` here is therefore not evidence about
+the `test` job, and a green `test (ubuntu-latest)` in CI is not evidence about
+this mode. The wiring pull request (card t_438e03b0; pull request #30, open and
+unmerged at this commit) rewires every job to call these modes and installs the
+pinned `cargo-nextest` on CI's runners, which makes the mode and the job the same
+command; the rule at the end of section 4 is the frame this exception sits in.
 
 Before you push, run one thing:
 
@@ -356,11 +372,19 @@ each with a reason that the job prints on every run.
 
 The rule that keeps it honest: **every command a contributor is expected to run
 before opening a pull request is a mode of `scripts/ci.sh` (section 3), and each
-mode is the matching job's command, verbatim.** A check that is not a mode of the
-script is a preference, not a gate: adding one means adding the mode and the job
-that calls it, in the same pull request. The jobs are switched to calling the
-modes by their own pull requests, so while a job still inlines its command, that
-command and its mode must stay textually identical.
+mode is the matching job's command, verbatim, once that job calls the mode.** A
+check that is not a mode of the script is a preference, not a gate: adding one
+means adding the mode and the job that calls it, in the same pull request. The
+jobs are switched to calling the modes by their own pull requests, so while a job
+still inlines its command, that command and its mode must stay textually
+identical, with one exception named here rather than smuggled past the rule: the
+`test` job still inlines `cargo test --workspace` while the `test` mode runs
+nextest and then the doctests (section 3). The wiring pull request (card
+t_438e03b0; pull request #30, open and unmerged at this commit) is what ends that
+exception: it points the jobs at the modes and installs the pinned `cargo-nextest`
+on the runners, which is the first commit at which the `test` mode and the `test`
+job are the same command. Until then, a green `test` mode does not prove the
+`test` job green.
 
 Caching covers `~/.cargo/registry`, `~/.cargo/git` and `target`, keyed by runner
 OS and the `Cargo.lock` hash. With zero dependencies there is little to cache
