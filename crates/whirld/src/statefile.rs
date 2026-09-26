@@ -91,29 +91,7 @@ impl Store {
     /// 6.3 steps 1 to 3: serialise, write the temp file in the same directory,
     /// `fsync` it. Nothing is visible under the target name yet.
     pub fn stage(&self, kind: Kind, text: &str) -> Result<Staged, String> {
-        let target = self.path(kind);
-        let temp = self.dir.join(format!(
-            "{}.tmp-{}-{}",
-            kind.name(),
-            std::process::id(),
-            unique()
-        ));
-        let mut file = fs::File::create(&temp)
-            .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
-        // The state directory is 0700, so the file is already out of reach of
-        // other users; this is the same belt as `plan::restrict_to_owner` wears
-        // for the config, and it costs one call.
-        restrict(&temp);
-        file.write_all(text.as_bytes())
-            .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
-        file.sync_all()
-            .map_err(|error| format!("cannot fsync {}: {error}", temp.display()))?;
-        Ok(Staged {
-            temp,
-            target,
-            dir: self.dir.clone(),
-            committed: false,
-        })
+        stage_named(&self.dir, kind.name(), text)
     }
 
     /// The whole protocol: stage, then rename.
@@ -220,6 +198,41 @@ fn remove_any(path: &Path) -> io::Result<()> {
     } else {
         fs::remove_file(path)
     }
+}
+
+/// 6.3 steps 1 to 3 for one named file in one directory: the temp file is
+/// created beside the target, so the rename of step 4 is same-filesystem.
+///
+/// `Store::stage` is this function with the state directory and a `Kind`;
+/// `cache/index.json` needs the same protocol in the cache root, because 6.3 is
+/// written for "every state file, no exceptions" (2.1 calls the index a state
+/// file and 7.2 gives it to the daemon) and because two readers depend on the
+/// rename: the worker, and the next daemon start.
+fn stage_named(dir: &Path, name: &str, text: &str) -> Result<Staged, String> {
+    let target = dir.join(name);
+    let temp = dir.join(format!("{name}.tmp-{}-{}", std::process::id(), unique()));
+    let mut file = fs::File::create(&temp)
+        .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
+    // The state directory is 0700, so the file is already out of reach of
+    // other users; this is the same belt as `plan::restrict_to_owner` wears
+    // for the config, and it costs one call.
+    restrict(&temp);
+    file.write_all(text.as_bytes())
+        .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot fsync {}: {error}", temp.display()))?;
+    Ok(Staged {
+        temp,
+        target,
+        dir: dir.to_path_buf(),
+        committed: false,
+    })
+}
+
+/// The whole protocol for a named file in a directory that is not the state
+/// directory: stage, then rename. `cache/index.json` (5.5 step 6).
+pub fn write_named(dir: &Path, name: &str, text: &str) -> Result<(), String> {
+    stage_named(dir, name, text)?.commit()
 }
 
 #[cfg(test)]
