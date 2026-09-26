@@ -871,6 +871,16 @@ favorites.
 `decision:` reset is a first-class pair of verbs rather than advice, because R1
 makes it trivial and a user should not have to remember a path.
 
+`decision:` **`whirl reset` is not in the v0.1 surface, and the table below is
+the design for a verb no v0.1 build has.** `docs/spec/features.md` 1.1 ships a
+closed verb set ("v0.1 ships this verb set and no more") and holds no `reset`;
+section 9 of this document adds no verb to it ("no new verb is needed and none is
+added"); and `docs/architecture.md` 2.5 and 2.5.1, the protocol grammar and the
+CLI verb mapping, close over the same set. The CLI answers `whirl reset` with its
+unknown-command error and the protocol has no request for it, so until the verb
+lands the raw form below is the whole of what a user can do, and the mentions of
+it in 1.4, 6.4 and 8.2 read as this design rather than as a command that exists.
+
 | Verb | Effect | Cache | History | Favorites |
 |---|---|---|---|---|
 | `whirl reset --state` | Quarantine-then-replace the three state files with fresh empty ones | untouched | cleared | cleared |
@@ -905,18 +915,27 @@ and it only happens when a daemon dies.
 
 ### 7.2 Ownership table, and the locks
 
-| Path | Writer | Readers |
-|---|---|---|
-| `config.json` | the user, in an editor | daemon, at start and on reload |
-| `state/current.json` | daemon | daemon; humans with `cat` |
-| `state/history.json` | daemon | daemon |
-| `state/favorites.json` | daemon | daemon |
-| `log` | daemon | humans |
-| `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup |
-| `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both |
-| `cache/index.json` | daemon | daemon; `whirl status` |
-| `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only |
-| `cache/tmp/**` | the worker run that created it | nobody |
+`Writer` names the one process that writes the file. `Readers` names the
+processes that open it: a `whirl` verb that shows a file's contents is not one of
+them, because it asks the daemon, which is already named on the row, and `whirl
+status` reports `cache/index.json`'s `root_id` (2.1) from the daemon that opened
+it. `Surface` names the `whirl` verbs a user runs to observe or change the file,
+or `none` where no verb does, which leaves the filesystem as the only way in.
+Every surface below is answered by the daemon, because the daemon is the process
+that opens the file.
+
+| Path | Writer | Readers | Surface |
+|---|---|---|---|
+| `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path | `whirl config path`, `whirl config check`, `whirl sources` |
+| `state/current.json` | daemon | daemon; humans | `whirl status`; `whirl pause`, `whirl resume` |
+| `state/history.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl history`; `whirl prev` |
+| `state/favorites.json` | daemon | daemon | `whirl favorites`; `whirl favorite`, `whirl unfavorite` |
+| `log` | daemon | humans | none |
+| `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup | `whirl status` (`lock_mode`) |
+| `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both | `whirl status` (`sweep_deferred`) |
+| `cache/index.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl status` (`cache_root_id`) |
+| `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only | `whirl status` (`cache_files`, `cache_bytes`) |
+| `cache/tmp/**` | the worker run that created it | nobody | none |
 
 - `daemon.lock` is taken with `flock(LOCK_EX|LOCK_NB)` on POSIX [L 3] and
   `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)` on Windows [9],
