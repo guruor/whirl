@@ -364,9 +364,16 @@ a worked transcript of a real session; section 2.12 lists where this deliberatel
 the prototype's socket is `srw-------` (`0600`) as intended, and a unix socket bound with no
 `chmod` at this machine's umask `0022` is `srwxr-xr-x` (`0755`). Group and other *may connect*
 in the interval between `bind()` and `set_permissions()`. `decision:` whirl sets the process umask
-to `0o077` around the `bind` call and then `fchmod`s the socket to `0600`, so there is no interval
-in which a connection is possible without the user's identity. The Windows pipe gets its DACL in
-the `CreateNamedPipe` call itself, so the equivalent interval does not exist there.
+to `0o177` around the `bind` call, so `0777 & ~0o177` is `0o600` and the socket is *created* at the
+mode of Pr4, and then `fchmod`s it to `0600` as the enforcement that does not rest on the umask.
+That is stronger than the `0o077` it replaced: `0o077` (`0777 & ~0o077` is `0700`) closes the
+connection window too, but the file exists as `0700` until the `fchmod` lands, and a client that
+connects in that interval -- a bound socket accepts as soon as `bind` returns -- reads it as `0700`.
+Measured: with the old mask and a 3 s stall inserted between the two calls, an observer of the path
+sees `0700` and then `0600`, and `whirld::control_socket`'s `the_socket_is_0600_in_a_0700_directory`
+fails with `448` against `384`; with `0o177` and the same stall it sees `0600` only (t_6c776148).
+The Windows pipe gets its DACL in the `CreateNamedPipe` call itself, so the equivalent interval does
+not exist there.
 
 **Path length.** `sun_path` is 104 bytes on this machine `[L 1]`, and the macOS default socket
 path is already 69 of them `[L 7]`, so a longer user name or home directory can exceed the limit.
@@ -1665,7 +1672,7 @@ What that boundary does and does not buy:
 
 | Measure | Why | Basis |
 |---|---|---|
-| umask `0077` around `bind`, then `fchmod 0600` | measured: a socket bound without a `chmod` is `0755` at this machine's umask, so it is connectable by others between `bind` and `chmod` | `[L 3]` |
+| umask `0177` around `bind`, so the socket is created `0600` in one step, then `fchmod 0600` | measured: a socket bound without a `chmod` is `0755` at this machine's umask, so it is connectable by others between `bind` and `chmod`; `0o177` leaves no interval in which the file is anything but `0600` either | `[L 3]`, t_6c776148 |
 | state, cache and log directories `0700`, files `0600` | state files carry the user's wallpaper paths and rotation history | `[D 6 §1]` |
 | peer UID checked on each accepted connection (`getpeereid` on macOS, `SO_PEERCRED` on Linux; the pipe DACL on Windows) and refused otherwise | defence in depth: the mode check depends on the filesystem behaving, and the peer check does not | `decision:`, mechanism `[L 1]` shows the socket is a filesystem object |
 | stale socket unlinked only after a failed connect probe | unlinking a live daemon's socket leaves it running and unreachable, then lets a second daemon take the path | `[M 15]` |
