@@ -1268,7 +1268,7 @@ mod tests {
         let dir = scratch("loop");
         let walls = dir.join("walls");
         plant(&walls.join("one.png"), 2560, 1440);
-        symlink(&walls, &walls.join("again")).expect("the loop");
+        symlink(&walls, walls.join("again")).expect("the loop");
 
         let candidates = enumerate(
             &table(&dir, ", \"follow_symlinks\": true, \"max_depth\": 40"),

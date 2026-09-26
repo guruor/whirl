@@ -1813,3 +1813,138 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     assert_eq!(value(&lines, "rotating"), "0");
     assert_eq!(value(&lines, "state_corrupt"), "-");
 }
+
+/// A PNG header only: the magic and the IHDR chunk, which is all 2.5's
+/// `resolution` stage reads (the `whirl-worker` fixtures plant the same shape).
+/// The two sizes are above the 1600x900 floors 4.2 ships, so nothing in the
+/// pipeline rejects them on this machine or on any other.
+fn rotation_png(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes
+}
+
+/// A config whose only source is `walls`, so a rotation has exactly the images
+/// the test planted: no second source, and no counter that depends on the
+/// machine the test runs on.
+fn write_rotation_config(dir: &Path, walls: &Path) {
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"sources\": [\n    \
+             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [\"{}\"] }}\n  ]\n}}\n",
+            walls.display()
+        ),
+    )
+    .expect("the test's own config");
+}
+
+/// The four fields of 2.6's `set:` line: `<digest> <origin_key> <via> <path>`.
+fn set_fields(lines: &[String]) -> Vec<String> {
+    let line = lines
+        .iter()
+        .find(|line| line.starts_with("set: "))
+        .unwrap_or_else(|| panic!("a set line in {lines:?}"));
+    line["set: ".len()..]
+        .split(' ')
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `local` source's rotation, end to end and over the real socket: two
+/// images in the configured directory, `next` twice, and the second answer is
+/// the other image rather than the one already set (4.1's window).
+///
+/// Every claim is checked against the filesystem, not against the answer alone:
+/// the `set:` line's path has to exist inside this daemon's own cache root, the
+/// bytes there have to be one of the two planted files, and `history.json` has
+/// to name both origins. The third `next` is 4.1's exhaustion case: with two
+/// candidates and both in the window, the source stage has nothing left, and the
+/// failure is the named one rather than a repeat.
+///
+/// The worker the daemon spawns is the binary `cargo test --workspace` builds
+/// next to the daemon (this file's module doc), so a `-p whirld` run after a
+/// `whirl-worker` edit can test a stale one: build the workspace when the source
+/// changed.
+#[test]
+fn a_local_source_rotates_and_the_second_next_is_the_other_image() {
+    let planted: Vec<(&str, Vec<u8>)> = vec![
+        ("wide.png", rotation_png(2560, 1440)),
+        ("narrow.png", rotation_png(2048, 1152)),
+    ];
+    let daemon = start_prepared(
+        "a_local_source_rotates_and_the_second_next_is_the_other_image",
+        |dir| {
+            let walls = dir.join("walls");
+            std::fs::create_dir_all(&walls).expect("the source's directory");
+            for (name, bytes) in &planted {
+                std::fs::write(walls.join(name), bytes).expect("a planted image");
+            }
+            write_rotation_config(dir, &walls);
+        },
+    );
+
+    let cache_root = daemon.dir.join("cache");
+    let first = set_fields(&daemon.ask("next"));
+    assert_eq!(first.len(), 4, "set: <digest> <origin_key> <via> <path>");
+    assert_eq!(first[2], "source", "a rotation sets through a source (2.6)");
+    assert!(
+        first[1].starts_with("pictures:"),
+        "the origin key is the source's id and its candidate's id: {}",
+        first[1]
+    );
+    let first_path = PathBuf::from(&first[3]);
+    assert!(
+        first_path.starts_with(&cache_root),
+        "the cache file is inside the root this daemon resolved: {}",
+        first_path.display()
+    );
+    let first_bytes = std::fs::read(&first_path).expect("the first cache file");
+    assert!(
+        planted.iter().any(|(_, bytes)| bytes == &first_bytes),
+        "the bytes in the cache are the image the source offered"
+    );
+
+    let second = set_fields(&daemon.ask("next"));
+    assert_ne!(
+        first[0], second[0],
+        "the second `next` is a different image: one candidate was set and the other was not (4.1)"
+    );
+    assert_ne!(first[1], second[1], "two files, two origins");
+    let second_bytes = std::fs::read(Path::new(&second[3])).expect("the second cache file");
+    assert!(
+        planted.iter().any(|(_, bytes)| bytes == &second_bytes),
+        "the second cache file is the other planted image"
+    );
+    assert_ne!(first_bytes, second_bytes, "two images, not one twice");
+
+    let history = std::fs::read_to_string(daemon.dir.join("state").join("history.json"))
+        .expect("the history ring");
+    for fields in [&first, &second] {
+        assert!(
+            history.contains(&fields[0]) && history.contains(&fields[1]),
+            "history.json records {} / {}: {history}",
+            fields[0],
+            fields[1]
+        );
+    }
+    assert_eq!(
+        history.matches("\"origin_key\"").count(),
+        2,
+        "two rotations, two entries: {history}"
+    );
+    assert_eq!(value(&daemon.ask("history 5"), "count"), "2");
+
+    let third = daemon.ask("next");
+    assert!(
+        third
+            .iter()
+            .any(|line| line.starts_with("ERR no_candidates")),
+        "both candidates are in the window, so the third `next` is exhaustion, not a repeat: {third:?}"
+    );
+}
