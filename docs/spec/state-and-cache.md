@@ -927,7 +927,7 @@ that opens the file.
 | Path | Writer | Readers | Surface |
 |---|---|---|---|
 | `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path | `whirl config path`, `whirl config check`, `whirl sources` |
-| `state/current.json` | daemon | daemon; humans with `cat` | `whirl status`; `whirl pause`, `whirl resume` |
+| `state/current.json` | daemon | daemon; humans | `whirl status`; `whirl pause`, `whirl resume` |
 | `state/history.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl history`; `whirl prev` |
 | `state/favorites.json` | daemon | daemon | `whirl favorites`; `whirl favorite`, `whirl unfavorite` |
 | `log` | daemon | humans | none |
