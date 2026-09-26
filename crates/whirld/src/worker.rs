@@ -327,9 +327,13 @@ fn failure_from(stderr: &str) -> WorkerError {
 /// `SIGTERM`, five seconds, then `SIGKILL` (1.7.1).
 ///
 /// `Child::kill` is `SIGKILL` on Unix and the standard library has no signal
-/// API, so the polite half is handed to the `kill` utility below. What this
-/// module may not assume is that a `kill` program is installed, and the history
-/// is kept here because the failure mode was silence:
+/// API, so the polite half is one `kill(2)` call, through the declaration and
+/// the `send_signal` wrapper below. A syscall has no program that can be
+/// missing, so the absent-`kill`-binary class is gone rather than covered by a
+/// second program that could be absent as well, and no `exec` is left anywhere
+/// on the signal path. What this module may not assume is that a `kill` program
+/// is installed, and the history is kept here because the failure mode was
+/// silence:
 ///
 /// `kill(1)` is `procps`' on Debian, `procps` is priority `important` rather
 /// than `required`, and the slim images this project builds and reviews in
@@ -349,12 +353,32 @@ fn failure_from(stderr: &str) -> WorkerError {
 /// so the worker is a grandchild with an ordinary PID (probe: worker PID 33 and
 /// the script's own `$$` 33, while PID 1 held `sh`). Nothing in this path turns
 /// on PID 1's default dispositions; all of it turns on whether a `kill` program
-/// exists, which is why the answer is a second route rather than a test that
-/// stops asking for one.
+/// exists, which is why the answer is a route that cannot be missing rather than
+/// a second program that might be.
+///
+/// The route changed the failure mode, so this is what the syscall can return
+/// and what each one is worth here. It is printed, not discarded:
+///
+/// - `ESRCH`, no such process: the child exited by itself between the deadline
+///   that put us here and this call, which is the one race this path always had
+///   and is not a defect. Worth the line anyway, because a pid that is already
+///   gone is exactly the case where a polite half that never landed leaves no
+///   trace in the outcome: the run still ends in `Timeout` either way.
+/// - `EPERM`, this process may not signal that pid: a child of ours is not a
+///   candidate for it outside a sandbox or a uid change, and nothing here could
+///   fix it if it were. Not fatal, `SIGKILL` below is attempted either way, and
+///   the run ends in `Timeout` exactly as 1.7.1 says.
+/// - `EINVAL`, the signal number is not one this platform accepts: unreachable
+///   from this code, which passes `SIGTERM` and (in the test) `SIGNAL_NONE`,
+///   both valid on every Unix here. It is a programming error, and it gets the
+///   same line as the other two.
 fn terminate(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        let _ = kill(child.id(), "-TERM");
+        let pid = child.id();
+        if let Err(error) = send_signal(pid, SIGTERM) {
+            eprintln!("whirld: worker {pid}: SIGTERM: {error}");
+        }
     }
     let grace = Instant::now() + TERM_GRACE;
     while Instant::now() < grace {
@@ -368,49 +392,40 @@ fn terminate(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// The `kill` utility: how this build sends one signal to one pid, because the
-/// standard library exposes no signal API beyond `Child::kill`, which is
-/// `SIGKILL`, and this workspace has no third-party dependencies to borrow one
-/// from.
-///
-/// Two routes, cheapest first. `kill(1)` is a single `exec` and is what macOS
-/// and any Linux with `procps` installed provide; where there is no such binary
-/// (`terminate` above names the images and the `ENOENT`) the shell's own `kill`
-/// builtin does the same job. POSIX requires `sh` to have that builtin, every
-/// Unix this build targets ships a `sh`, and this project already runs scripts
-/// through `sh` in its own tests, so the fallback costs one fork on the
-/// platforms that need it and nothing at all anywhere else.
-///
-/// The option and the pid go to the shell as positional arguments rather than
-/// interpolated into its command string, so neither can be read as syntax even
-/// if a later caller passes something this one did not.
-///
-/// `None` means neither route could be started at all. That is the one case
-/// that would put 1.7.1 back where the history above found it, and neither
-/// caller treats it as fatal: `terminate` does not depend on the polite half
-/// succeeding, because `SIGKILL` is still there, and the test's probe is a
-/// best-effort question with its own assertion to fail on.
+/// `SIGTERM`: the polite half of 1.7.1. 15 on every Unix this build targets,
+/// macOS included.
 #[cfg(unix)]
-fn kill(pid: u32, option: &str) -> Option<std::process::ExitStatus> {
-    let pid = pid.to_string();
-    let direct = Command::new("kill")
-        .arg(option)
-        .arg(&pid)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match direct {
-        Ok(status) => Some(status),
-        Err(_) => Command::new("sh")
-            .arg("-c")
-            .arg("kill \"$1\" \"$2\"")
-            .arg("sh")
-            .arg(option)
-            .arg(&pid)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .ok(),
+const SIGTERM: i32 = 15;
+
+// `kill(2)`, declared by hand because this workspace has no third-party
+// dependencies (v0.1) and there is no `libc` to borrow the declaration from.
+// `flock` is declared the same way in `lock.rs` and `tests/daemon_lock.rs`, and
+// `umask` in `socket.rs`.
+//
+// `pid_t` is `i32` on macOS and on Linux, and this module is Unix-only (every
+// module of this binary is: `main.rs`), so one declaration covers both.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+/// Send `signal` to `pid`, through `kill(2)` and nothing else.
+///
+/// `Ok(())` means the kernel accepted the signal for delivery. `Err` carries
+/// the errno, which is what `terminate` above prints and what the test below
+/// asserts on. There is no second route: on every Unix this builds for, the
+/// syscall is the thing that exists, and it is the only thing that has to.
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: `kill(2)` takes two integers, reads no memory and dereferences no
+    // pointer, so no argument can make it fault and the most a bad one buys is
+    // `EINVAL`. `pid` is a live child's own id from `Child::id`, which is a
+    // `pid_t` widened to `u32` on Unix, so the cast narrows nothing back.
+    let sent = unsafe { kill(pid as i32, signal) };
+    if sent == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -827,12 +842,11 @@ mod tests {
         );
 
         let pid: u32 = scripts.text("pid.txt").trim().parse().expect("a pid");
-        // Through the same `kill` utility the daemon just used, so this probe
-        // is not itself a reason for the test to fail on an image with no
-        // `kill(1)` binary (see `terminate`).
-        let probe = kill(pid, "-0").expect("kill -0");
+        // Through the same syscall the daemon just used: signal 0 is never
+        // delivered, it only asks whether the pid is there.
+        let probe = send_signal(pid, 0);
         assert!(
-            !probe.success(),
+            probe.is_err(),
             "the worker was killed and reaped, so {pid} is gone"
         );
     }
