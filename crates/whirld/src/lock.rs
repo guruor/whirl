@@ -612,6 +612,21 @@ pub(crate) fn take_as(state_dir: &Path, attempt: Attempt) -> Result<DaemonLock, 
     take_with(state_dir, move |_| Ok(attempt))
 }
 
+/// The rotation take with the OS answer supplied, [`take_as`]'s counterpart for
+/// `rotate.lock`. 8.8's removal exists in one direction of 8.7's answer -- the
+/// `excl_file` fallback -- and no filesystem this machine offers answers
+/// `ENOTSUP`, so this is how a daemon-side test reaches the removal the deadline
+/// path is supposed to feed with a pid. `reaped` is the take's second argument,
+/// so the same hook covers the take with 8.8's exception and the one without.
+#[cfg(test)]
+pub(crate) fn take_rotate_as(
+    state_dir: &Path,
+    attempt: Attempt,
+    reaped: Option<u32>,
+) -> Result<Option<RotateLock>, String> {
+    take_rotate_with(state_dir, move |_| Ok(attempt), reaped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
