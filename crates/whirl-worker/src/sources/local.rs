@@ -764,6 +764,29 @@ mod tests {
         );
     }
 
+    /// 2.5's split, and the line that decides it: "the source says what it can
+    /// answer, the pipeline answers the rest", with "Layer 2, the shared
+    /// pipeline" opening its numbered list with the resolution floor. A file
+    /// below 4.2's 1600x900 is therefore still this source's candidate; the
+    /// pipeline's `rejected_resolution` counter is what says why it was dropped,
+    /// and filtering it here would make that counter unreachable while hiding
+    /// the image from the reason the operator is shown.
+    #[test]
+    fn a_file_below_the_pipelines_resolution_floor_is_still_a_candidate() {
+        let dir = scratch("below-floor");
+        let file = dir.join("walls").join("small.png");
+        plant(&file, 400, 300);
+
+        let candidates = enumerate(&table(&dir, ""), &[]);
+        assert_eq!(
+            origins(&candidates),
+            vec![file.display().to_string()],
+            "the floor is 2.5 Layer 2's, not this source's"
+        );
+        assert_eq!(candidates[0].width, Some(400), "the header is still read");
+        assert_eq!(candidates[0].height, Some(300));
+    }
+
     /// The identity rule frozen against an external tool: these are the digests
     /// `printf %s <path> | shasum -a 256` printed, so the rule under test is
     /// "hex sha256 of the path string" and not "whatever this function computes".
