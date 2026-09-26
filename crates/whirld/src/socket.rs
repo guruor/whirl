@@ -1,5 +1,5 @@
-//! The control socket: bind it `0600` under a `0077` umask, accept, and answer
-//! the verbs (docs/architecture.md 2.1, 2.3).
+//! The control socket: bind it `0600` in one step under a `0177` umask, accept,
+//! and answer the verbs (docs/architecture.md 2.1, 2.3).
 //!
 //! One thread per connection, bounded at 16 (1.8, `[L 4]`). The accept loop
 //! never runs a worker: a rotation happens on the connection that asked for it,
@@ -48,6 +48,19 @@ unsafe extern "C" {
     fn umask(mask: u32) -> u32;
 }
 
+/// The umask the `bind` runs under: `0777 & ~0o177` is exactly `0o600`, so the
+/// socket file is created at the mode 2.1 asks for and there is no instant at
+/// which the path is anything else.
+///
+/// `0o077` is the mask that looks right and is not: `0777 & ~0o077` is `0700`,
+/// which closes the window `[L 3]` measured (group and other cannot connect)
+/// but still leaves the file at `0700` until the `fchmod` below lands, and a
+/// bound socket accepts a connection the moment `bind` returns. A client that
+/// connected in that window read `0700`: `control_socket`'s
+/// `the_socket_is_0600_in_a_0700_directory` saw `448` where it asserts `384`,
+/// once in eleven whole-workspace runs (t_6c776148).
+const SOCKET_UMASK: u32 = 0o177;
+
 /// The process umask, so the socket cannot be bound group- or world-connectable
 /// for even one instruction (2.1, "Permissions, and the window between `bind`
 /// and `chmod`"). `mode_t` is 16 bits on macOS and 32 elsewhere, which is the
@@ -67,8 +80,16 @@ fn set_umask(mask: u32) -> u32 {
     unsafe { umask(mask) }
 }
 
-fn with_private_umask<T>(body: impl FnOnce() -> T) -> T {
-    let previous = set_umask(0o077);
+/// Run `body` with `SOCKET_UMASK` in force, then put back the mask the process
+/// had. The daemon is single-threaded at that point -- `main` spawns the
+/// scheduler only after `bind` has returned -- which is what makes a
+/// process-wide mask safe to borrow here: `umask` is not thread-local. Nothing
+/// in a test binary may call it: `cargo test` runs a binary's unit tests on
+/// parallel threads, so the mask would be in force while the state, statefile
+/// and cache tests create their scratch files, and those fail with
+/// `PermissionDenied` (t_6c776148).
+fn with_socket_umask<T>(body: impl FnOnce() -> T) -> T {
+    let previous = set_umask(SOCKET_UMASK);
     let value = body();
     set_umask(previous);
     value
@@ -119,10 +140,13 @@ pub fn bind(path: &Path) -> Result<UnixListener, String> {
             }
         }
     }
-    let listener = with_private_umask(|| UnixListener::bind(path))
+    let listener = with_socket_umask(|| UnixListener::bind(path))
         .map_err(|error| format!("cannot bind {}: {error}", path.display()))?;
-    // `0777 & ~0077` is 0700, so the group and other bits are already gone; this
-    // is what removes the owner's execute bit and makes it exactly 0600.
+    // The socket is `0600` already: `SOCKET_UMASK` has the bind create it that
+    // way. This call stays as the enforcement that does not rest on the umask --
+    // it is what keeps 2.1's mode true even where `bind` ignored the mask -- and
+    // after the mask has done its job it is a no-op, so it opens no window of
+    // its own.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("cannot set mode 600 on {}: {error}", path.display()))?;
     Ok(listener)
@@ -688,4 +712,36 @@ fn write_err(
     message: impl std::fmt::Display,
 ) -> io::Result<()> {
     write_response(out, &Response::err(code, message))
+}
+
+/// The mask's own test. It is named `socket_mode_tests` rather than the
+/// file-wide `tests` because t_62920980 adds a `mod tests` to this file in the
+/// same window and two modules cannot share a name.
+#[cfg(test)]
+mod socket_mode_tests {
+    use super::*;
+
+    /// The mode of 2.1 is a property of the mask (t_6c776148): a `bind` creates
+    /// the socket as `0777 & ~umask`, so this arithmetic is what the daemon
+    /// relies on, and the `0o077` this card replaced -- which leaves the owner's
+    /// execute bit -- fails here instead of in the whole-workspace run, where it
+    /// showed up as a client reading `0700` between the `bind` and the `fchmod`.
+    ///
+    /// Deliberately arithmetic and not a `bind`: `umask` is process-wide and not
+    /// thread-local, and this binary runs its unit tests on parallel threads, so
+    /// the only safe place to *call* it is a single-threaded startup path. (A
+    /// `bind` here does not only narrow the socket: it narrows every file the
+    /// state, statefile and cache tests create while it is in force, and those
+    /// fail with `PermissionDenied`.) That the kernel honours the mask is
+    /// measured in docs/architecture.md 2.1 (`[L 3]`, with the 3 s stall
+    /// recorded there) and asserted end to end by `control_socket`'s
+    /// `the_socket_is_0600_in_a_0700_directory`.
+    #[test]
+    fn the_mask_is_the_mode_the_socket_is_created_with() {
+        assert_eq!(
+            0o777 & !SOCKET_UMASK,
+            0o600,
+            "`0o077` leaves the owner's execute bit: the socket exists as `0700` until the fchmod"
+        );
+    }
 }
