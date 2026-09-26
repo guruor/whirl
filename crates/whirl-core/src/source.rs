@@ -140,31 +140,22 @@ pub struct EnumContext {
 
 /// What one `enumerate` call produced.
 ///
-/// The candidates are 2.6's metadata-only list. The two page numbers are the
-/// source's own accounting of the listing requests it made, which no stage of
-/// the pipeline can see: a source that lists nothing over the wire (a local
-/// filesystem) walks no pages and asks for none, so both are 0.
+/// The candidates are 2.6's metadata-only list, and nothing else: a source's
+/// own accounting of the listing requests it made (how many pages it walked of
+/// the `pages` it was configured for) is a number no stage of the pipeline can
+/// act on and no record carries, because 2.6's `source:` line has no column for
+/// it. A walk that ended before it spent every configured page says so on stderr
+/// where it happens (`sources/wallhaven.rs`), which is the surface an operator
+/// reads; see features.md 2.3 for what `pages` is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Enumerated {
     pub candidates: Vec<Candidate>,
-    /// Listing requests this enumeration actually made.
-    pub pages_walked: u64,
-    /// How many of the configured `pages` the walk did not make because the
-    /// listing ended first: `last_page` reached, or a page that came back with
-    /// no entries. A walk that made every page it was configured for skipped
-    /// none, even when the listing has more pages than the config asked for:
-    /// that is what `pages` means (features.md 2.3), not a skip.
-    pub pages_skipped: u64,
 }
 
 impl Enumerated {
     /// The result of a source that makes no listing request of its own.
     pub fn of(candidates: Vec<Candidate>) -> Enumerated {
-        Enumerated {
-            candidates,
-            pages_walked: 0,
-            pages_skipped: 0,
-        }
+        Enumerated { candidates }
     }
 }
 

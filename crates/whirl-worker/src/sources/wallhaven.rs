@@ -467,6 +467,9 @@ impl Source for Wallhaven {
             }
             page += 1;
         }
+        // What the walk spent is reported here and nowhere else: `Enumerated`
+        // carries the candidates, and 2.6's `source:` record has no column for a
+        // walk, so stderr is the surface an operator has.
         let skipped = u64::from(configured).saturating_sub(walked);
         if skipped > 0 {
             eprintln!(
@@ -475,11 +478,7 @@ impl Source for Wallhaven {
                 self.id
             );
         }
-        Ok(Enumerated {
-            candidates,
-            pages_walked: walked,
-            pages_skipped: skipped,
-        })
+        Ok(Enumerated { candidates })
     }
 
     /// What 2.5 says this source can push into its own request.
@@ -813,8 +812,6 @@ mod tests {
         assert_eq!(candidate.width, Some(3840));
         assert_eq!(candidate.height, Some(2160));
         assert_eq!(candidate.bytes, Some(10_783_225));
-        assert_eq!(enumerated.pages_walked, 1);
-        assert_eq!(enumerated.pages_skipped, 0);
     }
 
     #[test]
@@ -945,7 +942,7 @@ mod tests {
     // -- pagination ---------------------------------------------------------
 
     #[test]
-    fn a_walk_stops_at_last_page_and_counts_what_it_did_not_walk() {
+    fn a_walk_stops_at_last_page_and_never_requests_the_one_after_it() {
         let text = "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
                     \"wallhaven\", \"collection\": \"example-user/12345\", \"pages\": 3 } ]\n}\n";
         let recorded = Recorded::answering(vec![
@@ -958,9 +955,11 @@ mod tests {
             ids(&enumerated),
             vec!["aaaaaa".to_string(), "bbbbbb".to_string()]
         );
-        assert_eq!(enumerated.pages_walked, 2, "page 2 was the last one");
-        assert_eq!(enumerated.pages_skipped, 1, "page 3 does not exist");
-        assert_eq!(seen.borrow().len(), 2, "and it was never requested");
+        assert_eq!(
+            seen.borrow().len(),
+            2,
+            "`pages` asked for 3, the listing ended at 2, so page 3 was never requested"
+        );
     }
 
     #[test]
@@ -973,20 +972,23 @@ mod tests {
         ]);
         let (source, seen) = wallhaven(text, recorded, Box::new(Key(None)));
         let enumerated = source.enumerate(&context()).expect("the listing is read");
-        assert_eq!(enumerated.pages_walked, 2);
         assert_eq!(
-            enumerated.pages_skipped, 0,
-            "a listing with more pages than `pages` asked for is not a skip"
+            ids(&enumerated),
+            vec!["aaaaaa".to_string(), "bbbbbb".to_string()]
         );
-        assert_eq!(seen.borrow().len(), 2);
+        assert_eq!(
+            seen.borrow().len(),
+            2,
+            "every configured page, and the listing's extra pages are not a skip"
+        );
     }
 
     #[test]
     fn each_page_of_a_walk_is_requested_by_its_own_number() {
-        // The two counters above say how many pages were walked. This says the
-        // walk asked for the pages it claims to have walked: a `listing_url`
-        // that dropped the page number would keep every counter above green on
-        // a fixture, because the fake hands out its answers in call order.
+        // Every pagination test here pins the walk from the wire side, because
+        // the fake hands out its answers in call order: a `listing_url` that
+        // dropped the page number would still get one answer per call, so only
+        // the requests themselves say which page was asked for.
         let text = "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
                     \"wallhaven\", \"collection\": \"example-user/12345\", \"pages\": 2 } ]\n}\n";
         let recorded = Recorded::answering(vec![
@@ -1006,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_page_ends_the_walk_and_the_rest_is_counted_as_skipped() {
+    fn an_empty_page_ends_the_walk_so_nothing_after_it_is_requested() {
         let text = "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
                     \"wallhaven\", \"collection\": \"example-user/12345\", \"pages\": 3 } ]\n}\n";
         let recorded = Recorded::answering(vec![(200, page(&[], 1, 9))]);
@@ -1015,9 +1017,11 @@ mod tests {
             .enumerate(&context())
             .expect("an empty listing is a listing");
         assert!(enumerated.candidates.is_empty());
-        assert_eq!(enumerated.pages_walked, 1);
-        assert_eq!(enumerated.pages_skipped, 2);
-        assert_eq!(seen.borrow().len(), 1);
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "`pages` asked for 3, the first page came back empty, so 2 and 3 were never requested"
+        );
     }
 
     // -- the named error paths ---------------------------------------------
