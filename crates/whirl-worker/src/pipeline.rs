@@ -29,7 +29,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use whirl_core::config::{Backend, Config, SourceConfig, paths};
+use whirl_core::config::{Backend, Config, LocalMode, SourceConfig, SourceKind, paths};
 use whirl_core::protocol::{self, ErrorCode, SourceRecord};
 use whirl_core::source::{Candidate, EnumContext};
 use whirl_core::state::{self, IndexFile, StateFile};
@@ -1077,6 +1077,50 @@ pub struct Run<'a> {
     pub draw: u64,
 }
 
+/// What a candidate's bytes became: the whole of what features.md 2.2's `mode`
+/// decides for a rotation, and the only two shapes a successful rotation has.
+///
+/// The arms are the two halves of the `mode` row: `copy` "copies into the cache
+/// first", and `reference` "sets the wallpaper from the original path: zero
+/// extra disk, the user's folder stays the source of truth".
+enum Filled {
+    /// The bytes are a cache entry under `sha256/` (docs/spec/state-and-cache.md
+    /// section 3): `copy`, and every kind that is not a `local` one.
+    Stored(Stored),
+    /// Nothing was written, and the platform is pointed at the candidate's own
+    /// path: features.md 2.2's `reference`, the printed default.
+    Referenced {
+        /// The one hash of the file the `set:` line needs, from the same pass
+        /// that proves the file is still readable (see [`Run::reference`]).
+        digest: String,
+        /// The candidate's origin, which is the user's own file.
+        path: PathBuf,
+    },
+}
+
+impl Filled {
+    /// The `set:` line's first field. For a stored candidate it is the digest
+    /// of the bytes under `sha256/`; for a referenced one it is the digest of
+    /// the file the platform was handed, which is what `status`'s `last_digest`
+    /// documents itself to be (docs/architecture.md 2.10, "content digest of the
+    /// displayed image").
+    fn digest(&self) -> &str {
+        match self {
+            Filled::Stored(stored) => &stored.digest,
+            Filled::Referenced { digest, .. } => digest,
+        }
+    }
+
+    /// The path the platform is given, which is the one thing the two arms
+    /// disagree about: the cache file, or the user's own file.
+    fn path(&self) -> &Path {
+        match self {
+            Filled::Stored(stored) => &stored.path,
+            Filled::Referenced { path, .. } => path,
+        }
+    }
+}
+
 impl Run<'_> {
     /// `--verb rotate`: pick a source by weight, pick a candidate, set it.
     ///
@@ -1130,28 +1174,32 @@ impl Run<'_> {
                 if bad.contains(&seeking.candidate.id) {
                     continue;
                 }
-                let stored = match self.fill(&seeking, &mut reasons)? {
-                    Some(stored) => stored,
+                let filled = match self.fill(&seeking, &mut reasons)? {
+                    Some(filled) => filled,
                     None => continue,
                 };
-                println!("{}", self.report(&seeking, &stored).downloaded_line());
-                match self.setter.set(&stored.path.display().to_string()) {
+                // 1.6's first line belongs to the store, and a reference-mode
+                // candidate reached the setter without one: nothing was
+                // downloaded, so nothing is claimed to have been.
+                if let Filled::Stored(_) = &filled {
+                    println!("{}", self.report(&seeking, &filled).downloaded_line());
+                }
+                let target = filled.path().display().to_string();
+                match self.setter.set(&target) {
                     Ok(()) => {
-                        let report = self.report(&seeking, &stored);
+                        let report = self.report(&seeking, &filled);
                         println!("{}", report.set_line());
                         return Ok(report);
                     }
                     Err(error) => {
                         // features.md 1.4: the candidate is marked bad for the
-                        // rest of the run, one more candidate is tried, and the
-                        // cache file stays an entry: state-and-cache section 3's
-                        // failure table says "it stays a cache entry, and the
-                        // worker reports `set_failed`".
-                        eprintln!(
-                            "warning: the setter refused {}: {}",
-                            stored.path.display(),
-                            error.message
-                        );
+                        // rest of the run, one more candidate is tried, and
+                        // state-and-cache section 3's failure table adds the
+                        // other half for a stored candidate: "it stays a cache
+                        // entry, and the worker reports `set_failed`". A
+                        // referenced candidate has no entry to stay, which is
+                        // the mode's own consequence and not a case here.
+                        eprintln!("warning: the setter refused {target}: {}", error.message);
                         bad.insert(seeking.candidate.id.clone());
                         set_failures.push(error);
                         if set_failures.len() >= 2 {
@@ -1175,8 +1223,42 @@ impl Run<'_> {
         ))
     }
 
-    /// The bytes of a candidate, from the cache or from a download, and the two
-    /// rejections the bytes themselves can cause.
+    /// features.md 2.2's `mode` for the source that offered a candidate, or
+    /// `None` for a kind that has no `mode` to honour.
+    ///
+    /// `mode` is a key of the `local` section and of nothing else (features.md
+    /// 2.2), so a `wallhaven` URL answers `None`: it is not the user's own file,
+    /// there is no original path to reference, and its bytes take the cache
+    /// route. A `local` source with no `local` section at all answers the same
+    /// value the schema's default does, which is the value
+    /// `crate::sources::local::Local::of` reads: a hand-built config that was
+    /// never parsed gets the documented default rather than the other arm.
+    fn mode_of(&self, source: &str) -> Option<LocalMode> {
+        let configured = self
+            .config
+            .sources
+            .iter()
+            .find(|configured| configured.id == source)?;
+        if configured.kind != SourceKind::Local {
+            return None;
+        }
+        Some(
+            configured
+                .local
+                .as_ref()
+                .map(|local| local.mode)
+                .unwrap_or(LocalMode::Reference),
+        )
+    }
+
+    /// The bytes of a candidate: where they go, and the two rejections the
+    /// bytes themselves can cause.
+    ///
+    /// The mode decides the route and nothing else in this function: features.md
+    /// 2.2's `reference` is [`Run::reference`], and everything else is the store
+    /// of docs/spec/state-and-cache.md section 3. That the default is
+    /// `reference` is why this branch is not the rare one: a `local` source that
+    /// says nothing about `mode` does not copy the user's library.
     ///
     /// `Ok(None)` is the backstop of 2.5 step 1 for a candidate whose source did
     /// not report its dimensions: the header is the authority, and a file under
@@ -1188,7 +1270,10 @@ impl Run<'_> {
         &self,
         seeking: &Seeking,
         reasons: &mut Vec<String>,
-    ) -> Result<Option<Stored>, Failure> {
+    ) -> Result<Option<Filled>, Failure> {
+        if matches!(self.mode_of(&seeking.source), Some(LocalMode::Reference)) {
+            return self.reference(seeking).map(Some);
+        }
         let cap = self
             .config
             .sources
@@ -1215,16 +1300,71 @@ impl Run<'_> {
             ));
             return Ok(None);
         }
-        Ok(Some(stored))
+        Ok(Some(Filled::Stored(stored)))
+    }
+
+    /// features.md 2.2's `reference`: the platform is pointed at the candidate's
+    /// own path and nothing is written, so `cache/sha256/` gains no file and
+    /// `tmp/` gains none either.
+    ///
+    /// Two things this deliberately does not do, both of them the mode's own
+    /// consequences rather than omissions. The floor is not re-applied: the
+    /// source read the header to produce the candidate at all
+    /// (`crate::sources::local::Local::candidate` answers `None` for a file it
+    /// cannot measure) and 2.5's resolution stage admitted it on those
+    /// dimensions, so a second measurement here would read the same bytes to
+    /// reach the same answer. `filters.max_bytes` is not enforced either: it is
+    /// the download cap of 2.5 step 3, and there is no download to bound.
+    ///
+    /// The file is still opened, for the one field the record needs and for the
+    /// only way this process can know the file is still there. `set:`'s first
+    /// field is a digest by the wire grammar
+    /// (`protocol::parse_worker_set_line` refuses anything else), so the bytes
+    /// are hashed in one pass and the open failure is the failure
+    /// [`Run::set_reference`] reports for the same act on the same kind of
+    /// path. `state-and-cache` 6.2 has a `-` in that field for a reference-mode
+    /// set; writing it would need `whirl-core`'s grammar and its parser, and
+    /// this crate writes neither.
+    fn reference(&self, seeking: &Seeking) -> Result<Filled, Failure> {
+        let origin = seeking.candidate.origin.as_str();
+        let mut reader = self
+            .transport
+            .open(origin)
+            .map_err(|error| Failure::new("set", ErrorCode::NotFound, error))?;
+        let mut hasher = protocol::Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => hasher.update(&buffer[..read]),
+                Err(error) => {
+                    return Err(Failure::new(
+                        "set",
+                        ErrorCode::NotFound,
+                        format!("{origin}: {error}"),
+                    ));
+                }
+            }
+        }
+        Ok(Filled::Referenced {
+            digest: hasher.hex(),
+            path: PathBuf::from(origin),
+        })
     }
 
     /// The record the daemon reads for a successful set: the digest, the
     /// candidate's `origin_key` and the published path.
-    fn report(&self, seeking: &Seeking, stored: &Stored) -> Report {
+    ///
+    /// "Published" is the path the platform was given, which is the cache file
+    /// for a stored candidate and the user's own file for a referenced one. Both
+    /// are what the daemon wants: `cache::record` writes no index entry for a
+    /// path outside the cache root, naming this very case
+    /// (crates/whirld/src/cache.rs).
+    fn report(&self, seeking: &Seeking, filled: &Filled) -> Report {
         Report {
-            digest: stored.digest.clone(),
+            digest: filled.digest().to_string(),
             origin_key: seeking.origin_key(),
-            path: stored.path.display().to_string(),
+            path: filled.path().display().to_string(),
         }
     }
 
@@ -1766,7 +1906,12 @@ mod tests {
     /// A config with one `local` source whose path is fake: the pipeline never
     /// reads it, because [`Bytes`] answers the origins. The floors are low and
     /// the cap is small so a fixture image can be either side of both.
-    fn config(dir: &Path, extra: &str) -> Config {
+    ///
+    /// `source_keys` lands inside the source's own object, which is where
+    /// `local.mode` lives (features.md 2.2); `extra` lands after the `sources`
+    /// array, which is where a test adds a top-level key. Two arguments rather
+    /// than one because a key in the wrong object is not the key under test.
+    fn config_with(dir: &Path, extra: &str, source_keys: &str) -> Config {
         // A path becomes a string literal in the body, so it is escaped rather
         // than trusted: on Windows `dir` is `C:\Users\...`, and an unescaped
         // `\U` is a syntax error at the config parser (which decodes the full
@@ -1782,13 +1927,31 @@ mod tests {
              \"min_height\": 16,\n  \"filters\": {{ \"max_bytes\": 4096, \"ratio_tolerance\": 0.02, \
              \"target_ratio\": null }},\n  \"cache\": {{ \"root\": {} }},\n  \
              \"sources\": [ {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \
-             \"paths\": [{}] }} ]{extra}\n}}\n",
+             \"paths\": [{}]{source_keys} }} ]{extra}\n}}\n",
             quoted(dir.join("cache")),
             quoted(dir.join("pictures"))
         );
         Config::parse(&body)
             .expect("the fixture config parses")
             .config
+    }
+
+    /// The fixture config with no key beyond the schema, and in particular no
+    /// `mode`: what the shipped schema writes and what the default is.
+    fn config(dir: &Path, extra: &str) -> Config {
+        config_with(dir, extra, "")
+    }
+
+    /// The fixture config in `copy`: the arm that stores.
+    ///
+    /// Every test below that asserts a cache file, a part file or a download
+    /// failure is a claim about the store, and features.md 2.2's default is the
+    /// other arm: leaving them on the default made them assert one mode's
+    /// behaviour under the other one's config, which is the shape of the defect
+    /// `mode` was read for in the first place. The two tests that are about
+    /// `mode` itself name it in their own body, one arm each.
+    fn copy_config(dir: &Path) -> Config {
+        config_with(dir, "", ", \"mode\": \"copy\"")
     }
 
     fn candidate(id: &str, origin: &str, width: u32, height: u32, bytes: u64) -> Candidate {
@@ -1950,7 +2113,7 @@ mod tests {
     #[test]
     fn a_rotation_publishes_under_the_digest_and_reports_the_record() {
         let dir = scratch("worker-rotate");
-        let config = config(&dir, "");
+        let config = copy_config(&dir);
         let bytes = long_png(1600, 900, 196);
         let sources = table(
             &config,
@@ -1998,6 +2161,189 @@ mod tests {
         assert!(report.downloaded_line().starts_with("downloaded: "));
     }
 
+    /// A setter that remembers what it was given, so a test can assert the path
+    /// the platform was handed rather than only the path a report names. The
+    /// noop backend is enough for every other test in this module; the two
+    /// below are the ones where the path itself is the claim.
+    #[derive(Default)]
+    struct Recorder(RefCell<Vec<String>>);
+
+    impl Recorder {
+        fn targets(&self) -> Vec<String> {
+            self.0.borrow().clone()
+        }
+    }
+
+    impl Setter for Recorder {
+        fn set(&self, path: &str) -> Result<(), SetError> {
+            self.0.borrow_mut().push(path.to_string());
+            Ok(())
+        }
+    }
+
+    /// features.md 2.2's `mode` at its printed default, which the fixture config
+    /// gets by writing no `mode` at all: the platform is set from the
+    /// candidate's own path and the cache gains nothing.
+    ///
+    /// The claims, in the order the row makes them. The path the setter is given
+    /// is the candidate's `origin` and not a cache file, which is "sets the
+    /// wallpaper from the original path". `cache/sha256/` holds what it held
+    /// before, which is nothing, and `tmp/` holds nothing either: "zero extra
+    /// disk". The digest is the one hash of that file, because the `set:` line's
+    /// first field is a digest by the wire grammar and the daemon reads the line
+    /// back (the assertion below is the daemon's own parser).
+    ///
+    /// features.md 105's pinning consequence is pinned here, and this is what it
+    /// comes to inside the worker: a pin is a digest, the digest is the cache
+    /// filename (state-and-cache 6.2), and a rotation that admits nothing to the
+    /// cache leaves a pin with nothing to name. The `copy` test below is the
+    /// other side of that sentence, where there is exactly one file to name.
+    ///
+    /// Neuter the mode branch in `Run::fill` and this test goes red on the first
+    /// assertion: the setter is handed a cache file and `sha256/` holds one.
+    #[test]
+    fn a_reference_mode_rotation_sets_the_original_path_and_stores_nothing() {
+        let dir = scratch("worker-reference");
+        let config = config(&dir, "");
+        assert_eq!(
+            config.sources[0]
+                .local
+                .as_ref()
+                .expect("the local section")
+                .mode,
+            LocalMode::Reference,
+            "the fixture writes no `mode`, so this is the default the config gives"
+        );
+        let bytes = long_png(1600, 900, 196);
+        let sources = table(
+            &config,
+            Fixture::with(vec![candidate(
+                "one",
+                "pictures/one.png",
+                1600,
+                900,
+                bytes.len() as u64,
+            )]),
+        );
+        let transport = Bytes::of(&[("pictures/one.png", bytes.clone())]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = empty_window(&dir);
+        let setter = Recorder::default();
+        let run = noop_run(&config, &sources, &transport, &cache, &window, &setter);
+
+        let report = run.rotate().expect("the rotation sets the file");
+
+        assert_eq!(
+            setter.targets(),
+            vec!["pictures/one.png".to_string()],
+            "the platform is given the candidate's own path, not a copy of it"
+        );
+        assert_eq!(report.path, "pictures/one.png", "{}", report.set_line());
+        assert_eq!(report.origin_key, "pictures:one");
+        assert_eq!(
+            report.digest,
+            protocol::sha256_hex(&bytes),
+            "the set: line's first field is the hash of the file that was set"
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            0,
+            "nothing entered the cache, so no file exists for a pin to name"
+        );
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "and no part file was created on the way"
+        );
+        assert_eq!(
+            protocol::parse_worker_set_line(&report.set_line()),
+            Some((
+                report.digest.clone(),
+                report.origin_key.clone(),
+                report.path.clone()
+            )),
+            "the daemon reads the line back, user's path and all: {}",
+            report.set_line()
+        );
+    }
+
+    /// features.md 2.2's `copy`, one arm over from the test above and the reason
+    /// the branch has two: "`copy` copies into the cache first", so the platform
+    /// is given the cache file and the cache holds exactly one entry, which is
+    /// the file a pin would name. Everything else about the rotation is
+    /// unchanged, and this test is what says so: the same fixture, the same
+    /// candidate, the other mode.
+    ///
+    /// `mode` is written into the config body rather than set on the parsed
+    /// struct, because what the pipeline reads is the `local` section of the
+    /// config it was handed. `whirl-core`'s own parse of the key is its own
+    /// test (`"mode": "move"` is refused at `sources[0].mode`,
+    /// crates/whirl-core/src/config.rs).
+    ///
+    /// Make the branch reference everything and this test goes red on the
+    /// cache-file assertion: `sha256/` is empty and the setter was handed the
+    /// candidate's origin.
+    #[test]
+    fn a_copy_mode_rotation_stores_the_bytes_and_sets_the_cache_file() {
+        let dir = scratch("worker-copy");
+        let config = config_with(&dir, "", ", \"mode\": \"copy\"");
+        assert_eq!(
+            config.sources[0]
+                .local
+                .as_ref()
+                .expect("the local section")
+                .mode,
+            LocalMode::Copy,
+            "the key in the body is the key the rotation reads"
+        );
+        let bytes = long_png(1600, 900, 196);
+        let sources = table(
+            &config,
+            Fixture::with(vec![candidate(
+                "one",
+                "pictures/one.png",
+                1600,
+                900,
+                bytes.len() as u64,
+            )]),
+        );
+        let transport = Bytes::of(&[("pictures/one.png", bytes.clone())]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = empty_window(&dir);
+        let setter = Recorder::default();
+        let run = noop_run(&config, &sources, &transport, &cache, &window, &setter);
+
+        let report = run.rotate().expect("the rotation sets the file");
+
+        assert_eq!(
+            report.digest,
+            protocol::sha256_hex(&bytes),
+            "the digest of the bytes, as it was before the mode was read"
+        );
+        assert_eq!(
+            report.path,
+            state::content_path(cache.root(), &report.digest, "png")
+                .display()
+                .to_string(),
+            "the platform is given the cache file, not the user's own"
+        );
+        assert_eq!(
+            setter.targets(),
+            vec![report.path.clone()],
+            "and that path is what the setter received"
+        );
+        assert_eq!(
+            fs::read(&report.path).expect("the bytes are published"),
+            bytes
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            1,
+            "one entry, which is the file a pin names"
+        );
+        assert_eq!(count_files(&state::tmp_dir(cache.root())), 0);
+    }
+
     /// features.md 2.5 hands the recent window to the source, so a source can see
     /// what the last rotations used before it lists anything.
     #[test]
@@ -2026,7 +2372,7 @@ mod tests {
     #[test]
     fn the_cap_is_enforced_mid_stream_and_nothing_is_published() {
         let dir = scratch("worker-cap");
-        let config = config(&dir, "");
+        let config = copy_config(&dir);
         let bytes = long_png(1600, 900, 8192);
         // The candidate declares ten bytes; the bytes that arrive are what the
         // cap is enforced against.
@@ -2059,7 +2405,7 @@ mod tests {
     #[test]
     fn a_fetch_that_fails_publishes_nothing_and_says_why() {
         let dir = scratch("worker-fetch");
-        let config = config(&dir, "");
+        let config = copy_config(&dir);
         let sources = table(
             &config,
             Fixture::with(vec![candidate("gone", "pictures/gone.png", 1600, 900, 100)]),
@@ -2088,7 +2434,7 @@ mod tests {
     #[test]
     fn a_download_that_is_not_an_image_fails_and_publishes_nothing() {
         let dir = scratch("worker-not-an-image");
-        let config = config(&dir, "");
+        let config = copy_config(&dir);
         let sources = table(
             &config,
             Fixture::with(vec![candidate("text", "pictures/text.png", 1600, 900, 100)]),
@@ -2242,7 +2588,7 @@ mod tests {
         }
 
         let dir = scratch("worker-setter");
-        let config = config(&dir, "");
+        let config = copy_config(&dir);
         let one = long_png(1600, 900, 32);
         let two = long_png(1600, 901, 32);
         let sources = table(
@@ -2278,7 +2624,7 @@ mod tests {
     #[test]
     fn a_file_under_the_floor_is_not_set() {
         let dir = scratch("worker-floor");
-        let config = config(&dir, "");
+        let config = copy_config(&dir);
         let bytes = long_png(8, 8, 8);
         let sources = table(
             &config,

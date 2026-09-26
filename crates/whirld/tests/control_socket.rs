@@ -1832,16 +1832,46 @@ fn rotation_png(width: u32, height: u32) -> Vec<u8> {
 /// A config whose only source is `walls`, so a rotation has exactly the images
 /// the test planted: no second source, and no counter that depends on the
 /// machine the test runs on.
-fn write_rotation_config(dir: &Path, walls: &Path) {
+///
+/// `mode` is written into the source's own object, which is where `local.mode`
+/// lives (features.md 2.2). Each rotation test below names the arm it is about:
+/// `None` is the config a user who never touches `mode` has, and a test that
+/// asserts a cache file while the config means `reference` would assert the
+/// defect this key is read for in the first place.
+fn write_rotation_config(dir: &Path, walls: &Path, mode: Option<&str>) {
+    let mode_key = match mode {
+        Some(mode) => format!(", \"mode\": \"{mode}\""),
+        None => String::new(),
+    };
     std::fs::write(
         dir.join("config.json"),
         format!(
             "{{\n  \"config_schema\": 1,\n  \"sources\": [\n    \
-             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [\"{}\"] }}\n  ]\n}}\n",
+             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [\"{}\"]{mode_key} }}\n  ]\n}}\n",
             walls.display()
         ),
     )
     .expect("the test's own config");
+}
+
+/// How many files a directory holds, at any depth, counting a directory that is
+/// not there as none. `cache/sha256/` is made by the first store and by nothing
+/// else (state-and-cache section 3 step 2), so in reference mode it need not
+/// exist at all.
+fn count_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            total += count_files(&path);
+        } else {
+            total += 1;
+        }
+    }
+    total
 }
 
 /// The four fields of 2.6's `set:` line: `<digest> <origin_key> <via> <path>`.
@@ -1856,9 +1886,10 @@ fn set_fields(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The `local` source's rotation, end to end and over the real socket: two
-/// images in the configured directory, `next` twice, and the second answer is
-/// the other image rather than the one already set (4.1's window).
+/// The `local` source's rotation in features.md 2.2's `copy`, end to end and
+/// over the real socket: two images in the configured directory, `next` twice,
+/// and the second answer is the other image rather than the one already set
+/// (4.1's window).
 ///
 /// Every claim is checked against the filesystem, not against the answer alone:
 /// the `set:` line's path has to exist inside this daemon's own cache root, the
@@ -1867,25 +1898,32 @@ fn set_fields(lines: &[String]) -> Vec<String> {
 /// candidates and both in the window, the source stage has nothing left, and the
 /// failure is the named one rather than a repeat.
 ///
+/// The mode is named because every assertion above is a claim about the cache,
+/// and 2.2's default is the arm that writes none: without the key this test ran
+/// in `reference` while asserting a cache file, which is what made it pass over
+/// a rotation that was pointing the platform at the user's own folder.
+/// `a_local_source_in_reference_mode_sets_the_planted_file_and_admits_nothing`
+/// is the same rotation in the other arm.
+///
 /// The worker the daemon spawns is the binary `cargo test --workspace` builds
 /// next to the daemon (this file's module doc), so a `-p whirld` run after a
 /// `whirl-worker` edit can test a stale one: build the workspace when the source
 /// changed.
 #[test]
-fn a_local_source_rotates_and_the_second_next_is_the_other_image() {
+fn a_local_source_in_copy_mode_rotates_and_the_second_next_is_the_other_image() {
     let planted: Vec<(&str, Vec<u8>)> = vec![
         ("wide.png", rotation_png(2560, 1440)),
         ("narrow.png", rotation_png(2048, 1152)),
     ];
     let daemon = start_prepared(
-        "a_local_source_rotates_and_the_second_next_is_the_other_image",
+        "a_local_source_in_copy_mode_rotates_and_the_second_next_is_the_other_image",
         |dir| {
             let walls = dir.join("walls");
             std::fs::create_dir_all(&walls).expect("the source's directory");
             for (name, bytes) in &planted {
                 std::fs::write(walls.join(name), bytes).expect("a planted image");
             }
-            write_rotation_config(dir, &walls);
+            write_rotation_config(dir, &walls, Some("copy"));
         },
     );
 
@@ -1946,5 +1984,110 @@ fn a_local_source_rotates_and_the_second_next_is_the_other_image() {
             .iter()
             .any(|line| line.starts_with("ERR no_candidates")),
         "both candidates are in the window, so the third `next` is exhaustion, not a repeat: {third:?}"
+    );
+}
+
+/// The same rotation in features.md 2.2's default, which is `reference`: the
+/// platform is pointed at the user's own file and the cache gains nothing.
+///
+/// The config writes no `mode`, so this is the arm a user who never edits the
+/// key actually runs. The claims: the `set:` line's path is one of the two
+/// planted files and not a cache path; `cache/sha256/` holds what it held
+/// before, which is nothing, on both sides of the rotation; the planted bytes
+/// are untouched, because whirl set the file the user already had rather than a
+/// copy of it; the second `next` is the other image, because 4.1's window is
+/// built from the `origin_key` and not from a cache entry; and the third is the
+/// named exhaustion rather than a repeat.
+///
+/// features.md 105's no-op pin is that same fact from the cache's side, and the
+/// `sha256/` assertion is where it is pinned: a pin is a digest, the digest is
+/// the cache filename (state-and-cache 6.2), and there is no file here to name.
+#[test]
+fn a_local_source_in_reference_mode_sets_the_planted_file_and_admits_nothing() {
+    let planted: Vec<(&str, Vec<u8>)> = vec![
+        ("wide.png", rotation_png(2560, 1440)),
+        ("narrow.png", rotation_png(2048, 1152)),
+    ];
+    let name = "a_local_source_in_reference_mode_sets_the_planted_file_and_admits_nothing";
+    let daemon = start_prepared(name, |dir| {
+        let walls = dir.join("walls");
+        std::fs::create_dir_all(&walls).expect("the source's directory");
+        for (file, bytes) in &planted {
+            std::fs::write(walls.join(file), bytes).expect("a planted image");
+        }
+        write_rotation_config(dir, &walls, None);
+    });
+
+    let cache_root = daemon.dir.join("cache");
+    assert_eq!(
+        count_files(&cache_root.join("sha256")),
+        0,
+        "the fixture starts with nothing in the cache"
+    );
+
+    let first = set_fields(&daemon.ask("next"));
+    assert_eq!(first.len(), 4, "set: <digest> <origin_key> <via> <path>");
+    assert_eq!(first[2], "source", "a rotation sets through a source (2.6)");
+    assert!(
+        first[1].starts_with("pictures:"),
+        "the origin key is the source's id and its candidate's id: {}",
+        first[1]
+    );
+    let first_path = PathBuf::from(&first[3]);
+    assert!(
+        !first_path.starts_with(&cache_root),
+        "reference mode sets the user's own file, never a copy: {}",
+        first_path.display()
+    );
+    let planted_path = planted
+        .iter()
+        .map(|(file, _)| daemon.dir.join("walls").join(file))
+        .find(|path| *path == first_path)
+        .unwrap_or_else(|| {
+            panic!(
+                "the path the platform was given is one of the planted files: {}",
+                first_path.display()
+            )
+        });
+    let planted_bytes = planted
+        .iter()
+        .find(|(file, _)| daemon.dir.join("walls").join(file) == planted_path)
+        .map(|(_, bytes)| bytes.clone())
+        .expect("the planted bytes");
+    assert_eq!(
+        std::fs::read(&planted_path).expect("the planted file"),
+        planted_bytes,
+        "the user's own file is what was set, byte for byte"
+    );
+    assert_eq!(
+        count_files(&cache_root.join("sha256")),
+        0,
+        "and nothing was admitted to the cache"
+    );
+
+    let second = set_fields(&daemon.ask("next"));
+    assert_ne!(
+        first[0], second[0],
+        "the second `next` is a different image: 4.1's window is the origin key, not a cache entry"
+    );
+    assert_ne!(first[1], second[1], "two files, two origins");
+    assert_ne!(first[3], second[3], "two files, two paths");
+    assert_eq!(
+        count_files(&cache_root.join("sha256")),
+        0,
+        "two rotations in reference mode, and the cache still holds nothing"
+    );
+    assert_eq!(
+        value(&daemon.ask("status"), "anchor_verified"),
+        "1",
+        "the daemon recorded the set it was told about (1.7.3)"
+    );
+
+    let third = daemon.ask("next");
+    assert!(
+        third
+            .iter()
+            .any(|line| line.starts_with("ERR no_candidates")),
+        "both candidates are in the window, so the third `next` is exhaustion: {third:?}"
     );
 }
