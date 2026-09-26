@@ -927,8 +927,24 @@ fn refusals_name_their_code_and_the_line_protocol_holds() {
         "{unknown:?}"
     );
     // A second daemon on the same socket refuses rather than unlinks it (1.5).
+    //
+    // Its state and cache roots are its own, inside this test's tree: 4.3 makes
+    // a daemon that is spawned without those two names resolve them from the
+    // platform default, and on this machine the platform default is the user's
+    // own `~/Library/Application Support/whirl` and `~/Library/Caches/whirl`.
+    // Leaving them out is two defects rather than one: the run locks and writes
+    // the user's real state directory and sweeps the user's real cache root, and
+    // the refusal the assertion below reads becomes whichever one start-up
+    // reaches first, so a suite run fails against another suite run's daemon
+    // (`state/locks/daemon.lock is held by pid ...`) instead of against this
+    // test's own live socket. They are separate from the first daemon's for the
+    // same reason: 1.5 step 1 takes the state lock before step 5 probes the
+    // socket, so sharing the state directory would refuse it one step too early
+    // and never reach the socket this test is about.
     let second = Command::new(env!("CARGO_BIN_EXE_whirld"))
         .env("WHIRL_SOCKET", &daemon.socket)
+        .env("WHIRL_STATE_DIR", daemon.dir.join("second-state"))
+        .env("WHIRL_CACHE_DIR", daemon.dir.join("second-cache"))
         .env("WHIRL_CONFIG", daemon.dir.join("config.json"))
         .output()
         .expect("the second daemon runs");
