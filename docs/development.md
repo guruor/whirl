@@ -1154,7 +1154,8 @@ stored flat, so the extraction directory *is* the directory all three must share
 
 ```sh
 # whirl-vX.Y.Z-macos-arm64.tar.gz, taken from the release page
-PREFIX="$(dirname "$(command -v whirld)")"   # one directory, for all three
+PREFIX="${PREFIX:-$(dirname "$(command -v whirld)")}"   # one directory, for all three
+mkdir -p "$PREFIX"
 tar --list --file whirl-vX.Y.Z-macos-arm64.tar.gz
 tar --extract --gzip --file whirl-vX.Y.Z-macos-arm64.tar.gz --directory "$PREFIX"
 ```
@@ -1170,10 +1171,11 @@ else in the archive:
 ```
 
 On a machine with no whirl installed yet there is nothing for `command -v whirld`
-to answer with, and `dirname ""` is `.`, so that line then evaluates to
-`PREFIX=.` and `tar --extract` unpacks the three binaries into whatever directory
-you are standing in. Set it yourself on that first install
-(`PREFIX=/tmp/whirl-prefix` before the block), or stand in the directory you mean.
+to answer with, and `dirname ""` is `.`, so unless you set `PREFIX` yourself that
+line falls back to `PREFIX=.` and `tar --extract` unpacks the three binaries into
+whatever directory you are standing in. Name it yourself on that first install
+(`PREFIX=/tmp/whirl-prefix` before the block: the line keeps your value, and the
+`mkdir -p` under it creates the directory), or stand in the directory you mean.
 What matters is that it is one directory for all three.
 
 No release has been cut yet (the only one so far is the throwaway prerelease in
