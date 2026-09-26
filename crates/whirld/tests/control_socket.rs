@@ -21,6 +21,29 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The harness's own bound for every wait on the daemon, read off the spec's
+/// timeout table rather than chosen. The row that decides it is
+/// `docs/architecture.md:715` (the card that sent this work cites the same row
+/// as `:699`, which is where it sat before the table moved down 16 lines at
+/// `3e2c84c`):
+///
+/// > rotation request timeout | 300 s | Deliberately equal to the worker
+/// > deadline: a client must not give up before the daemon does, or it will
+/// > report a failure for a rotation that then succeeds
+///
+/// `:714` (`connection_idle_timeout`, 300 s: "no client that waits as long as
+/// the prototype's does is ever cut off") and `:716`
+/// (`schedule.worker_deadline_seconds`, 300 s) set the same number from the
+/// daemon's side. A harness bound tighter than that asserts a contract the
+/// daemon never made: 30 s here against a 300 s worker deadline is a client
+/// giving up while the rotation it waits on is still running, and it reports
+/// that as a test failure.
+///
+/// One constant, cited once, because the defect it fixes was drift: `ask` said
+/// 30 s per recv, the bind wait 15 s, the CLI wait 30 s, and each was tighter
+/// than the contract it waited on.
+const CLIENT_BOUND: Duration = Duration::from_secs(300);
+
 struct Daemon {
     child: Child,
     dir: PathBuf,
@@ -40,8 +63,10 @@ impl Daemon {
     /// the greeting, in order.
     fn ask(&self, request: &str) -> Vec<String> {
         let stream = UnixStream::connect(&self.socket).expect("a connection to the daemon");
+        // `docs/architecture.md:715`: the rotation request timeout is 300 s, so a
+        // client reading this connection never gives up before the daemon does.
         stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
+            .set_read_timeout(Some(CLIENT_BOUND))
             .expect("a read timeout");
         let mut reader = BufReader::new(stream.try_clone().expect("a clone for reading"));
         let mut writer = stream;
@@ -101,9 +126,7 @@ fn start_without_whirl_config(name: &str) -> Daemon {
 /// One temporary tree per test, and the one place `spawn_daemon`'s third
 /// argument is decided.
 fn start_with(name: &str, whirl_config: bool, prepare: impl FnOnce(&Path)) -> Daemon {
-    let dir = std::env::temp_dir().join(format!("whirl-t{}-{}", std::process::id(), short(name)));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a temporary directory");
+    let dir = tree(name);
     let socket = dir.join("run").join("whirl.sock");
     prepare(&dir);
     Daemon {
@@ -111,6 +134,15 @@ fn start_with(name: &str, whirl_config: bool, prepare: impl FnOnce(&Path)) -> Da
         dir,
         socket,
     }
+}
+
+/// The empty tree a test owns: `cargo test` runs these in parallel inside one
+/// process, so the name carries the test's own identity and the pid.
+fn tree(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("whirl-t{}-{}", std::process::id(), short(name)));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a temporary directory");
+    dir
 }
 
 /// The config file this daemon read: `WHIRL_CONFIG`, resolved in `spawn_daemon`.
@@ -145,7 +177,19 @@ fn default_config_path(home: &Path) -> PathBuf {
 /// one) and points `HOME` at `dir`, so the daemon resolves the documented
 /// platform default: inside this test's tree, never the user's own config.
 fn spawn_daemon(dir: &Path, socket: &Path, whirl_config: bool) -> Child {
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_whirld"));
+    spawn_daemon_at(&daemon_binary(), dir, socket, whirl_config)
+}
+
+/// The daemon `cargo test` built.
+fn daemon_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_whirld"))
+}
+
+/// The same spawn, from a program path the caller names: the daemon resolves
+/// `whirl-worker` next to its own executable (`whirld`'s `worker::default_program`),
+/// so a test that copies the daemon into its own tree is how the slow-worker test
+/// gives the daemon a worker of its own.
+fn spawn_daemon_at(executable: &Path, dir: &Path, socket: &Path, whirl_config: bool) -> Child {
     let worker = executable
         .parent()
         .expect("the executable has a directory")
@@ -158,8 +202,9 @@ fn spawn_daemon(dir: &Path, socket: &Path, whirl_config: bool) -> Child {
 
     // The daemon's stderr goes to a file, never to this process's: a child that
     // inherited the test harness's pipe would hold it open past the run.
-    let log = std::fs::File::create(dir.join("daemon.log")).expect("a log file");
-    let mut command = Command::new(&executable);
+    let log_path = dir.join("daemon.log");
+    let log = std::fs::File::create(&log_path).expect("a log file");
+    let mut command = Command::new(executable);
     command
         .env("WHIRL_SOCKET", socket)
         .env("WHIRL_STATE_DIR", dir.join("state"))
@@ -178,24 +223,70 @@ fn spawn_daemon(dir: &Path, socket: &Path, whirl_config: bool) -> Child {
             // `socket` comment); removing it makes `~/.config` the arm in force.
             .env_remove("XDG_CONFIG_HOME");
     }
-    let child = command.spawn().expect("the daemon starts");
+    let mut child = command.spawn().expect("the daemon starts");
 
     // Ready means "accepting connections", not "the path exists": a restart over
     // the same directory has a stale socket file from the daemon that just died,
     // and the new one has to remove it before it can bind.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    //
+    // The bound is the spec's, not this file's (`docs/architecture.md:714-715`:
+    // a client waiting on the daemon waits 300 s, and 2.8's table has no
+    // daemon-startup row at all). 15 s was the harness asserting more than the
+    // daemon promised, and start-up latency past 5 s has been measured under
+    // load. What keeps the wider bound honest is the child check: a daemon that
+    // refused, exited or crashed fails here at once, with its exit status and
+    // its log, instead of waiting the deadline out.
+    let deadline = Instant::now() + CLIENT_BOUND;
     loop {
         if UnixStream::connect(socket).is_ok() {
             break;
         }
+        if let Some(status) = child.try_wait().expect("the daemon child is waited on") {
+            panic!(
+                "the daemon exited ({status}) before it bound {}; see {}",
+                socket.display(),
+                log_path.display()
+            );
+        }
         assert!(
             Instant::now() < deadline,
-            "the daemon did not bind {} in 15 s",
-            socket.display()
+            "the daemon did not bind {} in {} s",
+            socket.display(),
+            CLIENT_BOUND.as_secs()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
     child
+}
+
+/// A daemon whose `whirl-worker` is this test's own program: a copy of the real
+/// `whirld` inside the test's tree, so the sibling the daemon resolves is the
+/// file the closure writes. Nothing here replaces anything the rest of the suite
+/// runs: the copy is why the shim cannot leak into the built `whirl-worker` that
+/// every other daemon in this file spawns.
+fn start_with_its_own_worker(name: &str, worker: impl FnOnce(&Path) -> String) -> Daemon {
+    let dir = tree(name);
+    let executable = dir.join("whirld");
+    std::fs::copy(daemon_binary(), &executable).expect("a copy of the daemon");
+    make_executable(&executable);
+    let script = dir.join("whirl-worker");
+    std::fs::write(&script, worker(&dir)).expect("the worker program");
+    make_executable(&script);
+    let socket = dir.join("run").join("whirl.sock");
+    Daemon {
+        child: spawn_daemon_at(&executable, &dir, &socket, true),
+        dir,
+        socket,
+    }
+}
+
+/// A path this process may exec.
+fn make_executable(path: &Path) {
+    let mut permissions = std::fs::metadata(path)
+        .expect("the file exists")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("an executable file");
 }
 
 fn mode(path: &Path) -> u32 {
@@ -881,7 +972,9 @@ fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
         .spawn()
         .expect("the CLI starts");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // The CLI is a client waiting on the daemon, so its bound is the spec's too:
+    // `docs/architecture.md:715` gives a client 300 s before it may give up.
+    let deadline = Instant::now() + CLIENT_BOUND;
     let status = loop {
         match child.try_wait().expect("the CLI is waited on") {
             Some(status) => break status,
@@ -890,9 +983,10 @@ fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!(
-                        "`whirl {}` did not answer in 30 s: the client is waiting for a line \
+                        "`whirl {}` did not answer in {} s: the client is waiting for a line \
                          that never arrived",
-                        args.join(" ")
+                        args.join(" "),
+                        CLIENT_BOUND.as_secs()
                     );
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -1231,7 +1325,7 @@ fn subscribe_streams_one_event_per_state_change() {
     let daemon = start("subscribe_streams_one_event_per_state_change");
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone for reading"));
     let mut writer = stream;
@@ -1357,7 +1451,7 @@ fn a_failed_rotation_is_visible_on_both_planes() {
 
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1444,7 +1538,7 @@ fn subscribe_reports_the_gap_for_a_resume_point() {
     assert_eq!(daemon.ask("resume").last().map(String::as_str), Some("OK"));
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1679,7 +1773,7 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     // An unknown verb: refused, and the connection keeps answering (2.7).
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1701,7 +1795,7 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     // A line past `MAX_REQUEST_LINE`: refused, and the connection ends (2.2).
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1725,7 +1819,7 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     // A line that is not UTF-8: the framing refusal, and the connection ends.
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1747,7 +1841,7 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     // code, and the connection ends.
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(CLIENT_BOUND))
         .expect("a read timeout");
     let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
     let mut writer = stream;
@@ -1772,4 +1866,81 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     assert_eq!(value(&lines, "seq"), "1");
     assert_eq!(value(&lines, "rotating"), "0");
     assert_eq!(value(&lines, "state_corrupt"), "-");
+}
+
+/// The bound of 2.8 pinned with the failure mode it was moved for.
+///
+/// `docs/architecture.md:715` sets the rotation request timeout at 300 s,
+/// "deliberately equal to the worker deadline: a client must not give up before
+/// the daemon does, or it will report a failure for a rotation that then
+/// succeeds", and `ask` used to give up at 30 s. The worker here is the shim
+/// shape that proved the mechanism: a shell script named `whirl-worker` beside a
+/// copy of the daemon (`start_with_its_own_worker`), which reports its `set:`
+/// line only after `SHIM_DELAY`. That is past the 30 s the harness used to
+/// allow and far inside the 300 s the daemon itself allows (`:716` is the worker
+/// deadline, `:714` the connection the answer rides on), so this test passes at
+/// the spec's bound and, at 30 s, failed with `a response line` -- the panic the
+/// suite reports -- as a client that gave up on a rotation that was still
+/// running.
+///
+/// The delay is the subject, so the elapsed time is asserted rather than
+/// tolerated: `waited >= SHIM_DELAY` also fails a version of this test that
+/// quietly stopped reaching a worker at all.
+#[test]
+fn the_client_outlasts_a_worker_that_is_slower_than_the_old_bound() {
+    /// Longer than the 30 s `ask` used to allow, and well short of the 300 s
+    /// the daemon waits (2.8): the window the defect lived in.
+    const SHIM_DELAY: Duration = Duration::from_secs(35);
+    // A digest of the shape 2.5 requires and no file's real one: this test is
+    // about the line the daemon forwards, not about a hash it computed.
+    let digest = "a1".repeat(32);
+
+    let daemon = start_with_its_own_worker(
+        "the_client_outlasts_a_worker_that_is_slower_than_the_old_bound",
+        |dir| {
+            let file = dir.join("slow.png");
+            std::fs::write(&file, b"a file the slow worker reports").expect("a file to set");
+            format!(
+                "#!/bin/sh\nsleep {}\necho 'set: {digest} external:slow-worker {}'\n",
+                SHIM_DELAY.as_secs(),
+                file.display()
+            )
+        },
+    );
+
+    let file = daemon.dir.join("slow.png");
+    assert!(file.exists(), "the shim reports the file this test planted");
+    let started = Instant::now();
+    let lines = daemon.ask(&format!("set path {}", file.display()));
+    let waited = started.elapsed();
+
+    assert_eq!(lines.last().map(String::as_str), Some("OK"), "{lines:?}");
+    assert_eq!(
+        lines[1], "queued",
+        "the interim line reaches the client before the daemon blocks (2.5): {lines:?}"
+    );
+    let forwarded = format!(
+        "set: {digest} external:slow-worker manual {}",
+        file.display()
+    );
+    assert!(
+        lines.iter().any(|line| line == &forwarded),
+        "the slow worker's own record, forwarded as `via: manual` (2.6): {lines:?}"
+    );
+    assert!(
+        waited >= SHIM_DELAY,
+        "the worker really was slower than the old 30 s bound: waited {waited:?}"
+    );
+
+    let status = daemon.ask("status");
+    assert_eq!(
+        value(&status, "rotation_count"),
+        "1",
+        "the rotation the client waited out is a real one, recorded (2.10)"
+    );
+    assert_eq!(
+        value(&status, "rotating"),
+        "0",
+        "and it is done, not still in flight"
+    );
 }
