@@ -318,6 +318,42 @@ impl Worker {
             let _ = pipe.read_to_string(&mut stderr);
         }
 
+        // The daemon owns the worker's pipes and appends what the worker wrote to
+        // the log: `[D 6 §7.2]`'s `decision:` says the worker "writes its result
+        // and its diagnostics to stdout and stderr, and the daemon, which is its
+        // parent and owns the pipes, appends them", and architecture.md 1.6
+        // says the daemon "keeps the whole capture for the log". Until this
+        // loop, this daemon appended stdout and dropped stderr unless the exit
+        // code was non-zero, so stderr was read as an error channel and not as
+        // the diagnostics surface 7.2 makes it.
+        //
+        // A file skipped before candidacy is what that costs. features.md 2.2's
+        // `min_width` row decides it ("a file whose header cannot be read is
+        // excluded and *logged*, because a file we cannot measure is a file we
+        // cannot promise will display"), the counts it moves have no column in
+        // 2.6's `source:` record because 2.5's filter reporting is the
+        // candidates removed *per stage*, and `whirl_core::source::Enumerated`
+        // states the rule for the family ("a walk that ended before it spent
+        // every configured page says so on stderr where it happens, which is the
+        // surface an operator reads"). So a worker that exited 0 after skipping
+        // a user's files told nobody: the file was absent from `config check`
+        // (not a candidate, every rejection counter 0, `reason=-`) and absent
+        // from this log, and a collection looked smaller than it is with no
+        // reason given.
+        //
+        // Every diagnostic line is appended, on every exit, so the worker's own
+        // words come first and this daemon's report of a failure follows them:
+        // the `stage=<name> code=<code> message=<text>` line that
+        // [`failure_from`] reads is on this same stderr, and the caller logs the
+        // code it named (`whirld: rotation <run> failed: ...` in the scheduler,
+        // the `ERR` code of 2.7 to the client).
+        for line in stderr.lines() {
+            let line = line.trim_end();
+            if !line.is_empty() {
+                eprintln!("whirld: worker {} run {run}: {line}", verb.as_str());
+            }
+        }
+
         if !status.success() {
             return Err(failure_from(&stderr));
         }

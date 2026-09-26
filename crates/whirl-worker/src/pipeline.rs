@@ -55,8 +55,20 @@ const HEAD_WINDOW: usize = 1024;
 /// one `.heic` that `sips` wrote puts an `ispe` at 1063. All of them are past
 /// 1024. 64 KiB is the worst of those with an order of magnitude to spare and is
 /// the size of the read buffer in [`store`] and in `Run::reference`, so a HEIC
-/// costs one wider first read and no second pass. A HEIC whose `ispe` is deeper
-/// than this is still not one whirl will promise to display (features.md 2.2).
+/// costs one wider first read and no second pass.
+///
+/// **What has to fit is the whole `meta` box, not the `ispe`.** The walk in
+/// [`boxes`] stops at the first box whose *declared* size runs past the read,
+/// and [`sniff_heic`] cannot enter `meta` unless that top-level box was pushed,
+/// so a `meta` box whose declared size overruns this window leaves its `ispe`
+/// unread however shallowly that `ispe` sits. Measured: a file whose `meta`
+/// declares 200000 bytes and whose `ispe` box starts at 58 is not measured,
+/// although 58 is inside the 1024-byte window above. Every real `meta` box
+/// measured here ends by 5220, so the window is an order of magnitude clear of
+/// the rule it enforces. A HEIC whose `meta` box does not end inside this window
+/// is still not one whirl will promise to display (features.md 2.2), and it is
+/// dropped before candidacy rather than counted at a stage, which is why the
+/// worker reports it on stderr and this daemon forwards that to its log.
 const HEIC_WINDOW: usize = 64 * 1024;
 
 /// A failed stage: what the daemon turns into the `ERR` code of 2.7.
