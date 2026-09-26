@@ -327,17 +327,34 @@ fn failure_from(stderr: &str) -> WorkerError {
 /// `SIGTERM`, five seconds, then `SIGKILL` (1.7.1).
 ///
 /// `Child::kill` is `SIGKILL` on Unix and the standard library has no signal
-/// API, so the polite half goes through `kill(1)`, which exists on every Unix
-/// this build targets. A missing `kill` falls straight through to `SIGKILL`.
+/// API, so the polite half is handed to the `kill` utility below. What this
+/// module may not assume is that a `kill` program is installed, and the history
+/// is kept here because the failure mode was silence:
+///
+/// `kill(1)` is `procps`' on Debian, `procps` is priority `important` rather
+/// than `required`, and the slim images this project builds and reviews in
+/// (`rust:1.85-slim`, `rust:1.94-slim-bookworm`, both arm64) have no `kill`
+/// anywhere on `PATH`. `Command::new("kill")` there failed with `ENOENT` (code
+/// 2) before any signal existed, and because that error was discarded, the
+/// grace below ran its whole five seconds against a worker that was never told
+/// anything before the run ended in `SIGKILL` alone. That is 1.7.1's grace with
+/// the polite half missing, and it is what
+/// `a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace` reported
+/// as "no SIGTERM trap ran in 30s" in a container, identically on base
+/// `7e22e1a` and on `origin/development`, with the run taking exactly
+/// `DEADLINE` plus `TERM_GRACE` (8.01s) because nothing had been signalled.
+///
+/// It was not a PID 1 story, and measuring said so: under `cargo test` in that
+/// image PID 1 is `cargo`, which forks the test binary, which forks the worker,
+/// so the worker is a grandchild with an ordinary PID (probe: worker PID 33 and
+/// the script's own `$$` 33, while PID 1 held `sh`). Nothing in this path turns
+/// on PID 1's default dispositions; all of it turns on whether a `kill` program
+/// exists, which is why the answer is a second route rather than a test that
+/// stops asking for one.
 fn terminate(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = kill(child.id(), "-TERM");
     }
     let grace = Instant::now() + TERM_GRACE;
     while Instant::now() < grace {
@@ -349,6 +366,52 @@ fn terminate(child: &mut std::process::Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// The `kill` utility: how this build sends one signal to one pid, because the
+/// standard library exposes no signal API beyond `Child::kill`, which is
+/// `SIGKILL`, and this workspace has no third-party dependencies to borrow one
+/// from.
+///
+/// Two routes, cheapest first. `kill(1)` is a single `exec` and is what macOS
+/// and any Linux with `procps` installed provide; where there is no such binary
+/// (`terminate` above names the images and the `ENOENT`) the shell's own `kill`
+/// builtin does the same job. POSIX requires `sh` to have that builtin, every
+/// Unix this build targets ships a `sh`, and this project already runs scripts
+/// through `sh` in its own tests, so the fallback costs one fork on the
+/// platforms that need it and nothing at all anywhere else.
+///
+/// The option and the pid go to the shell as positional arguments rather than
+/// interpolated into its command string, so neither can be read as syntax even
+/// if a later caller passes something this one did not.
+///
+/// `None` means neither route could be started at all. That is the one case
+/// that would put 1.7.1 back where the history above found it, and neither
+/// caller treats it as fatal: `terminate` does not depend on the polite half
+/// succeeding, because `SIGKILL` is still there, and the test's probe is a
+/// best-effort question with its own assertion to fail on.
+#[cfg(unix)]
+fn kill(pid: u32, option: &str) -> Option<std::process::ExitStatus> {
+    let pid = pid.to_string();
+    let direct = Command::new("kill")
+        .arg(option)
+        .arg(&pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match direct {
+        Ok(status) => Some(status),
+        Err(_) => Command::new("sh")
+            .arg("-c")
+            .arg("kill \"$1\" \"$2\"")
+            .arg("sh")
+            .arg(option)
+            .arg(&pid)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok(),
+    }
 }
 
 #[cfg(test)]
@@ -764,13 +827,10 @@ mod tests {
         );
 
         let pid: u32 = scripts.text("pid.txt").trim().parse().expect("a pid");
-        let probe = Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("kill -0");
+        // Through the same `kill` utility the daemon just used, so this probe
+        // is not itself a reason for the test to fail on an image with no
+        // `kill(1)` binary (see `terminate`).
+        let probe = kill(pid, "-0").expect("kill -0");
         assert!(
             !probe.success(),
             "the worker was killed and reaped, so {pid} is gone"
