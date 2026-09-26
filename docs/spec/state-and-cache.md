@@ -565,7 +565,7 @@ happen to pick the same image again.
 
 Check, the adversarial form, on a config that `docs/architecture.md` 4.3 and the
 validator both accept: `cache.max_files` at 2, the floor that section sets
-(`docs/architecture.md:1475`) and the lowest value `validate_ordering` admits
+(`docs/architecture.md:1489`) and the lowest value `validate_ordering` admits
 (`crates/whirl-core/src/config.rs:1320`, whose refusal of 1 is asserted at
 `crates/whirl-core/src/config.rs:2450`); the byte cap at its default, so
 `cache.max_bytes >= filters.max_bytes` still holds; and `cache.grace_seconds` at
@@ -603,7 +603,7 @@ being tested.
 
 `decision:` `cache.max_files` is 2 here, and that is the floor's decision rather
 than this check's: 4.3 requires `cache.max_files >= 2`
-(`docs/architecture.md:1475`), `validate_ordering` refuses anything lower and
+(`docs/architecture.md:1489`), `validate_ordering` refuses anything lower and
 names the key (`crates/whirl-core/src/config.rs:1320`), a test asserts that
 refusal (`crates/whirl-core/src/config.rs:2450`), and 8.7 turns it into a refusal
 to start, which is exactly what a value of 1 produced on a real daemon:
@@ -620,16 +620,21 @@ why step 2 pins a second image.
 cache file created inside that window, and at the default of 600 s every file the
 check creates is inside it, so step 4's eviction is not observable: the third
 image is still protected after it stops being the anchor. 4.3's ordering rules do
-not bound `cache.grace_seconds` (the list is `docs/architecture.md:1473-1476`, and
+not bound `cache.grace_seconds` (the list is `docs/architecture.md:1487-1490`, and
 this key is not in it) and `want_u64` accepts 0
 (`crates/whirl-core/src/config.rs:1503`), so 0 is legal and is what the check
 uses; leaving the default in force would mean waiting out the window between
 steps 3 and 4.
 
-`decision:` the check's last precondition is the build: `cache_over_reason:
-pinned` is a sweep outcome (INV-CACHE-1), so the check is observable only in a
-build that has the cache and the sweep 5.5 specifies, and not in one that stops
-before them.
+The check's last precondition is the build, and the piece this build is missing
+is not the cache: the cache and the sweep exist (the sweep is
+`crates/whirld/src/cache.rs`'s `pub fn sweep`, and its `pinned` outcome is
+INV-CACHE-1's `cache_over_reason: pinned` in `whirl status`), while no source kind
+does (`crates/whirl-worker/src/sources/mod.rs`'s `build()` answers `None` for
+`local` and `wallhaven`). Every `whirl next` therefore ends `ERR no_candidates
+stage=source code=no_candidates message=no implementation for kind local in this
+build`, no rotation reaches the cache, and steps 1 to 4 above are unperformable
+in this build until a source kind lands.
 
 **INV-CACHE-3 (pins).** No pinned file is removed by the sweep, and every
 favorites entry is either present with a matching digest, or re-materialisable
