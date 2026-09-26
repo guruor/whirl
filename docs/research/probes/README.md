@@ -19,7 +19,7 @@ clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics
 
 | File | What it is |
 |---|---|
-| `wallpaper_store.py` | Reads `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist` with the nested binary plists decoded. `layers` for the four-layer view and per-Space variation, `dump [space-uuid]` for a decoded Space node, `diff a.plist b.plist` for which slots changed. Read-only. |
+| `wallpaper_store.py` | Reads `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist` with the nested binary plists decoded. `layers` for the four-layer view and per-Space variation, `dump [space-uuid]` for a decoded Space node, `current <space-uuid>` or `current --holds <path>` for one node's `Desktop` slot as `key=value` lines, `diff a.plist b.plist` for which slots changed. Read-only. |
 | `wp_probe.m` | Read-only AppKit probe: per screen, the CGDisplay UUID, frame, `desktopImageURLForScreen`, the option dictionary, and whether the file still exists. |
 | `wp_set.m` | Write probe: sets an image on every screen, optionally with the undocumented `@"allSpaces"` option, then reads back. Reports the `NSError`, which is the point. |
 | `allspaces_test.sh` | [V5]: does `allSpaces` change which nodes are written? Writes A with the option, B without, diffs the store both ways, restores the live image. Snapshot dir: `w0.plist`, `w1.plist`, `w2.plist`. |
@@ -61,13 +61,30 @@ Read the store, not the screen:
 ```sh
 python3 wallpaper_store.py dump                 # the most recently used Space, decoded
 python3 wallpaper_store.py dump <space-uuid>    # a specific one
+python3 wallpaper_store.py current <space-uuid> # one node's Desktop slot, key=value
 python3 live_spaces.py                          # [V6] LastUse age buckets, store wide
 python3 live_spaces.py /tmp/before.plist        # the same, on a snapshot
 python3 raw_node.py /tmp/before.plist /tmp/after.plist   # [V7] raw node timestamps
 ```
 
-Which Space is frontmost? The store does not say directly. The proxy used in the note: the Space
-whose `LastUse` is newest is the one on screen, and a `wp_set` run lands on it.
+Which Space is frontmost? The store does not say, and the proxy this README used to give (the Space
+whose `LastUse` is newest) is not it: measured 2026-09-26 07:00 UTC, the newest-`LastUse` node held
+`wallhaven-28y8x9.jpg` while `wp_probe` returned `wh-5dzd11.jpg` from a different node. Every in-use
+node carries the same write's `LastUse` within about a millisecond, so the newest of them is
+whichever one the wallpaper agent touched last. Take the image from `wp_probe`, which reflects the
+live Space's node, and ask the store which node holds it:
+
+```sh
+/tmp/wp_probe | sed -n 's/^  desktopImageURL: //p'
+python3 wallpaper_store.py current --holds '/System/Library/Desktop Pictures/Mac Yellow.heic'
+```
+
+`--holds` falls back to the most recently used holder when several nodes hold the same file (dead
+Spaces keep the last picture painted into them, and this machine has 13 nodes on one deleted Spice
+temp file), which is a heuristic again. `scripts/desktop-snapshot.sh` and
+`scripts/desktop-restore.sh` are the version of this that has to be right: the restore refuses to
+write unless the store says the image on screen belongs to the Space node the snapshot names, and
+it proves itself by reading the store back afterwards.
 
 One write, and whether the store survives in place `[V5d]`:
 

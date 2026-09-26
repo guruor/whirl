@@ -58,8 +58,15 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(EXIT_USAGE);
     }
-    let request = match request(&args) {
-        Ok(request) => request,
+    let request = match invocation(&args) {
+        Ok(Invocation::Ask(request)) => request,
+        Ok(Invocation::Help) => {
+            // The same text, the same stream and the same code as `--help` and
+            // `-h` above: `help` is the name USAGE gives this text on its own
+            // last line, and the spellings must not drift apart.
+            println!("{USAGE}");
+            return ExitCode::from(EXIT_OK);
+        }
         Err(message) => {
             eprintln!("whirl: {message}");
             eprintln!("{USAGE}");
@@ -97,55 +104,63 @@ fn main() -> ExitCode {
     }
 }
 
+/// One command line, resolved. `help` is the one entry with nothing to send: it
+/// has no protocol verb (2.5.1: no protocol verb exists only to serve the CLI),
+/// so it cannot be a `Request`, and it is still a table entry because USAGE names
+/// it. Everything else is exactly one request.
+enum Invocation {
+    Ask(Request),
+    Help,
+}
+
 /// The CLI verb table of 2.5.1, and nothing else. `set` is the one place the
 /// client guesses, and 2.5.1 puts the guess here on purpose: a wrong guess costs
 /// exit code 3, not a wall of state.
-fn request(args: &[String]) -> Result<Request, String> {
+fn invocation(args: &[String]) -> Result<Invocation, String> {
     let verb = args[0].as_str();
     let rest = &args[1..];
-    let request = match (verb, rest) {
-        ("next", []) => Request::Next,
-        ("prev", []) => Request::Prev,
-        ("status", []) => Request::Status,
-        ("version", []) => Request::Version,
-        ("sources", []) => Request::Sources,
-        ("favorites", []) => Request::Favorites,
-        ("pause", []) => Request::Pause,
-        ("resume", []) => Request::Resume,
-        ("ping", []) => Request::Ping,
-        ("idle", []) => Request::Subscribe { since: None },
-        ("set", [target]) => {
-            if protocol::is_absolute_path(target) {
-                Request::SetPath(target.clone())
-            } else {
-                Request::SetId(target.clone())
-            }
-        }
-        ("history", []) => Request::History {
+    let invocation = match (verb, rest) {
+        ("next", []) => Invocation::Ask(Request::Next),
+        ("prev", []) => Invocation::Ask(Request::Prev),
+        ("status", []) => Invocation::Ask(Request::Status),
+        ("version", []) => Invocation::Ask(Request::Version),
+        ("sources", []) => Invocation::Ask(Request::Sources),
+        ("favorites", []) => Invocation::Ask(Request::Favorites),
+        ("pause", []) => Invocation::Ask(Request::Pause),
+        ("resume", []) => Invocation::Ask(Request::Resume),
+        ("ping", []) => Invocation::Ask(Request::Ping),
+        ("idle", []) => Invocation::Ask(Request::Subscribe { since: None }),
+        ("set", [target]) => Invocation::Ask(if protocol::is_absolute_path(target) {
+            Request::SetPath(target.clone())
+        } else {
+            Request::SetId(target.clone())
+        }),
+        ("history", []) => Invocation::Ask(Request::History {
             count: DEFAULT_HISTORY_COUNT,
-        },
+        }),
         ("history", [count]) => {
             let count = count
                 .parse::<usize>()
                 .map_err(|_| format!("history: {count} is not a count"))?;
-            Request::History {
+            Invocation::Ask(Request::History {
                 count: count.clamp(1, MAX_HISTORY_COUNT),
-            }
+            })
         }
-        ("favorite", []) => Request::Favorite { id: None },
-        ("favorite", [id]) => Request::Favorite {
+        ("favorite", []) => Invocation::Ask(Request::Favorite { id: None }),
+        ("favorite", [id]) => Invocation::Ask(Request::Favorite {
             id: Some(id.clone()),
-        },
-        ("unfavorite", [id]) => Request::Unfavorite(id.clone()),
-        ("config", [path]) if path == "path" => Request::ConfigPath,
-        ("config", [check]) if check == "check" => Request::ConfigCheck,
+        }),
+        ("unfavorite", [id]) => Invocation::Ask(Request::Unfavorite(id.clone())),
+        ("config", [path]) if path == "path" => Invocation::Ask(Request::ConfigPath),
+        ("config", [check]) if check == "check" => Invocation::Ask(Request::ConfigCheck),
+        ("help", []) => Invocation::Help,
         (other, _) => {
             return Err(format!(
                 "{other} is not a command, or it has the wrong number of arguments"
             ));
         }
     };
-    Ok(request)
+    Ok(invocation)
 }
 
 /// The three ways a conversation with the daemon can end badly. `Io` is
