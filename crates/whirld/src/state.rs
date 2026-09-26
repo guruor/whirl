@@ -1214,6 +1214,8 @@ mod tests {
             PathBuf::from("whirl-worker"),
             effective.config_path.clone(),
             Backend::Noop,
+            effective.state_dir.clone(),
+            effective.cache_dir.clone(),
         );
         let lock = crate::lock::take_as(&state_dir, attempt).expect("the lock is taken");
         Daemon::load(effective, worker, lock)

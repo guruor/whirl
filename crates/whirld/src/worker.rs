@@ -5,7 +5,10 @@
 //! non-empty stdout line as the result. The environment is `env_clear()` plus
 //! the names 1.6 lists, which is the fix for `[M 16]` (the prototype inherited
 //! the daemon's whole environment) and what lets the Linux adapters see the
-//! session signals they need.
+//! session signals they need. Two of those names are set to this daemon's own
+//! *resolved* paths rather than to whatever the session had -
+//! `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` - because the worker reads the
+//! recent window of 4.1 out of the two files the daemon wrote (7.2).
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -81,14 +84,31 @@ pub struct Worker {
     program: PathBuf,
     config_path: PathBuf,
     backend: Backend,
+    /// The two directories this daemon resolved and opened (4.3's precedence,
+    /// 7.2's ownership table): where `history.json` is written, and where the
+    /// cache root that holds `index.json` is. They are carried here rather than
+    /// re-derived by the child, which is the defect this pair fixes: a
+    /// `Window::load` whose state directory is not the daemon's reads no
+    /// history, so the recent window of 4.1 is silently empty and consecutive
+    /// rotations repeat.
+    state_dir: PathBuf,
+    cache_dir: PathBuf,
 }
 
 impl Worker {
-    pub fn new(program: PathBuf, config_path: PathBuf, backend: Backend) -> Worker {
+    pub fn new(
+        program: PathBuf,
+        config_path: PathBuf,
+        backend: Backend,
+        state_dir: PathBuf,
+        cache_dir: PathBuf,
+    ) -> Worker {
         Worker {
             program,
             config_path,
             backend,
+            state_dir,
+            cache_dir,
         }
     }
 
@@ -134,6 +154,19 @@ impl Worker {
         // asked to re-resolve it (docs/development.md section 7).
         command.env("WHIRL_CONFIG", &self.config_path);
         command.env("WHIRL_BACKEND", self.backend.as_str());
+        // The same reasoning for 4.3's two path knobs, and here it is a
+        // correctness rule rather than a convenience: the worker's recent window
+        // of 4.1 is read from `history.json` in the state directory and
+        // `index.json` in the cache root (7.2's ownership table puts both files
+        // on the daemon). The scrub below would otherwise leave the child to
+        // re-derive both from `HOME` and the compiled defaults, so a daemon that
+        // took either path from the environment (4.3 puts it ahead of the file)
+        // would write history the worker never reads and get an empty window
+        // back. The values are this daemon's resolved ones, not whatever the
+        // session had: a forwards-when-set pass-through would still rely on the
+        // child resolving exactly as the daemon did.
+        command.env("WHIRL_STATE_DIR", &self.state_dir);
+        command.env("WHIRL_CACHE_DIR", &self.cache_dir);
         // Only when the daemon's own environment sets it, and never written to
         // a file (docs/architecture.md 6.3). The value is never printed.
         if let Some(value) = std::env::var_os("WHIRL_WALLHAVEN_API_KEY") {
@@ -344,12 +377,16 @@ mod tests {
 
     /// The config path is never read: every script here ignores its argv, which
     /// is itself part of what is being shown (1.6's argv is fixed and the
-    /// program is told, not asked).
+    /// program is told, not asked). The two directories are the daemon's
+    /// resolved ones; nothing here reads them either, except the one test that
+    /// asks what the child was told.
     fn worker(program: PathBuf) -> Worker {
         Worker::new(
             program,
             PathBuf::from("/nonexistent/whirl/config.json"),
             Backend::Noop,
+            PathBuf::from("/nonexistent/whirl/state"),
+            PathBuf::from("/nonexistent/whirl/cache"),
         )
     }
 
@@ -390,10 +427,11 @@ mod tests {
     }
 
     /// 1.6's environment rule, as a set equality rather than a membership test:
-    /// the child sees the two names that are always set, the two the daemon
-    /// adds, the API key when the daemon has one, the nine Linux session
-    /// variables on Linux when they are set, and nothing else. The shell sets
-    /// `PWD`, `SHLVL` and `_` for itself, which is why they are named here
+    /// the child sees the two names that are always set, the four the daemon
+    /// adds (the config path, the backend, and this daemon's resolved state and
+    /// cache directories), the API key when the daemon has one, the nine Linux
+    /// session variables on Linux when they are set, and nothing else. The shell
+    /// sets `PWD`, `SHLVL` and `_` for itself, which is why they are named here
     /// instead of silently tolerated.
     ///
     /// An implementation that forgot `env_clear()` fails on the extra names: the
@@ -424,6 +462,12 @@ mod tests {
         let mut expected: Vec<String> = ALWAYS.iter().map(|name| name.to_string()).collect();
         expected.push("WHIRL_CONFIG".to_string());
         expected.push("WHIRL_BACKEND".to_string());
+        // The two path knobs of 4.3 the worker resolves for itself. They are set
+        // unconditionally, to this daemon's resolved directories, so the child
+        // cannot read a different `history.json` than the daemon wrote: that is
+        // the recent window of 4.1, and an empty one repeats the image just set.
+        expected.push("WHIRL_STATE_DIR".to_string());
+        expected.push("WHIRL_CACHE_DIR".to_string());
         if std::env::var_os("WHIRL_WALLHAVEN_API_KEY").is_some() {
             expected.push("WHIRL_WALLHAVEN_API_KEY".to_string());
         }

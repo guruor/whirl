@@ -104,7 +104,13 @@ fn run(flags: &plan::Flags) -> Result<(), String> {
     eprintln!("whirld: backend {}", effective.backend.as_str());
 
     let program = worker::Worker::default_program();
-    let worker = worker::Worker::new(program, effective.config_path.clone(), effective.backend);
+    let worker = worker::Worker::new(
+        program,
+        effective.config_path.clone(),
+        effective.backend,
+        effective.state_dir.clone(),
+        effective.cache_dir.clone(),
+    );
     let socket_path = effective.socket_path.clone();
     // The state files are read here: a quarantine, a rebuild and the degraded
     // modes of docs/spec/state-and-cache.md 6.4 all happen before the socket is
