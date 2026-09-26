@@ -256,8 +256,11 @@ jobs:
             exit "$status"
           fi
           # A scan that read no commits exits 0 and finds nothing. Green there is
-          # green because nothing was checked.
-          if grep --fixed-strings "0 commits scanned" gitleaks.log > /dev/null; then
+          # green because nothing was checked. Read the count as a count: the
+          # substring `0 commits scanned` is also a substring of `10 commits
+          # scanned`, so require a leading non-zero digit instead. A log with no
+          # count line at all fails too, which is the direction that matters.
+          if ! grep --extended-regexp --quiet '[1-9][0-9]* commits scanned' gitleaks.log; then
             echo "::error::the scan read no commits, so this job checked nothing: check the range above, the checkout depth, and the git colour settings."
             exit 1
           fi
