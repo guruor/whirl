@@ -2370,7 +2370,7 @@ mod tests {
     fn a_missing_required_field_names_the_field_and_the_line() {
         let text = "{\n  \"config_schema\": 1,\n  \"sources\": [\n    { \"id\": \"pictures\", \"paths\": [\"~/Pictures\"] }\n  ]\n}";
         let error = refusal(text);
-        assert_eq!(error.field.as_deref(), Some("sources[0].kind"));
+        assert_eq!(error.field.as_deref(), Some("sources[0].kinds"));
         assert_eq!(error.line, 4);
         let message = error.to_string();
         assert_eq!(

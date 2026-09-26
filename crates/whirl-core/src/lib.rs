@@ -21,3 +21,10 @@ pub mod config;
 pub mod protocol;
 pub mod source;
 pub mod state;
+
+/// Throwaway: the deliberate clippy failure of the gate proof in t_438e03b0.
+/// Reverted in the commit after this one.
+pub fn gate_proof_declares_itself(flag: bool) -> bool {
+    let answer = if flag == true { true } else { false };
+    answer
+}
