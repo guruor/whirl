@@ -703,12 +703,6 @@ mod tests {
         );
     }
 
-    /// The inode of a file: what tells "8.8 removed it and 7.3 step 4 created
-    /// another" apart from "the same file, untouched".
-    fn inode(path: &Path) -> u64 {
-        std::fs::metadata(path).expect("the lock file").ino()
-    }
-
     /// The record of 8.7, as a holder writes it: the pid and the start time.
     fn plant_lock(state_dir: &Path, pid: u32) -> PathBuf {
         create_private_dir(state_dir).expect("the state directory");
@@ -732,7 +726,12 @@ mod tests {
         let dir = scratch("reaped-worker");
         let worker = 4711;
         let path = plant_lock(&dir, worker);
-        let left_behind = inode(&path);
+        // The worker's own file, held open across the take. What the removal
+        // leaves behind is this descriptor's inode with no directory entry left
+        // (`nlink` 0), which is also what tells a removal apart from the
+        // truncation 8.8 forbids. An inode *number* is not evidence: ext4 and
+        // tmpfs hand the same number straight back to the file that replaces it.
+        let left_behind = File::open(&path).expect("the worker's lock file");
 
         let guard = take_rotate_with(&dir, |_| Ok(Attempt::Unsupported), Some(worker))
             .expect("a take that cannot fail")
@@ -743,10 +742,10 @@ mod tests {
             path.is_file(),
             "7.3 step 4: the daemon holds the lock now, so its file is there"
         );
-        assert_ne!(
-            inode(&path),
-            left_behind,
-            "the reaped worker's file is gone; this is the file the daemon created"
+        assert_eq!(
+            left_behind.metadata().expect("the worker's file").nlink(),
+            0,
+            "the reaped worker's file is gone; this descriptor is all that is left of it"
         );
         // 8.7 says the fallback file names its holder, so the record that is there
         // is the daemon's own and not the worker's.
@@ -792,7 +791,7 @@ mod tests {
     fn a_lock_file_naming_another_holder_survives_the_reaping_take() {
         let dir = scratch("other-holder");
         let path = plant_lock(&dir, 4242);
-        let left_behind = inode(&path);
+        let left_behind = File::open(&path).expect("the planted lock file");
 
         let deferred = take_rotate_with(&dir, |_| Ok(Attempt::Unsupported), Some(4711))
             .expect("a take that cannot fail");
@@ -800,7 +799,14 @@ mod tests {
             deferred.is_none(),
             "8.8: a holder other than the reaped worker is not taken from"
         );
-        assert_eq!(inode(&path), left_behind, "and its file is untouched");
+        assert_eq!(
+            left_behind
+                .metadata()
+                .expect("the planted lock file")
+                .nlink(),
+            1,
+            "and its file is untouched: still linked, neither removed nor replaced"
+        );
         assert!(
             std::fs::read_to_string(&path)
                 .expect("the planted lock file")
