@@ -44,9 +44,11 @@ rows are in pull-request order, which is not merge order.
 | #10 | 2026-09-25 15:07 | 155 | the escalation test pins SIGTERM to the deadline, not just the grace |
 | #11 | 2026-09-25 15:24 | 163 | the spec for what releases the `excl_file` lock, and what a stale lock means |
 
-Eleven pull requests were opened in this window. One of them was closed unmerged, and its successor is
-the merge that carries its change; the successor is not numbered here either, because this file names
-only pull requests that are merged.
+Eleven pull requests were opened in this window. One of them, #2, was closed unmerged at
+2026-09-25 13:04:19Z, and it is not numbered here for that reason: this file numbers only merged pull
+requests. #3 carries its change, opened at 13:04:24Z on the same head branch
+(`whirl/t_bbf70dcb-secrets-gitleaks-gate`) and under the same title, and it is row 3 of the table
+above, merged at 13:11:57Z.
 
 ### M1's exit criteria, as met
 
@@ -77,7 +79,7 @@ Thirty-seven merged pull requests, 17,203 lines changed.
 At the close: `main` = `b9de3ec`; `git rev-list --count origin/main..origin/development` = `217`;
 `git tag` = no tags; `docs/releases/v0.1.0.md` = absent; one pull request open, the worker-tests branch
 at `a787ddf`, MERGEABLE/CLEAN, 14 of 14 checks green, unmerged because merging on this repo is the
-human's action. It is not numbered here: this file names only merged pull requests.
+human's action. It is not numbered here: this file numbers only merged pull requests.
 
 | PR | merged (UTC) | lines | what it carries |
 |---|---|---|---|
@@ -161,7 +163,7 @@ they land in is `crates/whirl-worker/src/backend/linux.rs`, which today is a stu
 |---|---|
 | Each of the four desktops has its own adapter, and the session signal selects it. | `git show <branch>:crates/whirl-worker/src/backend/linux.rs` names one command per desktop (the strings above), and the selection test asserts the mapping from the session signals in `docs/architecture.md` 1.6 to the adapter chosen. Artifact: the file, plus the test that pins the mapping. |
 | The code compiles and the suite passes on Linux, in the container the gate uses. | `./scripts/ci.sh linux` exits 0 on the branch (clippy, test, artifacts and guards, in the gate's container), and the `test (ubuntu-latest)` and `clippy (ubuntu-latest)` jobs are green at that head. |
-| Every adapter refuses what it cannot serve with a named error, never a silent success. | On a session with `gsettings` but no `gsettings-desktop-schemas`, the built worker prints the `No such schema` error and exits non-zero; with `qdbus` or `swaymsg` absent, the message names the missing binary. Proof: the test that asserts that string, and its output. |
+| Every adapter refuses what it cannot serve with a named error, never a silent success. | On a session with `gsettings` but no `gsettings-desktop-schemas`, the built worker prints the `No such schema` error and exits non-zero; with `qdbus` or `swaymsg` absent, the message names the missing binary. Proof: `cargo test -p whirl-worker --lib backend::linux` runs the two tests the adapters must carry, `crates/whirl-worker/src/backend/linux.rs::a_missing_schema_is_named` (the platform's `No such schema` text is what the refusal carries, as `SetFailed`) and `crates/whirl-worker/src/backend/linux.rs::a_missing_binary_is_named` (the absent binary's name is in the message); `./scripts/ci.sh linux` runs the same two in the gate's container, and the lines the `test (ubuntu-latest)` job prints for them are the output. |
 | The part is labelled honestly until a real Linux desktop proves it. | The header of `crates/whirl-worker/src/backend/linux.rs` and the release notes carry `unverified on real hardware`, with the date and the reason (this machine has no Linux desktop session). Removing the label requires the per-environment walk-through in `docs/research/linux.md`, run on that desktop, with the output recorded in the release notes. |
 
 ### M3b: Windows setter
@@ -175,22 +177,35 @@ holds the API answer and the thirteen-item real-hardware list.
 |---|---|
 | The setter calls the documented API and reads it back, for both modes. | `git show <branch>:crates/whirl-worker/src/backend/windows.rs` calls `SPI_SETDESKWALLPAPER` for `all` and `SPI_GETDESKWALLPAPER` for the readback, and `IDesktopWallpaper::SetWallpaper` with a monitor id from `GetMonitorDevicePathAt` for `per-display`. Artifact: the function bodies, not the file's presence. |
 | The `#[cfg(windows)]` code compiles, and the cross-check runs here. | `./scripts/ci.sh windows` exits 0, and the `test (windows-latest)` job is green at that head. |
-| A set is proved against a real Windows desktop, not a compile. | On the windows runner, one test sets a wallpaper from the cache and the platform's own readback returns that path. Artifact: the test's name and output line, from the `test (windows-latest)` job's run for that head. |
-| Per-virtual-desktop is refused, not faked. | `whirl config check` on a config asking for per-virtual-desktop wallpaper on Windows exits non-zero and names the absent public API (`IDesktopWallpaper` does not model virtual desktops). Proof: the command and the printed reason. |
+| A set is proved against a real Windows desktop, not a compile. | On the windows runner, one test sets a wallpaper from the cache and the platform's own readback returns that path: `crates/whirl-worker/src/backend/windows.rs::a_set_from_the_cache_is_read_back`, run there by `cargo test -p whirl-worker --lib backend::windows`. `./scripts/ci.sh windows` compiles the `#[cfg(windows)]` code and cannot run it, so that runner is the only place this test runs. Artifact: the test's name and output line, from the `test (windows-latest)` job's run for that head. |
+| Per-virtual-desktop is refused, not faked. | There is no key to ask with, so the refusal is at the config surface and by name: `whirld` on a config with `display.mode = "per-virtual-desktop"` refuses to start, exits 1, and prints `display.mode (line 3): <config>: unknown value "per-virtual-desktop"; known values are all, per-display`. That refusal is asserted in `crates/whirl-core/src/config.rs::wrong_types_and_out_of_range_values_are_refused_with_their_line`. It names a value outside the schema rather than an absent Windows API, because per-virtual-desktop is a Part 3 non-goal (`docs/spec/features.md`, "Windows and Linux *per-virtual-desktop* differentiation") for a reason the docs carry and the schema does not: `IDesktopWallpaper` does not model virtual desktops, and the Windows 11 per-desktop path is undocumented shell COM (`docs/research/windows.md`). The daemon's exit code is the refusal. `whirl config check` is not the surface for this, and that is why the row this replaces could not be run: it prints the same refusal and then exits 2 on the socket, so its exit code is the daemon's reachability and not the refusal. Artifact: the command, its exit code, and the printed line. |
 | The part is labelled honestly: a CI runner is a real Windows, but not a real user session. | The backend header and the release notes say which checks ran on a runner and which need a desktop, and the label is removed only by the thirteen-item list in `docs/research/windows.md` being run and recorded. |
 
 ### M3c: per-display matrix
 
 This is the one part that needs hardware the fleet does not have, so it is the one part whose criteria
-may legitimately block on it. `docs/spec/features.md` 1.3 is the policy: `"per-display"` is honoured
-only where a platform's research answered yes, and rejected at `whirl config check` with that
-platform's reason elsewhere.
+may legitimately block on it. `docs/spec/features.md` 1.3 is the policy, and it has three fallbacks, not
+two: `"per-display"` is honoured where a platform's research answered yes; refused at `whirl config
+check` with that platform's reason where it is impossible (GNOME) or out of scope (KDE); and accepted
+and run as `all`, with `display_mode_reason` naming why, where the research has not answered yet, which
+is macOS.
+
+The two readings of that policy disagree, and the disagreement is named here rather than settled
+quietly. Part 3's "Per-display images as a blanket v0.1 promise" row reads the third fallback away and
+puts macOS in the reject bucket beside GNOME and KDE, which is the reading the table below used to
+carry. 1.3's own third fallback; `docs/architecture.md` failure row 14, "accepted and run as `all`
+where the answer is unverified (macOS ...), refused at `config check` where it is impossible (GNOME) or
+out of scope (KDE)"; architecture 3.5's macOS cell and 3.7's unverified row; and the `display.mode`
+comment the shipped schema carries in `crates/whirl-core/src/config.rs` all read the other way. The
+failure table is what the implementation follows, so this file follows 1.3's third fallback and row 14.
+"No API names a Space" is not the per-display verdict and is kept where it belongs: the per-Space
+limitation, which is its own row in the "not in v0.1.0" table below.
 
 | criterion | proof |
 |---|---|
-| The matrix is reproduced per platform, not asserted. | For each of macOS, Windows and Linux: `whirl config check` on a config with `display.mode = "per-display"` prints the verdict the matrix claims, which is accept on Windows (`IDesktopWallpaper::SetWallpaper` takes a monitor id) and on sway, and reject with the platform's reason on macOS (no API names a Space) and on GNOME (one image on all monitors, a hard limitation). Artifact: the command, the exit code and the printed line, once per platform. |
-| On this machine, a per-display set touches one screen and leaves the other alone. | With a second display attached: `scripts/desktop-snapshot.sh` first, then a rotation naming one screen, then the readback of both screens with `docs/research/probes/wp_probe.m` (it prints `desktopImageURLForScreen` per screen); the named screen shows the new image and the other shows what it showed before. Artifact: the two readbacks, following `docs/development.md` "When a check needs a real set". This criterion cannot pass on a one-display machine and is expected to block there. |
-| The desktop is left exactly as it was found. | `scripts/desktop-restore.sh` after the check, and the restore proved by reading the store back and printing the image line. A test fixture left as the desktop picture is a failed check, not a pass. |
+| The matrix is reproduced per platform, not asserted. | For each of macOS, Windows and Linux: `whirl config check` on a config with `display.mode = "per-display"` prints the verdict the matrix claims (`docs/architecture.md` 3.5, and failure row 14 for all five answers). Accepted and run as `all` on macOS, with `display_mode_reason: unverified_platform`; honoured on Windows, per monitor, `IDesktopWallpaper::SetWallpaper` taking a monitor id; honoured on Linux where the desktop answered yes, which is sway per output and generic X11 per output and per `--output`; refused with the cell's reason on GNOME (one image on all monitors, a hard limitation) as `impossible_on_this_desktop` and on KDE (out of scope, `org.kde.slideshow` owns the key) as `out_of_scope_on_this_desktop`, those two being the cells `whirl config check` prints the reason for and exits 1 on. Artifact: the command, the exit code and the printed line, once per cell. |
+| On a two-display machine on a platform that honours `per-display`, a per-display set touches one screen and leaves the other alone. | Not this machine, and not macOS at all: the route is a sway session or a real Windows desktop, two displays attached, driving the backend's per-screen set directly rather than a rotation. `swaymsg output <output> bg <file> fill` names one output (`docs/research/linux.md`); `IDesktopWallpaper::SetWallpaper(monitorID, path)` takes one id from `GetMonitorDevicePathAt` (`docs/research/windows.md`). The named screen shows the new image and the other shows what it showed before, read back per screen (`swaymsg -t get_outputs`, `GetWallpaper`). macOS cannot carry this criterion on either reading of row 1: `per-display` there is accepted and runs as `all`, so `set()` puts the same image on every screen (`crates/whirl-worker/src/backend/macos.rs`, `fn set` at 398), and `scripts/desktop-snapshot.sh` and `scripts/desktop-restore.sh` are macOS-only, so they are not this check's harness. It cannot pass on a one-display machine either, whatever the platform, and is expected to block there. Artifact: the two readbacks. |
+| The desktop is left exactly as it was found. | `scripts/desktop-restore.sh` after the check, and the restore proved by reading the store back and printing the image line. Those two scripts are macOS-only, so on the platforms row 2 names the restore is that platform's own set back to the snapshot image, read back and printed the same way. A test fixture left as the desktop picture is a failed check, not a pass. |
 | `whirl status` reports the mode that actually ran. | `whirl status` prints `display_mode_effective: per-display` where the platform answered yes, `display_mode_effective: all` plus one warning line where the research has no answer yet, per 1.3's third fallback. Artifact: the status line. |
 
 ### The release path
@@ -214,7 +229,8 @@ is a pull request reviewed by someone who did not open it, and `main` is back-me
 | not in v0.1.0 | why |
 |---|---|
 | A Linux or Windows setter verified on real desktop hardware. | This machine has no Linux desktop session, so the Linux adapters ship compile- and container-verified and labelled `unverified on real hardware`; the Windows setter can be exercised on the CI runner but not in a real user session. `docs/development.md` section 3 is the list of what CI cannot prove, and each row's human check is where these are settled. That checklist, not the code, is the real release gate. |
-| `"per-display"` on a platform whose research answered no. | macOS: a `forScreen:` set covers the frontmost Space only and no public API names a Space, so per-display is rejected at `whirl config check` with that reason (`docs/spec/features.md` 1.3). The key stays in the schema so the config does not have to change later. |
+| `"per-display"` on a platform whose research answered no. | GNOME (one image on all monitors, a hard limitation) and KDE (`org.kde.slideshow` owns the config key, so it is out of scope) are refused at `whirl config check` with their own reason, `impossible_on_this_desktop` and `out_of_scope_on_this_desktop` (`docs/architecture.md` failure row 14). macOS is not in this bucket: its answer is unverified, not no, so `"per-display"` is accepted there and runs as `all` with `display_mode_reason: unverified_platform`, which is `docs/spec/features.md` 1.3's third fallback. The key stays in the schema so the config does not have to change later. |
+| Per-Space wallpaper on macOS. | A `forScreen:` set covers the frontmost Space only and no public API names a Space, so there is nothing to call rather than a technicality (`docs/architecture.md` 3.1, and X4). This is the per-Space limitation, and it is separate from the `"per-display"` verdict above: on macOS per-display is accepted and runs as `all`, while per-Space has no setter at all. |
 | Per-virtual-desktop wallpaper on Windows or Linux. | No public API: `IDesktopWallpaper` does not model virtual desktops, and the Windows 11 per-desktop path is undocumented shell COM. |
 | `whirl reset`. | Absent from the v0.1 surface; `whirl reset` answers with the CLI's usage rather than acting (`docs/spec/state-and-cache.md` 6.5). |
 | Packaging, code signing, notarization, installers, auto-update. | Release engineering rather than v0.1 product scope. What ships today is what `.github/workflows/release.yml` builds: three unsigned archives from `cargo build --workspace --release`. |
@@ -224,9 +240,11 @@ is a pull request reviewed by someone who did not open it, and `main` is back-me
 
 - The pull request list and every date in it come from
   `gh pr list --state all --limit 60 --json number,state,mergedAt,additions,deletions`. "lines" is
-  `additions + deletions` for that pull request. Every number in this file is merged:
-  `gh pr view <n> --json number,mergedAt` is the check, and a `mergedAt` of `null` would make the
-  document a claim rather than a record.
+  `additions + deletions` for that pull request. **Every pull request this file numbers is merged:**
+  `gh pr view <n> --json number,mergedAt` is the check on any row of either table, and a `mergedAt` of
+  `null` there would make the document a claim rather than a record. One pull request is named without
+  being numbered, #2, and it is the closed one: `gh pr view 2 --json state,mergedAt` prints `CLOSED` and
+  `null`, and #3, which is numbered, carries its change.
 - The ref facts come from `git fetch origin --prune` then `git rev-parse origin/main origin/development`,
   `git rev-list --count origin/main..origin/development`, `git tag` and
   `git cat-file -e origin/development:docs/releases/v0.1.0.md`.
