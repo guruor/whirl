@@ -105,3 +105,46 @@ Recipe, run inside the same container: keep the last copy of every
 test, then read the preserved `daemon.log`. The whole directory is smaller than
 16 KiB, so the copy is cheap; nothing else is needed, and no test file has to be
 touched.
+
+## 2. The native counterparts
+
+The same image tag without `--platform`, so on this machine the arm64 guest, and
+the same command on macOS. Same checkout, same commit as section 1.
+
+```sh
+docker run --rm --platform linux/arm64 \
+  -v "$PWD":/w -w /w \
+  -v whirl-ci-arm-target:/tmp/target -e CARGO_TARGET_DIR=/tmp/target \
+  rust:1.94.0-bookworm \
+  bash -c 'uname -m; rustc -V; WHIRL_BACKEND=noop cargo test --workspace'
+```
+
+    uname -m: aarch64
+    rustc 1.94.0 (4a4ef493e 2026-03-02)
+    running 4 tests   ... test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    running 43 tests  ... test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+    running 6 tests   ... test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    running 36 tests  ... test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.01s
+    running 19 tests  ... test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+    running 3 tests   ... test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+    test a_failed_rotation_is_visible_on_both_planes ... ok
+    test subscribe_streams_one_event_per_state_change ... ok
+    cargo test exit=0
+
+```sh
+cd <checkout>
+WHIRL_BACKEND=noop cargo test --workspace   # macOS 26.5.2, arm64, rustc 1.94.0
+```
+
+    running 4 tests   ... test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+    running 43 tests  ... test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+    running 6 tests   ... test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+    running 36 tests  ... test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.07s
+    running 19 tests  ... test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.12s
+    running 3 tests   ... test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+    test a_failed_rotation_is_visible_on_both_planes ... ok
+    test subscribe_streams_one_event_per_state_change ... ok
+    cargo test exit=0
+
+One commit, the same two tests, three environments: red only in the translated
+amd64 guest.
