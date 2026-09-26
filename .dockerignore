@@ -1,0 +1,6 @@
+# The gate's image (scripts/gate.Dockerfile) needs no file from this tree, so
+# keep the build context to what it is: the two exclusions below are the bulky
+# ones, and sending them would cost seconds on every build.
+target/
+.git/
+.worktrees/

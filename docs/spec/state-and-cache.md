@@ -565,7 +565,7 @@ happen to pick the same image again.
 
 Check, the adversarial form, on a config that `docs/architecture.md` 4.3 and the
 validator both accept: `cache.max_files` at 2, the floor that section sets
-(`docs/architecture.md:1475`) and the lowest value `validate_ordering` admits
+(`docs/architecture.md:1489`) and the lowest value `validate_ordering` admits
 (`crates/whirl-core/src/config.rs:1320`, whose refusal of 1 is asserted at
 `crates/whirl-core/src/config.rs:2450`); the byte cap at its default, so
 `cache.max_bytes >= filters.max_bytes` still holds; and `cache.grace_seconds` at
@@ -603,7 +603,7 @@ being tested.
 
 `decision:` `cache.max_files` is 2 here, and that is the floor's decision rather
 than this check's: 4.3 requires `cache.max_files >= 2`
-(`docs/architecture.md:1475`), `validate_ordering` refuses anything lower and
+(`docs/architecture.md:1489`), `validate_ordering` refuses anything lower and
 names the key (`crates/whirl-core/src/config.rs:1320`), a test asserts that
 refusal (`crates/whirl-core/src/config.rs:2450`), and 8.7 turns it into a refusal
 to start, which is exactly what a value of 1 produced on a real daemon:
@@ -620,16 +620,21 @@ why step 2 pins a second image.
 cache file created inside that window, and at the default of 600 s every file the
 check creates is inside it, so step 4's eviction is not observable: the third
 image is still protected after it stops being the anchor. 4.3's ordering rules do
-not bound `cache.grace_seconds` (the list is `docs/architecture.md:1473-1476`, and
+not bound `cache.grace_seconds` (the list is `docs/architecture.md:1487-1490`, and
 this key is not in it) and `want_u64` accepts 0
 (`crates/whirl-core/src/config.rs:1503`), so 0 is legal and is what the check
 uses; leaving the default in force would mean waiting out the window between
 steps 3 and 4.
 
-`decision:` the check's last precondition is the build: `cache_over_reason:
-pinned` is a sweep outcome (INV-CACHE-1), so the check is observable only in a
-build that has the cache and the sweep 5.5 specifies, and not in one that stops
-before them.
+The check drives the cache through rotations (steps 1 to 4), so it cannot be
+exercised end to end until a source kind ships. The cache and the sweep are not
+the gap — `crates/whirld/src/cache.rs`'s `pub fn sweep` exists, and its `pinned`
+outcome is INV-CACHE-1's `cache_over_reason: pinned` in `whirl status`. The gap
+is the sources: at this writing `local` is written and open as PR #33 and
+`wallhaven` is not written, so until #33 merges every `whirl next` ends `ERR
+no_candidates stage=source code=no_candidates message=no implementation for kind
+local in this build` and steps 1 to 4 are unperformable. Once #33 merges, the
+check runs as written against a local source, which needs no network.
 
 **INV-CACHE-3 (pins).** No pinned file is removed by the sweep, and every
 favorites entry is either present with a matching digest, or re-materialisable
@@ -871,6 +876,16 @@ favorites.
 `decision:` reset is a first-class pair of verbs rather than advice, because R1
 makes it trivial and a user should not have to remember a path.
 
+`decision:` **`whirl reset` is not in the v0.1 surface, and the table below is
+the design for a verb no v0.1 build has.** `docs/spec/features.md` 1.1 ships a
+closed verb set ("v0.1 ships this verb set and no more") and holds no `reset`;
+section 9 of this document adds no verb to it ("no new verb is needed and none is
+added"); and `docs/architecture.md` 2.5 and 2.5.1, the protocol grammar and the
+CLI verb mapping, close over the same set. The CLI answers `whirl reset` with its
+unknown-command error and the protocol has no request for it, so until the verb
+lands the raw form below is the whole of what a user can do, and the mentions of
+it in 1.4, 6.4 and 8.2 read as this design rather than as a command that exists.
+
 | Verb | Effect | Cache | History | Favorites |
 |---|---|---|---|---|
 | `whirl reset --state` | Quarantine-then-replace the three state files with fresh empty ones | untouched | cleared | cleared |
@@ -917,7 +932,7 @@ that opens the file.
 | Path | Writer | Readers | Surface |
 |---|---|---|---|
 | `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path | `whirl config path`, `whirl config check`, `whirl sources` |
-| `state/current.json` | daemon | daemon; humans with `cat` | `whirl status`; `whirl pause`, `whirl resume` |
+| `state/current.json` | daemon | daemon; humans | `whirl status`; `whirl pause`, `whirl resume` |
 | `state/history.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl history`; `whirl prev` |
 | `state/favorites.json` | daemon | daemon | `whirl favorites`; `whirl favorite`, `whirl unfavorite` |
 | `log` | daemon | humans | none |
