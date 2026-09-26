@@ -36,7 +36,7 @@ JSON
 ```
 
 `~/Pictures/Wallpapers` is the line to change. The `local` source walks that folder and takes any
-`jpg`, `jpeg`, `png` or `webp` at least 1600x900.
+`jpg`, `jpeg`, `png`, `heic` or `webp` at least 1600x900.
 
 ## 3. Start it, and rotate
 
