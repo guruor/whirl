@@ -564,10 +564,19 @@ reviewer can check:
 | `whirl config path`, `whirl config check` | `config path`, `config check` |
 | `whirl idle` | `subscribe`, then `close` after the first `event:` line |
 | `whirl version` | optionally `hello`, then `version` |
+| `whirl ping` | `ping` |
 
-Verbs with no CLI verb, and why they exist: `ping` and `hello` are liveness and negotiation for any
-client; `close` is a clean shutdown of one connection; `subscribe` is the frontend surface. No
-protocol verb exists only for the CLI, and no CLI verb needs a protocol verb of its own.
+`whirl ping` is the liveness probe and nothing else: `ping` is one round trip that does no work and
+has no success data lines (2.5), so the CLI prints nothing and its exit code is the whole answer, 0
+when the daemon replied and 2 when the socket is unreachable. It adds no protocol surface, because
+`ping` is a verb for any client (below); it is the CLI's own way to ask the question a user asks,
+"is the daemon there", without `nc` and without reading a socket by hand.
+
+Verbs with no CLI verb, and why they exist: `hello` is negotiation for any client, and the CLI never
+sends it (`whirl version` maps to `version` alone, above); `close` is a clean shutdown of one
+connection, and `whirl idle` issues it itself; `subscribe` is the frontend surface, reached through
+`whirl idle`. No protocol verb exists only for the CLI, and no CLI verb needs a protocol verb of its
+own.
 
 `decision:` `whirl idle` is `subscribe` plus one event, not a server-side one-shot verb.
 `[D 5 §1.1]`'s verb table wants "Block until state changes. For frontends, so none of them polls."
