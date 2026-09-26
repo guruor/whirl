@@ -62,7 +62,7 @@ Ctrl-C in the daemon's terminal. Nothing else is left running.
 
 - The screen changes a moment *after* `whirl next` returns. macOS applies the picture out of
   process, so the `set:` line means the write was accepted, not that the desktop has repainted:
-  measured here, 1.5 s to 2.7 s later.
+  two runs here put the write the store records 2.6 s and 3.4 s later.
 - `WHIRL_BACKEND` in your shell disarms the whole run without saying so. With `WHIRL_BACKEND=noop`
   exported (a leftover from a test) every stage still runs except the platform setter: `whirl next`
   prints its `set:` line, the history records it, and your wallpaper never changes. `whirl config
