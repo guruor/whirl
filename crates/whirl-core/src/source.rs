@@ -10,6 +10,7 @@
 //! the schema they will plug into.
 
 use crate::config::{ConfigError, SourceConfig};
+use std::fmt;
 use std::path::PathBuf;
 
 /// One candidate an enumerating source produced.
@@ -137,6 +138,106 @@ pub struct EnumContext {
     pub recent: Vec<String>,
 }
 
+/// What one `enumerate` call produced.
+///
+/// The candidates are 2.6's metadata-only list. The two page numbers are the
+/// source's own accounting of the listing requests it made, which no stage of
+/// the pipeline can see: a source that lists nothing over the wire (a local
+/// filesystem) walks no pages and asks for none, so both are 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Enumerated {
+    pub candidates: Vec<Candidate>,
+    /// Listing requests this enumeration actually made.
+    pub pages_walked: u64,
+    /// How many of the configured `pages` the walk did not make because the
+    /// listing ended first: `last_page` reached, or a page that came back with
+    /// no entries. A walk that made every page it was configured for skipped
+    /// none, even when the listing has more pages than the config asked for:
+    /// that is what `pages` means (features.md 2.3), not a skip.
+    pub pages_skipped: u64,
+}
+
+impl Enumerated {
+    /// The result of a source that makes no listing request of its own.
+    pub fn of(candidates: Vec<Candidate>) -> Enumerated {
+        Enumerated {
+            candidates,
+            pages_walked: 0,
+            pages_skipped: 0,
+        }
+    }
+}
+
+/// Why an `enumerate` call could not answer.
+///
+/// A source that cannot be asked has to say so. The alternative, an empty
+/// candidate list, is indistinguishable from a source that honestly found
+/// nothing, and the operator reads the difference in the reason the rotation
+/// prints (docs/architecture.md 4.3). The kind is named rather than only
+/// described because it is the half a test can assert on: the message is prose
+/// (and for a Wallhaven failure it is the API's own, which is not ours to keep
+/// stable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceErrorKind {
+    /// 401: the API wanted a key, or the key it was given is not valid.
+    Unauthorized,
+    /// 403: the request was refused before it was read.
+    Forbidden,
+    /// 429: the documented rate limit was exceeded.
+    RateLimited,
+    /// 404: the listing endpoint does not exist, which for a collection means
+    /// the handle is wrong.
+    NotFound,
+    /// The request never completed: no program to make it with, no network, or
+    /// a timeout.
+    Unavailable,
+    /// The response arrived and could not be read as the listing it claims to
+    /// be.
+    Malformed,
+}
+
+impl SourceErrorKind {
+    /// The name of the kind, which is what a log line and a test carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceErrorKind::Unauthorized => "unauthorized",
+            SourceErrorKind::Forbidden => "forbidden",
+            SourceErrorKind::RateLimited => "rate_limited",
+            SourceErrorKind::NotFound => "not_found",
+            SourceErrorKind::Unavailable => "unavailable",
+            SourceErrorKind::Malformed => "malformed",
+        }
+    }
+}
+
+/**
+ * A named failure from a source, with the API's own words in the message.
+ */
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceError {
+    pub kind: SourceErrorKind,
+    /// Prose, for the operator. It never carries an API key: see
+    /// docs/architecture.md 6.3 (docs/spec/features.md 2.4).
+    pub message: String,
+}
+
+impl SourceError {
+    pub fn new(kind: SourceErrorKind, message: impl Into<String>) -> SourceError {
+        SourceError {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for SourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.kind.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for SourceError {}
+
 /// One source, as docs/spec/features.md 2.6 describes it.
 ///
 /// Three methods, and no I/O in `validate` or `capabilities`: `validate` rejects a
@@ -147,8 +248,9 @@ pub trait Source {
     /// Reject a config this source cannot work with, naming the offending key.
     fn validate(&self, config: &SourceConfig) -> Result<(), ConfigError>;
 
-    /// List candidates. May be lazy: metadata only.
-    fn enumerate(&self, ctx: &EnumContext) -> Vec<Candidate>;
+    /// List candidates, or say why the listing could not be made. May be lazy:
+    /// metadata only.
+    fn enumerate(&self, ctx: &EnumContext) -> Result<Enumerated, SourceError>;
 
     /// Which Layer 1 filters this source can push into its own request.
     fn capabilities(&self) -> FilterSet;

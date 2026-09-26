@@ -28,9 +28,12 @@ fn scratch(name: &str) -> PathBuf {
 
 /// The config of docs/development.md section 7, with the one local source. The
 /// path it names is this test's scratch directory, so nothing on the machine is
-/// read even by accident.
+/// read even by accident, and the directory is created empty: a `local` source
+/// whose every path is missing is refused as a whole (features.md 2.2), which is
+/// its own test below.
 fn write_config(dir: &Path) -> PathBuf {
     let path = dir.join("config.json");
+    std::fs::create_dir_all(dir.join("pictures")).expect("the source's directory");
     let body = format!(
         "{{\n  \"config_schema\": 1,\n  \"backend\": \"noop\",\n  \"sources\": [\n    \
          {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [{}] }}\n  ]\n}}\n",
@@ -67,14 +70,13 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
-/// A rotation with no source that can be asked is `no_candidates`, not a
-/// success: features.md 1.4's "every configured source yielded nothing
-/// admissible" (2.7). No `kind` has an implementation in this build, so this is
-/// what the shipped binary does on every rotation until `local` or `wallhaven`
-/// lands, and the message has to say which kind is missing rather than leaving
-/// an operator to guess.
+/// A rotation over an empty directory is `no_candidates` with the sentence the
+/// spec names for it, not a success: features.md 1.4's "the source answered but
+/// the filter pipeline left nothing", whose message is "no source produced an
+/// admissible image" (`docs/architecture.md` 4.5's table, 2.7's code). The
+/// reason names the source and what it yielded.
 #[test]
-fn a_rotation_without_a_source_reports_no_candidates_on_stderr() {
+fn an_empty_directory_reports_no_candidates_with_the_reason_the_spec_names() {
     let dir = scratch("rotate");
     let config = write_config(&dir);
     let output = run(&config, &["--verb", "rotate", "--run", "1"]);
@@ -82,7 +84,12 @@ fn a_rotation_without_a_source_reports_no_candidates_on_stderr() {
         !output.status.success(),
         "a rotation that set nothing is not a success"
     );
-    assert_eq!(output.status.code(), Some(1), "a stage failure exits 1");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a stage failure exits 1, and never a panic: {}",
+        stderr(&output)
+    );
     assert_eq!(
         stdout(&output),
         "",
@@ -94,8 +101,62 @@ fn a_rotation_without_a_source_reports_no_candidates_on_stderr() {
         "stderr carries the failing stage and the code (1.6): {errors}"
     );
     assert!(
-        errors.contains("no implementation for kind local in this build"),
-        "the message names the missing kind: {errors}"
+        errors.contains("no source produced an admissible image"),
+        "the sentence 2.7's table and 4.5's name for the case: {errors}"
+    );
+    assert!(
+        errors.contains("pictures: 0 candidates, 0 admitted"),
+        "the reason names the source and what it yielded: {errors}"
+    );
+}
+
+/// A rotation whose only configured path does not exist is `no_candidates` too,
+/// with the path in the message: features.md 2.2's "a path that is missing or
+/// unreadable is a warning; it is an error only if every path fails", and
+/// `docs/architecture.md` 4.3's rule that the fact is the worker's and appears
+/// as `enabled=0 reason=<...>`. A panic here would be an exit code of 101 and no
+/// `stage=` line at all, which is what this test is for.
+#[test]
+fn a_path_that_does_not_exist_is_no_candidates_and_names_the_path() {
+    let dir = scratch("missing-path");
+    let absent = dir.join("pictures");
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"backend\": \"noop\",\n  \"sources\": [\n    \
+             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [{}] }}\n  ]\n}}\n",
+            json_string(&absent.display().to_string())
+        ),
+    )
+    .expect("the config is written");
+
+    let output = run(&config, &["--verb", "rotate", "--run", "1"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the named code, not a panic: {}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&output), "", "nothing ran past the source stage");
+    let errors = stderr(&output);
+    assert!(
+        errors.contains("stage=source code=no_candidates"),
+        "the stage and the code (1.6): {errors}"
+    );
+    assert!(
+        errors.contains(&absent.display().to_string()),
+        "the path that failed is named: {errors}"
+    );
+    // The errno text is the platform's, so the test asks the platform for it
+    // rather than hardcoding Unix's: the source reports the same
+    // `symlink_metadata` failure this line provokes.
+    let why = std::fs::symlink_metadata(&absent)
+        .expect_err("the path is still missing")
+        .to_string();
+    assert!(
+        errors.contains(&why),
+        "and so is the reason it failed ({why}): {errors}"
     );
 }
 
@@ -110,17 +171,18 @@ fn a_rotation_without_a_source_reports_no_candidates_on_stderr() {
 /// `backend` and its one enabled source; the plan's values are effective values,
 /// which is why 2.6 exists at all ("what did the daemon actually adopt").
 ///
-/// `enabled=0` and a reason, with no counter group: no `kind` has an
-/// implementation in this build, so no source can be enumerated and nothing can
-/// be counted. 4.3 fixes that form ("the worker runs the semantic check ... and
-/// prints `enabled=0 reason=<...>`") and 2.6 says the bracket group is optional.
-/// When `local` lands, this line grows the group and this assertion is the one
-/// that has to change.
+/// `enabled=1` and the counter group, because the source's kind has an
+/// implementation in this build: the group is `crates/whirl-worker/src/sources/`
+/// `mod.rs`'s dispatch table's, one arm per kind, and 2.6 says the bracket group
+/// is optional so that a kind without an arm can print `enabled=0 reason=<...>`
+/// instead. Every count is zero because the scratch directory `write_config`
+/// creates is empty, which is what makes this a literal rather than a machine's
+/// own count.
 ///
 /// It is a literal on purpose: the assertion is "these exact bytes", and a table
 /// this test joined together could hide a reordering of the keys behind a
 /// reordering of the table.
-const CHECK_OUTPUT: &str = "source: pictures local weight=1 enabled=0 last=- reason=no implementation for kind local in this build\nplan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1 startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02 filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=- cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 backend=noop sources=1\n";
+const CHECK_OUTPUT: &str = "source: pictures local weight=1 enabled=1 last=- candidates=0 admitted=0 rejected_resolution=0 rejected_ratio=0 rejected_size=0 rejected_type=0 rejected_dedupe=0 reason=-\nplan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1 startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02 filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=- cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 backend=noop sources=1\n";
 
 #[test]
 fn check_prints_the_source_and_plan_records() {

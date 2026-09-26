@@ -16,6 +16,8 @@
 //! fails with `no_candidates` and a message that names the missing kind.
 
 mod backend;
+mod http;
+mod lock;
 mod pipeline;
 mod sources;
 
@@ -115,6 +117,22 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(failure) => return failure.report(),
     };
+    // 7.2 and 7.3 step 2: the worker's half of `rotate.lock`, taken after the
+    // config (a config this worker cannot read is `bad_config`, not `busy`) and
+    // before anything that touches the cache, then held for the rest of this
+    // process's life: the guard is dropped as `main` returns, and under `flock`
+    // the kernel releases the lock on any exit, `SIGKILL` included.
+    let _rotation_lock = match args.verb {
+        // A check is not a rotation: 2.5's `config check` row gives that verb
+        // `bad_config`, `worker_failed` and `timeout` and no `busy`, and a check
+        // writes nothing into the cache, so it takes no lock and a check during a
+        // rotation still answers.
+        Verb::Check => None,
+        Verb::Rotate | Verb::Set => match rotation_lock() {
+            Ok(guard) => Some(guard),
+            Err(failure) => return failure.report(),
+        },
+    };
     let backend = match backend(&config) {
         Ok(backend) => backend,
         Err(failure) => return failure.report(),
@@ -136,11 +154,17 @@ fn main() -> ExitCode {
         None => pipeline::Window::empty(),
     };
     let platform = pipeline::host_platform();
+    // The one HTTP client this build has, and the transport that chooses by
+    // origin: a `wallhaven` candidate's origin is an `https://` URL and a `local`
+    // one's is a path (`pipeline::Origins`). Both live for the whole process
+    // because `Run` borrows them.
+    let client = http::Curl;
+    let transport = pipeline::Origins::new(&client);
     let run = pipeline::Run {
         config: &config,
         setter: &pipeline::PlatformSet(backend),
         sources: &sources,
-        transport: &pipeline::Paths,
+        transport: &transport,
         cache: &cache,
         window: &window,
         platform,
@@ -205,5 +229,42 @@ fn backend(config: &Config) -> Result<Backend, pipeline::Failure> {
             )
         }),
         Err(_) => Ok(config.backend),
+    }
+}
+
+/// 7.3 step 2: take `state/locks/rotate.lock` non-blocking, or refuse this run.
+///
+/// The directory is the one `WHIRL_STATE_DIR` names, which 1.6 has the daemon set
+/// to the directory **it** resolved: the lock has to be the file the daemon's
+/// sweep takes, and that is the daemon's answer and not anything in the config
+/// document (4.3). `pipeline::state_directory` is the same resolution the recent
+/// window of 4.1 already uses.
+///
+/// Contention is `busy` and not an error of the worker's (7.3 step 2: "its worker
+/// fails the non-blocking lock and exits `busy`, which is a fact the user can
+/// see"). A lock that cannot be taken or created at all is `internal`, with the
+/// reason in the message: 2.7 has no code for "the state directory is not
+/// there", and a code the spec does not define would be a worse answer than the
+/// sentence that says what happened.
+fn rotation_lock() -> Result<lock::RotateLock, pipeline::Failure> {
+    let state_dir = pipeline::state_directory().ok_or_else(|| {
+        pipeline::Failure::new(
+            "lock",
+            ErrorCode::Internal,
+            "no state directory: neither WHIRL_STATE_DIR nor a platform default \
+             resolved, so the rotation lock of 7.2 cannot be taken",
+        )
+    })?;
+    match lock::take(&state_dir) {
+        Ok(Some(guard)) => Ok(guard),
+        Ok(None) => Err(pipeline::Failure::new(
+            "lock",
+            ErrorCode::Busy,
+            format!(
+                "another rotation or a sweep holds {}",
+                state_dir.join(lock::ROTATE_FILE).display()
+            ),
+        )),
+        Err(message) => Err(pipeline::Failure::new("lock", ErrorCode::Internal, message)),
     }
 }

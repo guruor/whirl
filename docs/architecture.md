@@ -364,9 +364,16 @@ a worked transcript of a real session; section 2.12 lists where this deliberatel
 the prototype's socket is `srw-------` (`0600`) as intended, and a unix socket bound with no
 `chmod` at this machine's umask `0022` is `srwxr-xr-x` (`0755`). Group and other *may connect*
 in the interval between `bind()` and `set_permissions()`. `decision:` whirl sets the process umask
-to `0o077` around the `bind` call and then `fchmod`s the socket to `0600`, so there is no interval
-in which a connection is possible without the user's identity. The Windows pipe gets its DACL in
-the `CreateNamedPipe` call itself, so the equivalent interval does not exist there.
+to `0o177` around the `bind` call, so `0777 & ~0o177` is `0o600` and the socket is *created* at the
+mode of Pr4, and then `fchmod`s it to `0600` as the enforcement that does not rest on the umask.
+That is stronger than the `0o077` it replaced: `0o077` (`0777 & ~0o077` is `0700`) closes the
+connection window too, but the file exists as `0700` until the `fchmod` lands, and a client that
+connects in that interval -- a bound socket accepts as soon as `bind` returns -- reads it as `0700`.
+Measured: with the old mask and a 3 s stall inserted between the two calls, an observer of the path
+sees `0700` and then `0600`, and `whirld::control_socket`'s `the_socket_is_0600_in_a_0700_directory`
+fails with `448` against `384`; with `0o177` and the same stall it sees `0600` only (t_6c776148).
+The Windows pipe gets its DACL in the `CreateNamedPipe` call itself, so the equivalent interval does
+not exist there.
 
 **Path length.** `sun_path` is 104 bytes on this machine `[L 1]`, and the macOS default socket
 path is already 69 of them `[L 7]`, so a longer user name or home directory can exceed the limit.
@@ -564,10 +571,19 @@ reviewer can check:
 | `whirl config path`, `whirl config check` | `config path`, `config check` |
 | `whirl idle` | `subscribe`, then `close` after the first `event:` line |
 | `whirl version` | optionally `hello`, then `version` |
+| `whirl ping` | `ping` |
 
-Verbs with no CLI verb, and why they exist: `ping` and `hello` are liveness and negotiation for any
-client; `close` is a clean shutdown of one connection; `subscribe` is the frontend surface. No
-protocol verb exists only for the CLI, and no CLI verb needs a protocol verb of its own.
+`whirl ping` is the liveness probe and nothing else: `ping` is one round trip that does no work and
+has no success data lines (2.5), so the CLI prints nothing and its exit code is the whole answer, 0
+when the daemon replied and 2 when the socket is unreachable. It adds no protocol surface, because
+`ping` is a verb for any client (below); it is the CLI's own way to ask the question a user asks,
+"is the daemon there", without `nc` and without reading a socket by hand.
+
+Verbs with no CLI verb, and why they exist: `hello` is negotiation for any client, and the CLI never
+sends it (`whirl version` maps to `version` alone, above); `close` is a clean shutdown of one
+connection, and `whirl idle` issues it itself; `subscribe` is the frontend surface, reached through
+`whirl idle`. No protocol verb exists only for the CLI, and no CLI verb needs a protocol verb of its
+own.
 
 `decision:` `whirl idle` is `subscribe` plus one event, not a server-side one-shot verb.
 `[D 5 §1.1]`'s verb table wants "Block until state changes. For frontends, so none of them polls."
@@ -793,7 +809,7 @@ are checked against them, and the third column below says where each name comes 
 | `display_mode_effective` | `all` | `features 1.3` | what the platform actually gets; features.md 1.3 names this key for the `per-display` fallback |
 | `display_mode_reason` | `-` | here | why, when they differ: `unverified_platform`, `impossible_on_this_desktop`, `out_of_scope_on_this_desktop`, `no_displays` 3.7 |
 | `anchor_digest` | `d435840ce84fbb8d...` | `[D 6 §9]` | what whirl believes is on screen; `-` before the first verified rotation 1.7.3 |
-| `anchor_path` | `sha256/d4/35/d43584...` | `[D 6 §9]` | the path the platform was given, `-` for a reference-mode set |
+| `anchor_path` | `/Users/govind.rajpurohit/Library/Caches/whirl/sha256/d4/35/d43584...jpg` | `[D 6 §9]` | the path the platform was given, as the daemon records it: the cache file for an image whirl stored, or the path a `set path` named 2.6; `-` for a `reference`-mode set, which stores nothing and so leaves the file the user's own 6.1, and `-` before the first verified rotation 1.7.3 |
 | `anchor_verified` | `1` | here | 1 once a rotation's readback agreed with the set; 0 while unverified 1.7.3 |
 | `cache_dir` | `/Users/govind.rajpurohit/Library/Caches/whirl` | `[D 6 §9]` | which cache this daemon owns 3.1 |
 | `cache_root_id` | `9d1f0c2e-5b6a-4d7e-8f11-0c2b4a6d9e01` | `[D 6 §9]` | the cache root's identity file, so `status` can tell two daemons apart 3.1 |
@@ -1665,7 +1681,7 @@ What that boundary does and does not buy:
 
 | Measure | Why | Basis |
 |---|---|---|
-| umask `0077` around `bind`, then `fchmod 0600` | measured: a socket bound without a `chmod` is `0755` at this machine's umask, so it is connectable by others between `bind` and `chmod` | `[L 3]` |
+| umask `0177` around `bind`, so the socket is created `0600` in one step, then `fchmod 0600` | measured: a socket bound without a `chmod` is `0755` at this machine's umask, so it is connectable by others between `bind` and `chmod`; `0o177` leaves no interval in which the file is anything but `0600` either | `[L 3]`, t_6c776148 |
 | state, cache and log directories `0700`, files `0600` | state files carry the user's wallpaper paths and rotation history | `[D 6 §1]` |
 | peer UID checked on each accepted connection (`getpeereid` on macOS, `SO_PEERCRED` on Linux; the pipe DACL on Windows) and refused otherwise | defence in depth: the mode check depends on the filesystem behaving, and the peer check does not | `decision:`, mechanism `[L 1]` shows the socket is a filesystem object |
 | stale socket unlinked only after a failed connect probe | unlinking a live daemon's socket leaves it running and unreachable, then lets a second daemon take the path | `[M 15]` |
@@ -1729,7 +1745,7 @@ Every row is a complete answer: what the daemon does, and what the user sees. Th
 | 7 | **The worker hangs** | 300 s deadline, `SIGTERM`, 5 s, `SIGKILL` (1.7.1); `rotate.lock` is released by the kernel on exit, or removed by the daemon where the `excl_file` fallback is in force `[D 6 §7.2]` `[D 6 §8.8]`; the slot is consumed | `ERR timeout`, exit 1, `last_error: worker_timeout`, and the daemon is still answering `status` while all of this happens |
 | 8 | **The worker is killed mid-rotation** (OOM, user, supervisor) | Part file or unreported cache file is reclaimed by the sweep after its grace window `[D 6 §5.5]`; the anchor is reconciled by 1.7.3 if the setter had already succeeded | `ERR worker_failed` (or `ERR timeout` if the deadline was the cause), exit 1; nothing on screen changes unless the setter had already run, in which case the wallpaper did change and `status` reports `last_via: recovered` |
 | 9 | **The state directory is not writable** | The daemon refuses to start, with the directory and the `errno` in the message `[D 6 §8.5]` | `launchctl`/`systemctl`/Task Scheduler log or the whirl log carries `state dir not writable: <path> (EACCES)`; every `whirl` verb exits 2 because there is no daemon |
-| 10 | **The cache directory is read-only** | The daemon starts, `cache_readonly: 1`; local sources in reference mode can still rotate to a file already present, and nothing new is admitted `[D 6 §8.4]` | `whirl next` gives `ERR cache_readonly <path>` if nothing usable is cached; `status` shows `cache_readonly: 1` and a reason |
+| 10 | **The cache directory is read-only** | The daemon starts. Detection is 8.4's `tmp/<run>-probe.part`, written inside `tmp/` and nowhere else, so a cache root that refuses writes while `tmp/` accepts them is reported as `cache_writable: 1`, with `sweep failed: cannot create <cache>/index.json.tmp-<pid>-<rand>: Permission denied` logged once for the sweep (`6.3`'s temp name, not 8.4's probe) and index writes left best-effort; `cache_root_id` is the id an `index.json` already carries, or `-` where the daemon could not mint the first one. A rotation that needs no write is unaffected, and for a local source that is `reference` mode, which sets the user's own file and stores nothing (`features 2.2`) `[D 6 §8.4]` | `whirl next` gives `ERR cache_readonly <message>`, exit 1, and `last_error: cache_readonly` until a rotation that needs no write succeeds. `status` reports the condition through `cache_writable`; there is no `cache_readonly` status key, because `cache_readonly` is 2.10's error code for a rotation that had to write and could not |
 | 11 | **`favorites.json` is corrupt** | It is quarantined, the cache protects the recovery window's files, and pin-changing verbs are refused while reads keep working `[D 6 §6.4]` | `ERR favorites_degraded <quarantine path>` from `whirl favorite`, `status` shows `favorites_degraded: 1` and the quarantine path |
 | 12 | **Two clients ask for a rotation at once** | The first takes the slot; the second gets `ERR busy` immediately (1.8). Nothing is queued | `whirl next` prints `whirl: busy: a rotation is already in flight` and exits 1; the first client's rotation completes normally |
 | 13 | **The config is invalid** | At startup, a refusal to start naming the key `[D 6 §8.7]`. On re-read, the previous config stays in force, the failure is logged, and the daemon keeps rotating | `status` shows the old values; the log has `<key>: <value> is out of range`; `whirl config check` prints the same and exits 1 |

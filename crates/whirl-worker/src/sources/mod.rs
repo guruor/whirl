@@ -1,16 +1,19 @@
 //! The source factory: docs/spec/features.md 2.6's "one dispatch table", and the
 //! only place that knows which `kind`s this build can actually serve.
 //!
-//! **Empty on purpose.** `local` and `wallhaven` are each their own card, and
-//! neither has landed. Until one does, [`build`] answers `None` for every kind,
-//! [`Sources::from_config`] returns a table with no entries, and a rotation fails
-//! with `no_candidates` and the reason [`missing_reason`] names. That is the
-//! honest state of the build: the alternative, a test-only source compiled into
-//! this binary, would ship a `kind` the configuration schema does not describe.
+//! **Both kinds of the schema are behind an arm below.** `local` is [`local`] and
+//! `wallhaven` is [`wallhaven`], which is features.md 2.3 plus the key rule of
+//! 2.4. There is no kind left for [`missing_reason`] to describe, which is why
+//! that function is now unreachable from [`build`]: it is kept because
+//! `config check` still has to answer for a config written against a later
+//! schema's kind rather than crash on it.
 //!
 //! This module does not stand in for the sources. What it does is keep the
 //! pipeline's dependency one trait wide, so a source card adds an arm to
 //! [`build`] and a test in `pipeline.rs` supplies its own.
+
+mod local;
+mod wallhaven;
 
 use whirl_core::config::{Config, SourceConfig, SourceKind};
 use whirl_core::source::Source;
@@ -73,17 +76,22 @@ impl Sources {
     }
 }
 
-/// The dispatch table of features.md 2.6: one arm per kind, no logic. Both arms
-/// answer `None` until their card lands.
+/// The dispatch table of features.md 2.6: one arm per kind, no logic. Each arm is
+/// the whole line a source contributes, and a kind with no implementation answers
+/// `None` until its card lands.
 fn build(source: &SourceConfig) -> Option<Box<dyn Source>> {
     match source.kind {
-        SourceKind::Local => None,
-        SourceKind::Wallhaven => None,
+        SourceKind::Local => Some(local::source(source)),
+        SourceKind::Wallhaven => Some(wallhaven::source(source)),
     }
 }
 
 /// Why a source could not be asked, for `enabled=0 reason=<...>`
-/// (docs/architecture.md 4.3).
+/// (docs/architecture.md 4.3). Every kind of the schema has an arm in [`build`]
+/// now, so this is unreachable from a parsed config: it is kept for the match
+/// that must answer for a config written against a later schema's kind, and a
+/// kind that has landed answers with its own `enabled=0 reason=...` from
+/// [`Source::validate`] instead.
 pub fn missing_reason(source: &SourceConfig) -> String {
     format!(
         "no implementation for kind {} in this build",
