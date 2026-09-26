@@ -34,11 +34,30 @@ use whirl_core::protocol::{self, ErrorCode, SourceRecord};
 use whirl_core::source::{Candidate, EnumContext};
 use whirl_core::state::{self, IndexFile, StateFile};
 
-/// The largest header this build sniffs. A HEIC `ispe` box can sit behind a
-/// `meta` box, so the window is wider than the 8 to 30 bytes the other three
-/// formats need; section 3 step 5 asks for "the first bytes", and this is how
-/// many of them are kept.
+/// The largest header this build sniffs for the formats whose dimensions are in
+/// the first bytes: PNG's `IHDR`, a JPEG's frame header, WebP's `VP8`/`VP8L`/
+/// `VP8X` chunk. Section 3 step 5 asks for "the first bytes", and this is how
+/// many of them are kept. A HEIC is not one of these: see [`HEIC_WINDOW`].
 const HEAD_WINDOW: usize = 1024;
+
+/// The window a stream's or a file's head is widened to when the bytes
+/// themselves say HEIC and the small window did not measure them.
+///
+/// A HEIC's dimensions live in an `ispe` box inside `iprp`/`ipco`, behind the
+/// `meta` box's `hdlr`, `dinf`, `pitm`, `iinf` and `iref`, so they are nothing
+/// like "the first bytes" - and the first `ispe` in the file is the *thumbnail*
+/// item's, which is why the walk below follows `pitm` and `ipma` to the primary
+/// item rather than taking the first or the largest box it finds. Measured
+/// against the thirteen `.heic` files Apple ships in
+/// `/System/Library/Desktop Pictures` on macOS 26.5: the first `ispe` in `ipco`,
+/// the thumbnail's, starts at 1245, 1680, 1781, 2686 and 3421, and the primary
+/// item's starts 20 bytes later in each file; every `meta` box ends by 5220, and
+/// one `.heic` that `sips` wrote puts an `ispe` at 1063. All of them are past
+/// 1024. 64 KiB is the worst of those with an order of magnitude to spare and is
+/// the size of the read buffer in [`store`] and in `Run::reference`, so a HEIC
+/// costs one wider first read and no second pass. A HEIC whose `ispe` is deeper
+/// than this is still not one whirl will promise to display (features.md 2.2).
+const HEIC_WINDOW: usize = 64 * 1024;
 
 /// A failed stage: what the daemon turns into the `ERR` code of 2.7.
 #[derive(Debug, Clone)]
@@ -641,6 +660,27 @@ pub fn sniff(bytes: &[u8]) -> Option<Header> {
         .or_else(|| sniff_heic(bytes))
 }
 
+/// How many bytes the head of a file or a stream is worth keeping, given what
+/// has arrived so far: [`HEAD_WINDOW`], or [`HEIC_WINDOW`] once the small window
+/// is full, the bytes say HEIC, and the sniff still has not measured them.
+///
+/// The questions are asked in that order because each one is cheaper to answer
+/// than the read it would cause. A file shorter than the small window is not
+/// widened: there is nothing more to read. A JPEG, a PNG or a WebP answers
+/// inside the small window, and so does a HEIC whose `ispe` happens to be in
+/// there. What is left is the case this exists for: a HEIC whose dimensions sit
+/// behind `meta`, which is every HEIC measured on this machine, at 1063 to 3421
+/// bytes in. Both callers of [`sniff`] ask this and not a constant of their own,
+/// so a file the local source admits is a file the pipeline can measure, and a
+/// file the local source drops is a file the pipeline would drop.
+pub fn head_window(head: &[u8]) -> usize {
+    if head.len() >= HEAD_WINDOW && sniff(head).is_none() && is_heic(head) {
+        HEIC_WINDOW
+    } else {
+        HEAD_WINDOW
+    }
+}
+
 fn sniff_png(bytes: &[u8]) -> Option<Header> {
     const MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     if bytes.len() < 24 || bytes[..8] != MAGIC {
@@ -736,32 +776,256 @@ fn sniff_webp(bytes: &[u8]) -> Option<Header> {
     }
 }
 
-fn sniff_heic(bytes: &[u8]) -> Option<Header> {
+/// Whether these bytes are a HEIC/HEIF file at all: the `ftyp` box of
+/// ISO/IEC 14496-12 4.3 with one of the brands the HEIF family uses
+/// (ISO/IEC 23008-12 Annex B).
+///
+/// It is the brand test alone, and it is a function of its own because
+/// [`head_window`] has to ask it *before* the dimensions are found: a stream
+/// widens its window on the strength of the brand, not on an answer.
+pub fn is_heic(bytes: &[u8]) -> bool {
     if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
-        return None;
+        return false;
     }
     let brand: [u8; 4] = [bytes[8], bytes[9], bytes[10], bytes[11]];
-    let heic: [[u8; 4]; 6] = [*b"heic", *b"heix", *b"hevc", *b"hevx", *b"mif1", *b"msf1"];
-    if !heic.contains(&brand) {
+    [*b"heic", *b"heix", *b"hevc", *b"hevx", *b"mif1", *b"msf1"].contains(&brand)
+}
+
+/// The dimensions of a HEIC, from the `ispe` property of its *primary* image
+/// item.
+///
+/// The boxes read here, all of them headers only, so no byte of image data is
+/// ever read as a box:
+///
+/// ```text
+/// ftyp
+/// meta                the item tables and the properties
+///   pitm              the id of the primary item
+///   iprp
+///     ipco            the properties, in order, 1-indexed
+///       ... ispe ...  a size: width and height
+///     ipma            which item carries which property
+/// mdat                the coded image, never entered
+/// ```
+///
+/// **The first `ispe` in the file is the thumbnail's, not the image's.** In all
+/// thirteen of Apple's own `.heic` desktop pictures the first `ispe` in `ipco`
+/// is a 1024x1024 thumbnail item and a later one is the 6016x6016 primary item,
+/// and `pitm` names the primary item while `ipma` points it at a property. This
+/// follows that pair. Answering from the first `ispe` byte-for-byte would be
+/// worse than not answering: 1024x1024 is under the 1600x900 floor of 2.5 step
+/// 1, so every one of those files would be dropped by the *filter* instead, as
+/// `rejected_resolution=1` - a different bug with the same symptom, and one that
+/// reads as an honest measurement.
+///
+/// A file whose `pitm` or `ipma` cannot be read falls back to the largest
+/// `ispe`, which agrees with the primary item on every file measured here and is
+/// the only defensible reading of a file that does not say which item is the
+/// primary one. A file with no `ispe` anywhere is not a file whirl will promise
+/// to display (features.md 2.2), so it is `None` rather than a header of zeroes:
+/// zeroes would reach the resolution stage as a measured 0x0 and be reported as
+/// under the floor, which is a measurement this build did not make.
+fn sniff_heic(bytes: &[u8]) -> Option<Header> {
+    if !is_heic(bytes) {
         return None;
     }
-    // `ispe` carries the dimensions: 4-byte size, `ispe`, the 4 version-and-flags
-    // bytes every FullBox has, then width and height as 32-bit big-endian. A
-    // scan is what the header window allows; the boxes walk by their own sizes
-    // and a file that hides `ispe` deeper than the window is not one whirl will
-    // promise to display.
-    let mut at = 0;
-    while at + 20 <= bytes.len() {
-        if &bytes[at + 4..at + 8] == b"ispe" {
-            return Some(Header {
-                ext: "heic",
-                width: be32(&bytes[at + 12..at + 16]).unwrap_or(0),
-                height: be32(&bytes[at + 16..at + 20]).unwrap_or(0),
-            });
+    let meta = boxes(bytes, 0, bytes.len())
+        .into_iter()
+        .find(|found| found.kind == *b"meta")?;
+    // `meta` is a FullBox (ISO/IEC 14496-12 8.11.1): four bytes of version and
+    // flags, then its children.
+    let inside = boxes(bytes, meta.payload + 4, meta.end);
+    let iprp = inside.iter().find(|found| found.kind == *b"iprp")?;
+    let item = inside
+        .iter()
+        .find(|found| found.kind == *b"pitm")
+        .and_then(|pitm| primary_item(bytes, pitm));
+    let sections = boxes(bytes, iprp.payload, iprp.end);
+    let owned = sections
+        .iter()
+        .find(|found| found.kind == *b"ipco")
+        .map(|ipco| boxes(bytes, ipco.payload, ipco.end))
+        .unwrap_or_default();
+    let associated = item
+        .and_then(|item| {
+            sections
+                .iter()
+                .find(|found| found.kind == *b"ipma")
+                .and_then(|ipma| primary_property(bytes, ipma, &owned, item))
+        })
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| owned.get(index))
+        .filter(|found| found.kind == *b"ispe")
+        .and_then(|found| ispe_size(bytes, found));
+    let (width, height) = associated.or_else(|| largest_ispe(bytes, &owned))?;
+    Some(Header {
+        ext: "heic",
+        width,
+        height,
+    })
+}
+
+/// One box in a byte range: what its `type` field says it is, where its own
+/// content starts, and where it ends. The payload is never read as anything but
+/// the children of a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoxHeader {
+    kind: [u8; 4],
+    /// The first byte after the header: this box's own content.
+    payload: usize,
+    /// One past the last byte of this box.
+    end: usize,
+}
+
+/// The boxes of `bytes[from..to]`, in order, each skipped by the size it
+/// declares: a 32-bit size, `1` meaning the real size is the 64-bit `largesize`
+/// after the type, and `0` meaning the box runs to the end of its parent
+/// (ISO/IEC 14496-12 4.2). A size smaller than the box's own header, or one that
+/// runs past the parent, ends the walk.
+///
+/// Stopping is the point. The argument here is a *window*, not a whole file, so
+/// a box that claims to be longer than what has been read is the ordinary case
+/// for a truncated read, and reading past the end of the window is the one thing
+/// this cannot do.
+fn boxes(bytes: &[u8], from: usize, to: usize) -> Vec<BoxHeader> {
+    let end = to.min(bytes.len());
+    let mut out = Vec::new();
+    let mut at = from;
+    while at + 8 <= end {
+        let (size, header) = match u64::from(be32(&bytes[at..at + 4]).unwrap_or(0)) {
+            1 => match bytes.get(at + 8..at + 16).and_then(be64) {
+                Some(large) => (large, 16usize),
+                None => break,
+            },
+            0 => ((end - at) as u64, 8usize),
+            declared => (declared, 8usize),
+        };
+        let Ok(size) = usize::try_from(size) else {
+            break;
+        };
+        // The size is the file's own field (`largesize` is a `u64` nothing
+        // bounds), and both uses below are additions to `at`, so it is bounded
+        // *before* either of them. `at + size` on a `largesize` near `u64::MAX`
+        // is an addition the input supplies the terms of: in debug it panics
+        // (`attempt to add with overflow`, the profile `cargo test` builds), and
+        // in release it wraps to a small number, which the walk below steps by -
+        // landing back at the box it just read and re-reading it forever. The
+        // loop keeps `at <= end`, so `next > end` is exactly `at + size > end`
+        // (equivalently `size > end - at`, which is the subtraction that cannot
+        // overflow) and is what "runs past the parent" in the doc comment means.
+        let Some(next) = at.checked_add(size) else {
+            break;
+        };
+        if size < header || next > end {
+            break;
         }
+        out.push(BoxHeader {
+            kind: [bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]],
+            payload: at + header,
+            end: next,
+        });
+        at = next;
+    }
+    out
+}
+
+/// `ispe`'s width and height: a FullBox, so four bytes of version and flags and
+/// then two 32-bit big-endian dimensions (ISO/IEC 14496-12 12.1.3).
+fn ispe_size(bytes: &[u8], found: &BoxHeader) -> Option<(u32, u32)> {
+    let at = found.payload + 4;
+    if at + 8 > found.end {
+        return None;
+    }
+    Some((be32(&bytes[at..at + 4])?, be32(&bytes[at + 4..at + 8])?))
+}
+
+/// The primary item's id, from `pitm`: a FullBox whose payload is a 16-bit id,
+/// or a 32-bit one when the box's version is 1 or more (ISO/IEC 14496-12
+/// 8.11.4).
+fn primary_item(bytes: &[u8], pitm: &BoxHeader) -> Option<u32> {
+    let version = *bytes.get(pitm.payload)?;
+    let at = pitm.payload + 4;
+    if version >= 1 {
+        be32(bytes.get(at..at + 4)?)
+    } else {
+        Some(u32::from(*bytes.get(at)?) << 8 | u32::from(*bytes.get(at + 1)?))
+    }
+}
+
+/// The index in `ipco` that `ipma` associates with `item`, the first association
+/// whose property is an `ispe`.
+///
+/// `ipma`'s payload is a 32-bit entry count and then one entry per item: the
+/// item's id, the number of properties associated with it, and one property
+/// index per association (ISO/IEC 14496-12 8.11.3.3). Two things vary and both
+/// are read rather than assumed from the files measured here: the id is 16 bits
+/// until the box's version reaches 1 and 32 bits after, and each property index
+/// is one byte with a 7-bit index plus an `essential` bit on top, or two bytes
+/// with a 15-bit index, when the low bit of the box's flags is set.
+fn primary_property(
+    bytes: &[u8],
+    ipma: &BoxHeader,
+    properties: &[BoxHeader],
+    item: u32,
+) -> Option<usize> {
+    let version = *bytes.get(ipma.payload)?;
+    let flags = *bytes.get(ipma.payload + 3)?;
+    let wide = flags & 1 != 0;
+    let stride = if wide { 2 } else { 1 };
+    let mask = if wide { 0x7fff } else { 0x7f };
+    let mut at = ipma.payload + 4;
+    let entries = be32(bytes.get(at..at + 4)?)? as usize;
+    at += 4;
+    for _ in 0..entries {
+        let listed = if version >= 1 {
+            be32(bytes.get(at..at + 4)?)?
+        } else {
+            u32::from(*bytes.get(at)?) << 8 | u32::from(*bytes.get(at + 1)?)
+        };
+        at += if version >= 1 { 4 } else { 2 };
+        let associations = *bytes.get(at)? as usize;
         at += 1;
+        if listed != item {
+            at += associations * stride;
+            continue;
+        }
+        for index in 0..associations {
+            let start = at + index * stride;
+            let raw = if wide {
+                u32::from(*bytes.get(start)?) << 8 | u32::from(*bytes.get(start + 1)?)
+            } else {
+                u32::from(*bytes.get(start)?)
+            };
+            let property = (raw & mask) as usize;
+            let named = property
+                .checked_sub(1)
+                .and_then(|index| properties.get(index))
+                .is_some_and(|found| found.kind == *b"ispe");
+            if named {
+                return Some(property);
+            }
+        }
+        return None;
     }
     None
+}
+
+/// The largest `ispe` in `ipco`, which is what a file whose `pitm`/`ipma` pair
+/// could not be read is measured by.
+fn largest_ispe(bytes: &[u8], properties: &[BoxHeader]) -> Option<(u32, u32)> {
+    properties
+        .iter()
+        .filter(|found| found.kind == *b"ispe")
+        .filter_map(|found| ispe_size(bytes, found))
+        .max_by_key(|(width, height)| u64::from(*width) * u64::from(*height))
+}
+
+fn be64(bytes: &[u8]) -> Option<u64> {
+    let mut out = [0u8; 8];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = *bytes.get(index)?;
+    }
+    Some(u64::from_be_bytes(out))
 }
 
 fn be32(bytes: &[u8]) -> Option<u32> {
@@ -908,6 +1172,7 @@ pub fn store(
     let mut part = Part::create(cache, run)?;
     let mut hasher = protocol::Sha256::new();
     let mut head: Vec<u8> = Vec::with_capacity(HEAD_WINDOW);
+    let mut window = HEAD_WINDOW;
     let mut bytes = 0u64;
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -935,9 +1200,22 @@ pub fn store(
             ));
         }
         hasher.update(&buffer[..read]);
-        if head.len() < HEAD_WINDOW {
-            let take = (HEAD_WINDOW - head.len()).min(read);
-            head.extend_from_slice(&buffer[..take]);
+        // Section 3 step 5's head. It starts at the small window and widens, at
+        // most once, for a HEIC the small one cannot measure (`head_window`).
+        // That is why this takes as much of the chunk as the *current* window
+        // has room for instead of a fixed count: the file that needs the wide
+        // window can arrive whole in this one read, and capping the first take
+        // at 1024 bytes would lose the rest of it.
+        let mut taken = 0;
+        while taken < read {
+            let room = window.saturating_sub(head.len());
+            if room == 0 {
+                break;
+            }
+            let take = room.min(read - taken);
+            head.extend_from_slice(&buffer[taken..taken + take]);
+            taken += take;
+            window = head_window(&head);
         }
         if let Err(error) = part.write(&buffer[..read]) {
             part.discard();
@@ -2016,20 +2294,95 @@ mod tests {
         webp_header(b"VP8X", &body)
     }
 
-    /// A HEIC: the file type box, then the `ispe` box that carries the size.
-    fn heic(width: u32, height: u32) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&24u32.to_be_bytes());
-        bytes.extend_from_slice(b"ftyp");
-        bytes.extend_from_slice(b"heic");
-        bytes.extend_from_slice(&[0, 0, 0, 0]);
-        bytes.extend_from_slice(b"mif1");
-        bytes.extend_from_slice(&20u32.to_be_bytes());
-        bytes.extend_from_slice(b"ispe");
-        bytes.extend_from_slice(&[0, 0, 0, 0]);
-        bytes.extend_from_slice(&width.to_be_bytes());
-        bytes.extend_from_slice(&height.to_be_bytes());
+    /// A box: a 32-bit size, a type, and the payload.
+    fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(payload);
         bytes
+    }
+
+    /// A box that declares its real size in the 64-bit `largesize` field: a
+    /// 32-bit size of `1`, the type, then the size the file chooses (ISO/IEC
+    /// 14496-12 4.2). The payload is whatever the caller passes; the declared
+    /// size is the caller's number, not the payload's length, which is the point
+    /// of the tests that use it.
+    fn boxed_large(kind: &[u8; 4], largesize: u64, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = 1u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&largesize.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// The file type box every HEIC starts with: a major brand and a compatible
+    /// one, which is all `is_heic` reads.
+    fn ftyp() -> Vec<u8> {
+        let mut payload = b"heic".to_vec();
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        payload.extend_from_slice(b"mif1");
+        boxed(b"ftyp", &payload)
+    }
+
+    /// An `ispe` property: version and flags, then width and height.
+    fn ispe(width: u32, height: u32) -> Vec<u8> {
+        let mut payload = vec![0u8; 4];
+        payload.extend_from_slice(&width.to_be_bytes());
+        payload.extend_from_slice(&height.to_be_bytes());
+        boxed(b"ispe", &payload)
+    }
+
+    /// `pitm`, version 0: the primary item's id.
+    fn pitm(item: u16) -> Vec<u8> {
+        let mut payload = vec![0u8; 4];
+        payload.extend_from_slice(&item.to_be_bytes());
+        boxed(b"pitm", &payload)
+    }
+
+    /// `ipma`, version 0 with one-byte property indices: one associated property
+    /// per item, as `(item id, property index)`, the index 1-based against
+    /// `ipco`'s children.
+    fn ipma(entries: &[(u16, u8)]) -> Vec<u8> {
+        let mut payload = vec![0u8; 4];
+        payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (item, property) in entries {
+            payload.extend_from_slice(&item.to_be_bytes());
+            payload.push(1);
+            payload.push(*property);
+        }
+        boxed(b"ipma", &payload)
+    }
+
+    /// A HEIC in the shape Apple's own files have: `ftyp`, then `meta` with
+    /// `pitm` (the primary item is 2), an `iprp` whose `ipco` holds one `ispe`
+    /// per item and whose `ipma` gives item 1 the first and item 2 the second,
+    /// then `mdat` with a well-formed `ispe` box *inside its payload* - image
+    /// data that reads like a box header, which a byte scan of the window could
+    /// have answered with. `filler` is a box of padding between `pitm` and
+    /// `iprp`, which is how a test pushes the properties past the small window.
+    fn heic_of(thumbnail: (u32, u32), primary: (u32, u32), filler: usize) -> Vec<u8> {
+        let ipco = boxed(
+            b"ipco",
+            &[ispe(thumbnail.0, thumbnail.1), ispe(primary.0, primary.1)].concat(),
+        );
+        let iprp = boxed(b"iprp", &[ipco, ipma(&[(1, 1), (2, 2)])].concat());
+        let meta = boxed(
+            b"meta",
+            &[
+                vec![0, 0, 0, 0], // the FullBox version and flags
+                pitm(2),
+                boxed(b"free", &vec![0u8; filler]),
+                iprp,
+            ]
+            .concat(),
+        );
+        [ftyp(), meta, boxed(b"mdat", &ispe(2048, 1536))].concat()
+    }
+
+    /// The two-item shape: a 1024x1024 thumbnail item and the primary one, which
+    /// is what every `.heic` measured on this machine carries.
+    fn heic(width: u32, height: u32) -> Vec<u8> {
+        heic_of((1024, 1024), (width, height), 0)
     }
 
     fn filler(bytes: &mut Vec<u8>, extra: usize) {
@@ -2362,6 +2715,195 @@ mod tests {
         assert_eq!(sniff(b"<html>not a picture</html>"), None);
         assert_eq!(sniff(&[]), None);
         assert_eq!(sniff(&png(1600, 900)[..12]), None, "half a header");
+    }
+
+    /// The HEIC half of the sniff, in the shape this machine's files have: the
+    /// first `ispe` in `ipco` is a 1024x1024 thumbnail item and the primary
+    /// item's is later. Answering with the first one is not a near miss: 1024x1024
+    /// is under the 1600x900 floor of 2.5 step 1, so the file would be dropped by
+    /// the *filter* as `rejected_resolution=1`, which `whirl config check` reports
+    /// as an honest measurement of a file that is not small at all.
+    #[test]
+    fn the_heic_sniff_answers_with_the_primary_items_ispe_and_not_the_first_one() {
+        assert_eq!(
+            sniff(&heic_of((1024, 1024), (6016, 6016), 0)),
+            Some(Header {
+                ext: "heic",
+                width: 6016,
+                height: 6016
+            }),
+            "the thumbnail is the first ispe in the file and the second is the image"
+        );
+        assert_eq!(
+            sniff(&heic_of((8000, 8000), (4032, 3024), 0)),
+            Some(Header {
+                ext: "heic",
+                width: 4032,
+                height: 3024
+            }),
+            "and the primary item wins even when the thumbnail is larger: `pitm` \
+             and `ipma` are what settle it, not the size of the box"
+        );
+    }
+
+    /// `mdat` is the coded image, and image data is arbitrary bytes: this one
+    /// holds a well-formed `ispe` box, at an offset a scan of the window would
+    /// have read. The walk never enters it, so the fake is not an answer, and a
+    /// file with `ftyp heic` and no `meta` is not a picture.
+    #[test]
+    fn a_heic_without_a_meta_box_is_not_measured_by_its_image_data() {
+        let mut bytes = ftyp();
+        bytes.extend_from_slice(&boxed(b"mdat", &ispe(2048, 1536)));
+        assert!(is_heic(&bytes), "the brand is a HEIC brand");
+        assert_eq!(
+            sniff(&bytes),
+            None,
+            "a scan of the window would answer 2048x1536 from the coded image"
+        );
+    }
+
+    /// A file whose `pitm`/`ipma` pair is missing is measured by its largest
+    /// `ispe` rather than dropped: the pair is what makes the answer exact, not
+    /// what makes it possible. Nothing measured here needs the arm, and a file
+    /// that does not name a primary item still has dimensions in it.
+    #[test]
+    fn a_heic_without_pitm_is_measured_by_its_largest_ispe() {
+        let ipco = boxed(b"ipco", &[ispe(800, 600), ispe(1600, 900)].concat());
+        let iprp = boxed(b"iprp", &[ipco, ipma(&[(1, 1), (2, 2)])].concat());
+        let meta = boxed(b"meta", &[vec![0, 0, 0, 0], iprp].concat());
+        assert_eq!(
+            sniff(&[ftyp(), meta].concat()),
+            Some(Header {
+                ext: "heic",
+                width: 1600,
+                height: 900
+            })
+        );
+    }
+
+    /// The window rule of section 3 step 5, on the file that made this necessary:
+    /// a HEIC whose dimensions are past the 1024-byte window asks for the wide
+    /// one, and the wide one measures it.
+    #[test]
+    fn a_heic_past_the_small_window_asks_for_the_wide_one() {
+        // 4096 bytes between `pitm` and `iprp` puts the first `ispe` around 4 KiB
+        // in, which is the shape of `Mac Blue.heic` (1245), `Sonoma.heic` (2686)
+        // and one `sips` wrote (1063), with room to spare.
+        let bytes = heic_of((1024, 1024), (6016, 6016), 4096);
+        let small = &bytes[..HEAD_WINDOW];
+        assert_eq!(
+            sniff(small),
+            None,
+            "the small window cannot see the ispe, and that is where this started"
+        );
+        assert!(is_heic(small), "but the bytes say what they are");
+        assert_eq!(
+            head_window(small),
+            HEIC_WINDOW,
+            "so a head is worth reading further, and this is by how much"
+        );
+        assert_eq!(
+            sniff(&bytes),
+            Some(Header {
+                ext: "heic",
+                width: 6016,
+                height: 6016
+            }),
+            "and the wide window measures it"
+        );
+    }
+
+    /// The widening is for that one case and no other: everything that answers
+    /// inside the small window keeps the 1 KiB read, which is every JPEG, PNG and
+    /// WebP in a library and every HEIC whose `ispe` happens to sit early.
+    #[test]
+    fn the_window_widens_only_for_a_heic_the_small_one_cannot_measure() {
+        assert_eq!(head_window(&png(1600, 900)), HEAD_WINDOW);
+        assert_eq!(head_window(&jpeg(1920, 1080)), HEAD_WINDOW);
+        assert_eq!(head_window(&webp_lossless(800, 600)), HEAD_WINDOW);
+        assert_eq!(
+            head_window(b"<html>not a picture</html>"),
+            HEAD_WINDOW,
+            "and a file that is not a picture is not a HEIC either"
+        );
+        assert_eq!(
+            head_window(&heic_of((1024, 1024), (6016, 6016), 4096)[..200]),
+            HEAD_WINDOW,
+            "a file shorter than the small window has nothing further to read, \
+             and the sniff on it is `None` for that reason: there is no ispe to \
+             find and no more file to ask"
+        );
+        // A HEIC *longer* than the small window whose dimensions are inside it:
+        // the zeroed padding here is a second `free` box after `mdat`, so the
+        // first 1024 bytes hold the whole `meta` box.
+        let mut long = heic(4032, 3024);
+        long.extend_from_slice(&boxed(b"free", &vec![0u8; 4096]));
+        assert!(
+            long.len() > HEAD_WINDOW,
+            "the window rule needs a long file"
+        );
+        assert_eq!(
+            head_window(&long),
+            HEAD_WINDOW,
+            "the small window measured it, so there is nothing to widen for"
+        );
+    }
+
+    /// A box's size is the file's own number, and the walk adds it to where it
+    /// is, so it is bounded before it is used. This pins the two sizes that
+    /// broke that: `u64::MAX`, which panicked the debug build at the bound
+    /// (`attempt to add with overflow`) and in release wrapped to a small number;
+    /// and `2**64 - 20`, which wraps to exactly `0` - the walk steps back to the
+    /// box it just read and re-reads it forever, in the shipped profile.
+    ///
+    /// A reader that stops is the rule (features.md 2.2: a header that cannot be
+    /// read never becomes a candidate); a reader that dies or spins is not a
+    /// rule at all.
+    #[test]
+    fn a_box_size_that_would_overflow_the_walk_stops_it_instead() {
+        // The 64-byte shape of the card's repro: `ftyp` (20 bytes), then a box
+        // whose 32-bit size is `1` and whose `largesize` is the whole of the
+        // arithmetic. 20 + 0xffff_ffff_ffff_ffec is 0 modulo 2**64.
+        for largesize in [u64::MAX, 0xffff_ffff_ffff_ffec] {
+            let bytes = [ftyp(), boxed_large(b"junk", largesize, &[0u8; 8])].concat();
+            let found = boxes(&bytes, 0, bytes.len());
+            assert_eq!(
+                found.len(),
+                1,
+                "the walk reads the ftyp box and stops at the one it cannot bound \
+                 (largesize {largesize:#018x})"
+            );
+            assert_eq!(found[0].kind, *b"ftyp");
+            assert_eq!(found[0].end, 20);
+            assert_eq!(
+                sniff(&bytes),
+                None,
+                "and a file whose header cannot be read is not measured, rather \
+                 than measured as 0x0"
+            );
+        }
+    }
+
+    /// The bound is on the arithmetic and not on the field: a `largesize` that
+    /// fits is still read and still skipped by, so a file that uses the 64-bit
+    /// form for an ordinary reason is read exactly as before.
+    #[test]
+    fn a_box_size_that_fits_is_still_read_from_largesize() {
+        let bytes = [
+            ftyp(),
+            boxed_large(b"free", 32, &[0u8; 16]),
+            boxed(b"mdat", &[]),
+        ]
+        .concat();
+        let kinds: Vec<[u8; 4]> = boxes(&bytes, 0, bytes.len())
+            .into_iter()
+            .map(|found| found.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![*b"ftyp", *b"free", *b"mdat"],
+            "a 64-bit size of 32 skips its own 16-byte header and 16 payload bytes"
+        );
     }
 
     // -- the rotation -------------------------------------------------------

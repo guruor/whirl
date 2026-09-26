@@ -79,8 +79,9 @@ use whirl_core::source::{
 use crate::pipeline::sniff;
 
 /// How many of a file's first bytes the header read looks at. The same 1024 the
-/// pipeline's own sniff uses: a HEIC `ispe` box can sit behind a `meta` box, so
-/// the window is wider than the 8 to 30 bytes the other three formats need.
+/// pipeline's own sniff uses for the formats that answer inside it
+/// (`crate::pipeline::head_window`): a HEIC is the one that is read further, and
+/// by how much is that function's answer and not a bound of this source's own.
 /// This is not the decode 2.2 refuses to ship: it is the header read 2.2 puts in
 /// the source's own contract.
 const HEAD_BYTES: usize = 1024;
@@ -442,21 +443,48 @@ fn unreadable_root(root: &Path, follow_symlinks: bool) -> Option<String> {
     None
 }
 
-/// A file's first [`HEAD_BYTES`] bytes, sniffed. `None` covers every failure the
-/// same way, because 2.2's decision is the same for all of them: a file we
-/// cannot measure is a file we cannot promise will display.
+/// A file's first bytes, sniffed. `None` covers every failure the same way,
+/// because 2.2's decision is the same for all of them: a file we cannot measure
+/// is a file we cannot promise will display.
+///
+/// The window is the pipeline's own ([`crate::pipeline::head_window`]) and not a
+/// second opinion: a file this source admits is a file every later stage can
+/// measure, and the one it drops here is the one they would drop too. That is
+/// the whole difference between a JPEG folder and an iPhone one: a HEIC's
+/// dimensions sit in an `ispe` box behind `meta`, past 1 KiB in every `.heic`
+/// measured on this machine, so the small read is widened for exactly the file
+/// whose own bytes say HEIC and whose dimensions the small window did not find.
 fn header_of(path: &Path) -> Option<crate::pipeline::Header> {
+    let head = read_head(path, HEAD_BYTES)?;
+    if let Some(header) = sniff(&head) {
+        return Some(header);
+    }
+    // A second open, and only for the file the first window could not measure.
+    // The first read stays at 1 KiB because it is the one every JPEG, PNG and
+    // WebP in the tree spends, and a library of those is what this walk is
+    // mostly reading.
+    match crate::pipeline::head_window(&head) {
+        window if window > HEAD_BYTES => sniff(&read_head(path, window)?),
+        _ => None,
+    }
+}
+
+/// A file's first `bound` bytes, or fewer when the file is shorter than that:
+/// `bound` is a bound and not a promise, and the sniff is what decides whether
+/// what was read is enough.
+fn read_head(path: &Path, bound: usize) -> Option<Vec<u8>> {
     let mut file = File::open(path).ok()?;
-    let mut head = vec![0u8; HEAD_BYTES];
+    let mut head = vec![0u8; bound];
     let mut filled = 0;
-    while filled < HEAD_BYTES {
+    while filled < bound {
         match file.read(&mut head[filled..]) {
             Ok(0) => break,
             Ok(read) => filled += read,
             Err(_) => return None,
         }
     }
-    sniff(&head[..filled])
+    head.truncate(filled);
+    Some(head)
 }
 
 /// `~` and `~/`, expanded against `HOME` (2.2: "`~` is expanded"). `None` for a
@@ -1171,6 +1199,102 @@ mod tests {
             origins(&enumerate(&table(&dir, ""), &[])),
             vec![walls.join("good.png").display().to_string()],
             "a zero-byte file and a file of the wrong bytes are both unmeasurable"
+        );
+    }
+
+    /// An `ispe` property: version and flags, then width and height.
+    fn ispe(width: u32, height: u32) -> Vec<u8> {
+        let mut payload = vec![0u8; 4];
+        payload.extend_from_slice(&width.to_be_bytes());
+        payload.extend_from_slice(&height.to_be_bytes());
+        boxed(b"ispe", &payload)
+    }
+
+    /// A box: a 32-bit size, a type, and the payload.
+    fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// A HEIC in the shape Apple's own files have: `ftyp`, then `meta` with
+    /// `pitm` naming item 2, an `iprp` whose `ipco` holds the thumbnail item's
+    /// `ispe` first and the primary item's second, and the `ipma` that pairs
+    /// them. `filler` is padding ahead of the properties, which is how a test
+    /// puts the dimensions past the small read the way every real file does.
+    ///
+    /// The same fixture `crate::pipeline`'s tests use, for the same reason: this
+    /// build reads a header and never decodes (features.md 1.4).
+    fn heic(thumbnail: (u32, u32), primary: (u32, u32), filler: usize) -> Vec<u8> {
+        let mut ipco = ispe(thumbnail.0, thumbnail.1);
+        ipco.extend_from_slice(&ispe(primary.0, primary.1));
+        // `ipma`, version 0 with one-byte indices: one property per item, and
+        // item `n` carries property `n`.
+        let mut ipma = vec![0u8; 4];
+        ipma.extend_from_slice(&2u32.to_be_bytes());
+        for item in [1u16, 2] {
+            ipma.extend_from_slice(&item.to_be_bytes());
+            ipma.push(1);
+            ipma.push(item as u8);
+        }
+        let mut iprp = boxed(b"ipco", &ipco);
+        iprp.extend_from_slice(&boxed(b"ipma", &ipma));
+        let mut meta = vec![0u8; 4];
+        meta.extend_from_slice(&boxed(b"pitm", &[0, 0, 0, 2]));
+        meta.extend_from_slice(&boxed(b"free", &vec![0u8; filler]));
+        meta.extend_from_slice(&boxed(b"iprp", &iprp));
+        let mut bytes = boxed(b"ftyp", b"heic\x00\x00\x00\x00mif1");
+        bytes.extend_from_slice(&boxed(b"meta", &meta));
+        bytes
+    }
+
+    /// The card this comes from: a HEIC whose dimensions sit past the 1 KiB the
+    /// header read starts with. Nothing about the file is unusual, which is the
+    /// whole point - every `.heic` Apple ships has its `ispe` at 1063 to 3421
+    /// bytes in - and before this the file was dropped without becoming a
+    /// candidate and without a counter that said so.
+    #[test]
+    fn a_heic_past_the_small_window_is_a_candidate_with_its_primary_size() {
+        let dir = scratch("heic-window");
+        let file = dir.join("walls").join("Mac Blue.heic");
+        fs::create_dir_all(dir.join("walls")).expect("the source directory");
+        fs::write(&file, heic((1024, 1024), (6016, 6016), 4096)).expect("the fixture");
+
+        let candidates = enumerate(&table(&dir, ""), &[]);
+        assert_eq!(origins(&candidates), vec![file.display().to_string()]);
+        assert_eq!(candidates[0].width, Some(6016), "the primary item's ispe");
+        assert_eq!(candidates[0].height, Some(6016));
+        assert_eq!(
+            candidates[0].bytes,
+            fs::metadata(&file).ok().map(|meta| meta.len())
+        );
+    }
+
+    /// The same rule from the other side: a file whose *name* says heic and whose
+    /// bytes are not a measurable HEIC is not a candidate. The wider read is
+    /// decided by the bytes (`is_heic`) and not by the filename, so a `.heic`
+    /// that is not one gets the small read and no answer.
+    #[test]
+    fn a_file_named_heic_whose_bytes_are_not_one_is_not_a_candidate() {
+        let dir = scratch("heic-liar");
+        let walls = dir.join("walls");
+        fs::create_dir_all(&walls).expect("the source directory");
+        plant(&walls.join("good.png"), 2560, 1440);
+        fs::write(
+            walls.join("liar.heic"),
+            b"not a HEIC, whatever the name says",
+        )
+        .expect("a file");
+        // A HEIC brand with no `meta` box: it passes the brand test, so it is
+        // read further, and it is still not measurable.
+        let mut headless = boxed(b"ftyp", b"heic\x00\x00\x00\x00mif1");
+        headless.extend_from_slice(&boxed(b"mdat", &ispe(2048, 1536)));
+        fs::write(walls.join("headless.heic"), headless).expect("a file");
+
+        assert_eq!(
+            origins(&enumerate(&table(&dir, ""), &[])),
+            vec![walls.join("good.png").display().to_string()]
         );
     }
 
