@@ -691,6 +691,17 @@ mod tests {
     /// deadline plus the grace, which is all the run can take.
     const WATCH_BOUND: Duration = Duration::from_secs(30);
 
+    /// `ESRCH`: the errno `kill(pid, 0)` returns once the pid is gone. macOS and
+    /// Linux agree on 3, so unlike `EWOULDBLOCK` in `tests/daemon_lock.rs` this
+    /// one needs no `cfg`.
+    const ESRCH: i32 = 3;
+
+    /// `kill(2)`'s own existence question: signal 0 is never delivered, it only
+    /// asks whether the pid is there and whether this process could signal it.
+    /// The test below leans on that to prove the killed worker is gone. It lives
+    /// here rather than beside `SIGTERM` because this test is its only caller.
+    const SIGNAL_NONE: i32 = 0;
+
     /// When a `TERM` trap was seen to run, on the test's own clock.
     ///
     /// A timestamp written by the trap itself would be a wall-clock reading
@@ -767,14 +778,14 @@ mod tests {
     ///
     /// A daemon that skipped `SIGTERM` fails 1 and the marker assertion; one
     /// that killed alongside the signal fails 3 and 4; one that returned without
-    /// killing leaves the process alive and fails the `kill -0` probe.
+    /// killing leaves the process alive and fails the `kill(pid, 0)` probe.
     ///
     /// What it still cannot see: the instant of the signal itself, any closer
     /// than `TOLERANCE` early and `SLACK` late, and the signal by number. The
     /// signal is observed only through the shell's trap table, so this says
     /// "the trap the script installed for `TERM` ran", which on every shell
-    /// here means `SIGTERM` and not that the daemon used `kill(1)` rather than
-    /// a syscall.
+    /// here means `SIGTERM` and not that the daemon sent it with `kill(2)`
+    /// rather than by any other route to the same signal.
     ///
     /// The `trap` is the script's first statement and the pid file its second:
     /// both orderings are load-sensitive, and installing the handler before
@@ -842,12 +853,16 @@ mod tests {
         );
 
         let pid: u32 = scripts.text("pid.txt").trim().parse().expect("a pid");
-        // Through the same syscall the daemon just used: signal 0 is never
-        // delivered, it only asks whether the pid is there.
-        let probe = send_signal(pid, 0);
+        // Through the same syscall the daemon just used, so this probe is not
+        // itself a reason for the test to fail on an image with no `kill(1)`
+        // binary (see `terminate`): signal 0 is `kill(2)`'s own existence
+        // question and is never delivered. `ESRCH` is a stricter answer than
+        // the `kill(1)` exit status this replaces, which said only that the
+        // command was unhappy, not why.
+        let probe = send_signal(pid, SIGNAL_NONE);
         assert!(
-            probe.is_err(),
-            "the worker was killed and reaped, so {pid} is gone"
+            matches!(&probe, Err(error) if error.raw_os_error() == Some(ESRCH)),
+            "the worker was killed and reaped, so {pid} is gone: {probe:?}"
         );
     }
 
