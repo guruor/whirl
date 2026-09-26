@@ -110,6 +110,14 @@ docs/
                                 and a GitHub Release (section 5)
 .github/release-notes-template.md   the shape of a release's notes, and the sections
                                     a release may not publish without (section 5)
+scripts/ci.sh               the gate: one mode per check, each mode the command the
+                            matching job runs, plus the container and msrv modes
+                            (section 3)
+scripts/gate.Dockerfile     the gate's Linux image: the pinned toolchain plus the
+                            pinned cargo-nextest, one pin per architecture
+.config/nextest.toml        the test runner's repository config: the version, the
+                            fail-fast and slow-timeout rules, and retries = 0
+.dockerignore               keeps target/ and .git/ out of that image's build context
 prototype/                  the throwaway spike: read-only, never shipped, never built by CI
 ```
 
@@ -257,18 +265,48 @@ What each CI job exercises, and how to run the same thing locally.
 | `guards` | ubuntu | `cargo metadata` plus a `Cargo.lock` scan, then a release build and a size check | zero third-party dependencies, and the binary size caps |
 | `artifacts` | ubuntu, macos, windows | `cargo build --workspace --release` plus `upload-artifact` | the release build produces `whirld`, `whirl`, `whirl-worker` on every platform |
 
-The local equivalents are the same commands, in this order, and they are what to
-run before opening a pull request:
+### The gate: `scripts/ci.sh`
+
+One script, one mode per check, each mode the matching job's command with the
+same flags. That is the contract: one copy of every command, so a local run and a
+CI run cannot drift, and a check that is not a mode of the script is a preference
+rather than a gate.
+
+Before you push, run one thing:
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-WHIRL_BACKEND=noop cargo test --workspace
-cargo build --workspace --release
+./scripts/ci.sh all
 ```
 
-`WHIRL_BACKEND=noop` is not optional in the test command if any test rotates; the
-workflow sets it for the whole job so that an added test cannot forget it.
+That is `local` (fmt, clippy, test, artifacts), then `windows`, then `msrv`, then
+`linux`. What each mode proves:
+
+| mode | what it proves |
+|---|---|
+| `fmt` | formatting, and nothing else |
+| `clippy` | every `cfg` path compiles clean under `-D warnings` |
+| `test` | the suite with one process per test (cargo-nextest), then the doctests, which nextest does not run. The whole workspace is built first, which the integration tests need because they spawn the worker binary |
+| `msrv` | 1.85.0 accepts the code, so `rust-version` is a fact and not a claim |
+| `guards` | zero third-party dependencies, and the release binaries fit the caps in `docs/architecture.md` R2 |
+| `artifacts` | the release build produces the three binaries |
+| `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
+| `linux` | the ubuntu jobs again, in the gate's container, so a Linux-only failure surfaces here rather than in CI |
+| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails three tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
+
+`WHIRL_BACKEND=noop` is not a contributor's business any more: the script sets it
+for the whole of `test` and for `msrv`'s test step, so a new test cannot forget
+it. A mode that cannot run says why and exits 2, naming what is missing:
+`cargo-nextest` 0.9.146 for `test` (pinned in `.config/nextest.toml`), Docker for
+the container modes, the 1.85.0 toolchain for `msrv`. There is no fallback from
+`test` to `cargo test`: the two commands prove different things, and the gate does
+not guess.
+
+**What the gate cannot prove: Windows behaviour.** `windows` only compiles.
+Nothing on a Mac and nothing in a Linux container runs Windows code, and the
+`test (windows-latest)` job is the only thing that does. So when a change touches
+path handling, process spawning or the transports, open a draft pull request
+after your first commit: that job is the only Windows signal there is, and a
+green gate is not a promise that CI will be green.
 
 ### What CI cannot prove, and who proves it instead
 
@@ -317,9 +355,12 @@ found`. The scanner's own rules stay on; `.gitleaks.toml` only adds exemptions,
 each with a reason that the job prints on every run.
 
 The rule that keeps it honest: **every command a contributor is expected to run
-before opening a pull request appears in the workflow, verbatim.** If a check is
-not in the file, it is a preference, not a gate. Adding a check means adding it in
-both places in the same pull request.
+before opening a pull request is a mode of `scripts/ci.sh` (section 3), and each
+mode is the matching job's command, verbatim.** A check that is not a mode of the
+script is a preference, not a gate: adding one means adding the mode and the job
+that calls it, in the same pull request. The jobs are switched to calling the
+modes by their own pull requests, so while a job still inlines its command, that
+command and its mode must stay textually identical.
 
 Caching covers `~/.cargo/registry`, `~/.cargo/git` and `target`, keyed by runner
 OS and the `Cargo.lock` hash. With zero dependencies there is little to cache
