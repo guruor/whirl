@@ -116,8 +116,10 @@ LINUX_PLATFORM="linux/amd64"
 #
 #   whirld::bin/whirld worker::tests::a_spawn_that_never_produced_a_worker_reports_no_reaped_pid
 #
-# Measured 2026-09-27 on this arm64 host at this head, four runs -- three as the
-# invoking user and one as root -- the same one every time:
+# Measured 2026-09-27 on this arm64 host, every run the same one. The runs are
+# the mode as it now runs, as the invoking user (`--user`, below): the root
+# invocation an earlier card measured had a second red, the `0o000` fixture in
+# `crates/whirl-worker/src/sources/local.rs` that flag exists to avoid.
 #
 #   ./scripts/ci.sh linux-amd64
 #   -> exit 100, 247 tests run (with .config/nextest.toml's fail-fast = false),
@@ -125,8 +127,27 @@ LINUX_PLATFORM="linux/amd64"
 #
 # while it passes in the same image without --platform (arm64, 247 of 247), on
 # macOS, and in CI's own jobs on real x86_64 (run 36272882168: ubuntu-latest,
-# macos-latest and msrv all report it ok). t_26eefd55 owns the diagnosis and the
-# fix.
+# macos-latest and msrv all report it ok).
+#
+# The failure is the translator's, not whirl's, and there is nothing to fix on
+# this side (t_26eefd55). The daemon spawns through std's `Command`, and std on
+# linux-gnu reaches the kernel through glibc's `posix_spawn`, which returns the
+# child's exec error in memory a `CLONE_VM|CLONE_VFORK` child shares with its
+# parent (glibc 2.36, spawni.c). Rosetta's clone child is not in the parent's
+# address space, so that write never lands: measured in this container, an `int`
+# a `clone(CLONE_VM|CLONE_VFORK)` child wrote read back as `0` in the parent
+# under emulation and as the value the child wrote natively, while a byte the
+# same child wrote to a pipe arrived in both. `posix_spawn` therefore returns
+# success with a pid for a program that is not there (`ENOENT` natively, and
+# `EACCES` for a file without the execute bit), and the refusal survives only as
+# the child's exit status `127`, glibc's `SPAWN_ERROR`.
+#
+# So the worker this test knows never existed is, in the emulated guest, a
+# process that was forked and died: the assertion's subject is the translator's
+# process table rather than whirl's reading of 8.8. Forcing std's fork+exec path
+# with `pre_exec` makes the `ENOENT` arrive under emulation too, which is how the
+# two halves were told apart, and it is not worth taking: it would change the
+# spawn path on every real target, with `unsafe`, to satisfy an emulator.
 #
 # This list used to name two control_socket tests, and those are fixed rather
 # than relabelled: t_62920980 found the EINTR the translation delivered to a read
@@ -134,11 +155,11 @@ LINUX_PLATFORM="linux/amd64"
 # third name was on the list while this file was written,
 # whirld::bin/whirld worker::tests::a_spawn_that_finds_the_script_busy_is_retried,
 # which passes since dec136e (t_43827dc5) made it ask the guest for the kernel's
-# refusal instead of assuming emulation reports it. Until the one above is
-# diagnosed, this mode exits non-zero on a clean tree with that one failure
-# expected: nothing is filtered out and nothing is skipped, and the mode prints
-# the name, the reason and the card on every run, so a red is understood rather
-# than ignored.
+# refusal instead of assuming emulation reports it. The one above is the only red
+# this mode has, and it is the emulator's: nothing is filtered out and nothing is
+# skipped, the run is the whole suite, and the mode prints the name, the
+# measurement and the card on every run, so a red is understood rather than
+# ignored.
 
 usage() {
   # The mode table above, printed from this file rather than repeated here.
@@ -320,10 +341,12 @@ amd64_note() {
   printf 'ci.sh: this run is emulated x86_64, and one test is expected to fail in it:\n' >&2
   printf '          whirld::bin/whirld worker::tests::a_spawn_that_never_produced_a_worker_reports_no_reaped_pid\n' >&2
   printf '        which passes on real x86_64 (CI run 36272882168), in this image without --platform and\n' >&2
-  printf '        natively here; card t_26eefd55 owns the diagnosis and the fix. The two control_socket names\n' >&2
-  printf '        here were fixed by t_62920980, not relabelled. Nothing is skipped: the run is the whole\n' >&2
-  printf '        suite and it exits non-zero until that lands, which is why this mode is opt-in and not part\n' >&2
-  printf '        of local or all.\n' >&2
+  printf '        natively here. That one is the translator and not whirl: the emulated posix_spawn reports\n' >&2
+  printf '        success, with a pid, for a program it could not exec, so there is nothing here to fix and\n' >&2
+  printf '        the mode keeps it red (t_26eefd55; the block above LINUX_PLATFORM is the measurement). The\n' >&2
+  printf '        two control_socket names this note used to print were fixed by t_62920980, not relabelled.\n' >&2
+  printf '        Nothing is skipped or filtered: the run is the whole suite, and it exits non-zero on the\n' >&2
+  printf '        one above, which is why this mode is opt-in and not part of local or all.\n' >&2
 }
 
 on_the_runner() {
