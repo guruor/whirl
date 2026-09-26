@@ -191,6 +191,30 @@ impl Worker {
         run: u64,
         deadline: Duration,
     ) -> Result<Outcome, WorkerError> {
+        self.run_reporting_reaped(verb, target, run, deadline, &mut None)
+    }
+
+    /// The same run, with 8.8's proof attached: `reaped` is where the pid of the
+    /// child this process **has reaped** goes. That pid is the one thing that
+    /// entitles a take of `rotate.lock` to remove a lock file under 8.7's
+    /// `excl_file` fallback (8.8, 7.3 step 4): the parent holds the exit status,
+    /// so the holder is provably gone and no liveness probe is needed.
+    ///
+    /// It stays `None` wherever this process has no exit status to show: the
+    /// spawn paths that never produced a worker, and a `try_wait` that failed.
+    /// 1.7.1's deadline is the third. `terminate` does reap the child it kills
+    /// (it polls through `TERM_GRACE`, then sends `SIGKILL` and waits), but the
+    /// exit status stops there, because `WorkerError::Timeout` carries no pid.
+    /// Under 8.7's fallback a timed-out worker's `rotate.lock` is therefore left
+    /// where it is, and the sweep after it defers (5.5 step 1).
+    pub(crate) fn run_reporting_reaped(
+        &self,
+        verb: Verb,
+        target: Option<&str>,
+        run: u64,
+        deadline: Duration,
+        reaped: &mut Option<u32>,
+    ) -> Result<Outcome, WorkerError> {
         let mut command = Command::new(&self.program);
         command
             .arg("--config")
@@ -258,6 +282,12 @@ impl Worker {
             }
             std::thread::sleep(POLL);
         };
+
+        // 8.8's proof, and the only place it is obtained: `try_wait` returned the
+        // exit status, so this process has reaped the child that held that pid.
+        // Every path that returns above this line leaves `reaped` exactly as the
+        // caller left it.
+        *reaped = Some(child.id());
 
         // Read after the exit. The contract caps stdout at two lines and stderr
         // at one, so the pipe buffer cannot be full; a worker that ignored the
