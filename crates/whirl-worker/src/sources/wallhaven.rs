@@ -1063,6 +1063,30 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_missing_half_of_its_documented_shape_is_malformed() {
+        // 2.3's shape is `data[]` plus `meta` on both endpoints, and one reader
+        // covers both. Either half missing is a parse failure and not an empty
+        // listing: reading `last_page` off a body that did not carry one as 0
+        // would end the walk on a broken answer and call it "the end".
+        for body in [
+            r#"{"meta":{"current_page":1,"last_page":1}}"#,
+            r#"{"data":[]}"#,
+            r#"{"data":{"entries":[]},"meta":{"current_page":1,"last_page":1}}"#,
+        ] {
+            let recorded = Recorded::answering(vec![(200, body.to_string())]);
+            let (source, _) = wallhaven(COLLECTION, recorded, Box::new(Key(None)));
+            let error = source
+                .enumerate(&context())
+                .expect_err("not the documented shape");
+            assert_eq!(error.kind, SourceErrorKind::Malformed, "{body}");
+            assert!(
+                error.to_string().contains("not a listing"),
+                "the reader's own words travel: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn a_failed_second_page_fails_the_whole_listing_by_name() {
         let text = "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
                     \"wallhaven\", \"collection\": \"example-user/12345\", \"pages\": 2 } ]\n}\n";
