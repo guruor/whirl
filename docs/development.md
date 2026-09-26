@@ -100,7 +100,8 @@ docs/
   spec/                     features, state and cache layout
   research/                 per-platform findings, with the real-hardware checklists
   decisions/                ADRs: NNNN-title.md, template in 0000-template.md
-  reviews/                  review reports, one per reviewed document
+  reviews/                  review reports; the index in `README.md` says what
+                            each one covers
   releases/                 one file per release: vX.Y.Z.md, the notes the tag
                             workflow publishes, written before the tag (section 5)
 .github/workflows/ci.yml    the gate: push to `main` or `development`, pull request
