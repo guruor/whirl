@@ -386,6 +386,13 @@ on the runners, which is the first commit at which the `test` mode and the `test
 job are the same command. Until then, a green `test` mode does not prove the
 `test` job green.
 
+**The other CI gate with no mode is a deliberate exclusion, not a gap:** `secrets`
+(gitleaks) installs a release binary and scans the commits a change adds, and a
+contributor cannot run that scanner on their machine, so there is no honest mode
+to write and none is pretended. Its consequence is stated where it belongs: `all`
+does not cover it, and section 3 lists it among the three things `all` leaves
+unproven.
+
 Caching covers `~/.cargo/registry`, `~/.cargo/git` and `target`, keyed by runner
 OS and the `Cargo.lock` hash. With zero dependencies there is little to cache
 today; the cache exists because the compiled `target` directory and the pinned
