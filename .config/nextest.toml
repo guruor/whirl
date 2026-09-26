@@ -1,0 +1,38 @@
+# cargo-nextest's repository configuration: nextest reads it from the workspace
+# root, and it is checked in so that CI and a laptop run the same suite.
+#
+# Every key here is nextest 0.9.146's. The file was run, not only schema-checked:
+# `./scripts/ci.sh test` (155 tests, green) reads it, `linux-amd64` shows
+# fail-fast below taking effect, and raising `required` refuses to run at all.
+# The reference is nextest's published schema for the released version,
+# https://nexte.st/schemas/repo-config.json (the schema is generated from
+# nextest's own config parser and each level sets "additionalProperties":
+# false, so a key that is not nextest's is a schema error).
+
+# The runner version is pinned the way rust-toolchain.toml pins the compiler:
+# one version, CI and laptop the same. scripts/gate.Dockerfile installs this
+# version into the gate's image, and reads the same pin in scripts/ci.sh for the
+# image tag.
+nextest-version = { required = "0.9.146" }
+
+[profile.default]
+# A failure must not hide the other tests. The ubuntu, macOS and Windows jobs
+# each report every failure from one run: without this, nextest stops scheduling
+# after the first failure and the run reports "90/155 tests run".
+fail-fast = false
+
+# A test still running after one slow period is named in the output; ten slow
+# periods and it is killed. Without this, a hung test on the Windows runner
+# burns the job's six-hour timeout and reports nothing about which test hung.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# Zero, deliberately. A retry policy is how a real race hides: whirl's one
+# measured flake appeared in 1 run of 30 (t_7e9836df, ETXTBSY), and a second
+# attempt would have turned that run green and taught nobody anything.
+# `cargo nextest run --retries 2` is a diagnostic a developer may run by hand
+# while fixing a flake; it is not the gate.
+retries = 0
+
+# If a retry is ever introduced, the run reports a test that only passed on the
+# retry as `flaky`, never as a pass.
+final-status-level = "flaky"
