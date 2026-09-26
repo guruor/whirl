@@ -151,17 +151,22 @@ amd64 guest.
 
 ## 3. Does CI run these two tests on x86_64? Yes, and it is green
 
-The workflow says so. `.github/workflows/ci.yml:73-77` is the `test` job,
+The workflow says so. `.github/workflows/ci.yml:73-79` is the `test` job,
 `runs-on: ${{ matrix.os }}` with `os: [ubuntu-latest, macos-latest,
-windows-latest]`, and line 92 is its only test step:
+windows-latest]`, and lines 89-91 are its only test step (this document's head
+merges the workflow that calls the gate a developer runs, `scripts/ci.sh`; the
+job, its matrix and its tests are unchanged):
 
-    - name: cargo test --workspace
-      run: cargo test --workspace
+    - name: the test suite, then the doctests
+      run: bash scripts/ci.sh test
 
-Both tests are plain `#[test]`s in `crates/whirld/tests/control_socket.rs`
-(`subscribe_streams_one_event_per_state_change` at 1059,
-`a_failed_rotation_is_visible_on_both_planes` at 1160): no `#[ignore]`, no
-`#[cfg]`, so that step runs them, and `ubuntu-latest` is x86_64.
+`scripts/ci.sh test` exports `WHIRL_BACKEND=noop` and runs the workspace suite,
+then the doctests. Both tests are plain `#[test]`s in
+`crates/whirld/tests/control_socket.rs`
+(`subscribe_streams_one_event_per_state_change` at 1230,
+`a_failed_rotation_is_visible_on_both_planes` at 1349; 1059 and 1160 at the
+`7e22e1a` tree this section's runs came from): no `#[ignore]`, no `#[cfg]`, so
+that step runs them, and `ubuntu-latest` is x86_64.
 
 A recent green run says the same. `gh run list` picks run `36221809231`:
 workflow `ci`, event `push` on `development`, head
@@ -282,10 +287,11 @@ the design it comes from:
 `development` moved 37 commits while this was being written, so the branch
 merges it (`git merge origin/development`, no conflicts) and every measurement
 above is repeated on the merged tree, `da555be`. The runs quoted below are from
-that tree unless they say otherwise. The claims about the present state were
-re-taken at this head, `0cd385c` (this branch with `development` at `399da9c`
-merged in, and the doc-only commit this section's correction arrives in changes
-nothing but this file); the third-red bullet also records what closed that red.
+that tree unless they name another: the two that say "at this head" were taken
+at `bf98ed9`, this branch with `development` at `08c457e` merged in, whose one
+conflict is in `crates/whirld/src/socket.rs` and is resolved by keeping both
+sides' test modules (the line-number bullet below says what moved with it). The
+third-red bullet also records what closed that red.
 
 * The two tests this document rules on are green under emulation, then and now.
   In the emulated container, `cargo test --workspace --no-fail-fast` at
@@ -300,30 +306,35 @@ nothing but this file); the third-red bullet also records what closed that red.
       test subscribe_streams_one_event_per_state_change ... ok
 
   The one red there is the third red below, in `whirld`'s own unit binary. The
-  same command at this head, `0cd385c`:
+  same command at this head, `bf98ed9`:
 
       test result: ok. 0 passed ... test result: ok. 4 passed ... test result: ok. 47 passed
       test result: ok. 21 passed ... test result: ok. 7 passed
-      test result: ok. 54 passed; 0 failed   <- the binary the third red was in
+      test result: ok. 55 passed; 0 failed   <- the binary the third red was in
       test result: ok. 22 passed; 0 failed   <- control_socket
       test result: ok. 3 passed ... test result: ok. 0 passed
       test a_failed_rotation_is_visible_on_both_planes ... ok
       test subscribe_streams_one_event_per_state_change ... ok
       cargo test exit=0
 
-  That binary holds 53 tests at `da555be` and 54 at this head; the one added test
-  is the kernel-free half of the third red's fix below.
+  That binary holds 53 tests at `da555be` and 55 at this head: the kernel-free
+  test of the third red's fix below, and the socket-mask test this section's
+  merge of `development` brings with it.
 
-* Natively the same merged tree is green, and re-checked at this head: `cargo
-  test --workspace` exit 0 on macOS arm64 (0, 4, 47, 21, 7, 54, 22, 3 and 0
+* Natively the same tree is green, and re-checked at this head: `cargo
+  test --workspace` exit 0 on macOS arm64 (0, 4, 47, 21, 7, 55, 22, 3 and 0
   passed, the emulated run's own counts), `cargo fmt --all -- --check` clean,
   `cargo clippy --workspace --all-targets -- -D warnings` clean.
-* Line numbers moved with the merge, and did not move after it: the `read_line`
+* Line numbers moved with the merge, and did not move again: the `read_line`
   helper whose empty read panics is at `control_socket.rs:1081` (911 in section
   1's run at `7e22e1a`), and the two tests are at 1230 and 1349 (1059 and 1160 at
-  `7e22e1a`). Checked at this head, and still those. Section 3's `ci.yml`
-  references were checked too and still hold: 73-77 is the `test` job's header
-  with the three-OS list, and 92 is its only test step.
+  `7e22e1a`). Checked at this head, and still those. Section 3's `ci.yml` lines
+  did move: this head merges the workflow that calls `scripts/ci.sh`, so the
+  `test` job is 73-79 and its only test step is 89-91, `run: bash scripts/ci.sh
+  test` (section 3 carries the rewritten quote). The three image digests of
+  section 1 were re-read with `docker buildx imagetools inspect` and are
+  unchanged, index `sha256:36546847...`, `linux/amd64` `sha256:4673f78d...`,
+  `linux/arm64` `sha256:94aaa0b4...`.
 * The emulated mode was **not** green as a whole at `da555be`.
   `worker::tests::a_spawn_that_finds_the_script_busy_is_retried`, added to
   `development` by `2deceea` ("worker: retry a spawn the kernel refused with
@@ -359,14 +370,14 @@ nothing but this file); the third-red bullet also records what closed that red.
   `a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds`, which hands the
   retry loop `errno 26` directly and asserts on the attempt counts, so the
   behaviour is covered on every platform. At this head the emulated run of the
-  test prints the skip and passes, in 0.02 s:
+  test prints the skip and passes, in 0.03 s:
 
       note: this guest cannot report an exec failure through Command::spawn (the emulated amd64 translation loses glibc's posix_spawnp errno), so the refusal never reaches the caller; the retry is not exercised end to end here, and a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds covers it
       test worker::tests::a_spawn_that_finds_the_script_busy_is_retried ... ok
 
   The skip is not a hole where the kernel does answer. On `linux/arm64` (a real
   kernel, no translation) the same test takes the asserting path: no note, and
-  0.11 s against the emulated run's 0.02 s. A copy of this tree with the retry
+  0.12 s against the emulated run's 0.03 s. A copy of this tree with the retry
   disabled (`SPAWN_ATTEMPTS` 10 -> 1) fails there, so the premise is doing its
   work and the test is not vacuous:
 
