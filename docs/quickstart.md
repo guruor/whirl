@@ -33,7 +33,7 @@ JSON
 ```
 
 `~/Pictures/Wallpapers` is the line to change. The `local` source walks that folder and takes any
-`jpg`, `jpeg`, `png`, `heic` or `webp` at least 1600x900; `whirl config check` prints the counts.
+`jpg`, `jpeg`, `png`, `heic` or `webp` at least 1600x900.
 
 ## 3. Start it, and rotate
 
@@ -51,6 +51,8 @@ whirl next
 ```
 
 It prints `queued` and then `set: <digest> <origin_key> <path>`, naming the picture it set.
+`whirl config check` prints what a source did, `candidates=` and `admitted=` and the rejection
+counters; it asks the daemon, so it only works while `whirld` is up.
 
 ## 4. Stop it
 
