@@ -905,23 +905,27 @@ and it only happens when a daemon dies.
 
 ### 7.2 Ownership table, and the locks
 
-`Readers` names the processes that open the file. A `whirl` verb that shows a
-file's contents is not one of them: it asks the daemon, which is already named on
-the row. `whirl status` reports `cache/index.json`'s `root_id` (2.1), and the
-process that opens the file for it is the daemon.
+`Writer` names the one process that writes the file. `Readers` names the
+processes that open it: a `whirl` verb that shows a file's contents is not one of
+them, because it asks the daemon, which is already named on the row, and `whirl
+status` reports `cache/index.json`'s `root_id` (2.1) from the daemon that opened
+it. `Surface` names the `whirl` verbs a user runs to observe or change the file,
+or `none` where no verb does, which leaves the filesystem as the only way in.
+Every surface below is answered by the daemon, because the daemon is the process
+that opens the file.
 
-| Path | Writer | Readers |
-|---|---|---|
-| `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path |
-| `state/current.json` | daemon | daemon; humans with `cat` |
-| `state/history.json` | daemon | daemon; the worker, for the recent window of 4.1 |
-| `state/favorites.json` | daemon | daemon |
-| `log` | daemon | humans |
-| `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup |
-| `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both |
-| `cache/index.json` | daemon | daemon; the worker, for the recent window of 4.1 |
-| `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only |
-| `cache/tmp/**` | the worker run that created it | nobody |
+| Path | Writer | Readers | Surface |
+|---|---|---|---|
+| `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path | `whirl config path`, `whirl config check`, `whirl sources` |
+| `state/current.json` | daemon | daemon; humans with `cat` | `whirl status`; `whirl pause`, `whirl resume` |
+| `state/history.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl history`; `whirl prev` |
+| `state/favorites.json` | daemon | daemon | `whirl favorites`; `whirl favorite`, `whirl unfavorite` |
+| `log` | daemon | humans | none |
+| `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup | `whirl status` (`lock_mode`) |
+| `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both | `whirl status` (`sweep_deferred`) |
+| `cache/index.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl status` (`cache_root_id`) |
+| `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only | `whirl status` (`cache_files`, `cache_bytes`) |
+| `cache/tmp/**` | the worker run that created it | nobody | none |
 
 - `daemon.lock` is taken with `flock(LOCK_EX|LOCK_NB)` on POSIX [L 3] and
   `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)` on Windows [9],
