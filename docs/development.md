@@ -313,7 +313,7 @@ proves:
 | `artifacts` | the release build produces the three binaries |
 | `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
 | `linux` | CI's `clippy`, `test` and `artifacts` jobs as they run on `ubuntu-latest`, plus `guards`, again in the gate's container, as the invoking user rather than root (`--user "$(id -u):$(id -g)"`, below), so a Linux-only failure surfaces here rather than in CI. `fmt` is not repeated there: rustfmt's output does not depend on the operating system, and `local` has already run it |
-| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails one test that passes on real x86_64 (card t_26eefd55). Opt-in: it is not in `local` or `all` |
+| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails one test that passes on real x86_64: the emulator's `posix_spawn` reports success for an exec it refused, which no change here can fix (t_26eefd55; the measurement is in `scripts/ci.sh` above `LINUX_PLATFORM`). Opt-in: it is not in `local` or `all` |
 
 **What `all` leaves unproven**, so that the answer is here rather than inferred:
 
@@ -324,8 +324,12 @@ proves:
   nothing; `test (windows-latest)` on a Windows runner is the only thing that runs
   Windows code, and it is not something this machine can do (below).
 - **`linux-amd64`.** Deliberately outside `all`: on Apple silicon it is emulated
-  and it fails one test that passes on real x86_64 (card t_26eefd55). Run it
-  by hand when a change touches something an architecture decides.
+  and it fails one test that passes on real x86_64. That one is the emulator's:
+  the translated `posix_spawn` reports success, with a pid, for a program it
+  could not exec, so the daemon's "no worker existed" path is unreachable there
+  and whirl has nothing to fix (t_26eefd55, and the block above
+  `LINUX_PLATFORM` in `scripts/ci.sh` is the measurement). Run the mode by hand
+  when a change touches something an architecture decides.
 
 `WHIRL_BACKEND=noop` is not a contributor's business any more: the script sets it
 for the whole of `test` and for `msrv`'s test step, so a new test cannot forget
