@@ -338,6 +338,38 @@ path handling, process spawning or the transports, open a draft pull request
 after your first commit: that job is the only Windows signal there is, and a
 green gate is not a promise that CI will be green.
 
+### The gate's container, and what it leaves behind
+
+`linux` and `linux-amd64` run `scripts/gate.Dockerfile`'s image. The repository
+owns that Dockerfile because the stock `rust` image has no `cargo-nextest`: a
+container mode built on the stock image could not run the test suite at all. The
+base image is pinned by OCI index digest and each architecture's `cargo-nextest`
+binary by the sha256 the release publishes next to it, and `scripts/ci.sh` builds
+the tag from both pins, so changing either builds a new image rather than reusing
+the old one.
+
+Two image-and-volume pairs are left on the machine on purpose, one per
+architecture the gate has run on:
+
+- `whirl-gate:<toolchain>-<nextest>-<arch>`, here
+  `whirl-gate:1.94.0-0.9.146-arm64` and `whirl-gate:1.94.0-0.9.146-amd64`;
+- `whirl-gate-target-<arch>`, the container's `CARGO_TARGET_DIR`. One volume per
+  architecture, because a shared volume would invalidate every fingerprint each
+  time the gate switched between arm64 and amd64.
+
+They are warm caches: the second run of a mode is seconds instead of a rebuild.
+To give the disk back, both filters were checked against this machine's own docker
+output on 2026-09-26 (two images, two volumes):
+
+```sh
+docker images --filter=reference='whirl-gate:*' -q | xargs docker rmi
+docker volume ls -q --filter name=whirl-gate-target | xargs docker volume rm
+```
+
+The next container run rebuilds the image and repopulates the volume. The pinned
+`rust` base image stays as well; removing it is a separate `docker rmi` once
+nothing built from it is left.
+
 ### What CI cannot prove, and who proves it instead
 
 Continuous integration runs on headless machines. It can prove that the code
