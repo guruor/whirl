@@ -563,25 +563,32 @@ modified by whirl for as long as it is the anchor. This holds across cap
 changes, cache clears (which must restore it, section 8.2), and rotations that
 happen to pick the same image again.
 
-Check, the adversarial form, on a config that is legal under 5.1: leave
-`cache.max_bytes` at its default and set `cache.max_files` to 1, so the ordering
-rule (`cache.max_bytes >= filters.max_bytes`) still holds and the daemon starts.
+Check, the adversarial form, on a config that 4.3 and the validator both accept:
+`cache.max_files` at 2, which is the floor 4.3 sets (`docs/architecture.md:1475`)
+and the lowest value `validate_ordering` admits
+(`crates/whirl-core/src/config.rs:1320`, whose refusal of 1 is asserted at
+`crates/whirl-core/src/config.rs:2450`); the byte cap at its default, so
+`cache.max_bytes >= filters.max_bytes` still holds; and `cache.grace_seconds` at
+0, its legal minimum (the paragraph after the steps gives both reasons).
 
 1. Run `whirl next` once. Record `anchor_path` and `anchor_digest` from
    `whirl status`, then pin that image with `whirl favorite`, so it is protected
    by two independent rules.
-2. Run `whirl next` again. The cache now holds two protected files (the pin and
-   the new anchor) against a count cap of 1, and the sweep runs at the end of
+2. Run `whirl next` again, then pin this image too. The cache now holds two
+   protected files against a count cap of 2, and the sweep runs at the end of
    that rotation.
-3. Confirm that (a) the image on screen is the second one, (b) the file recorded
-   in step 1 is still present and still matches its digest, and `whirl favorites`
-   still lists it, (c) the current `anchor_path` exists and still matches
-   `anchor_digest`, and (d) `whirl status` reports `cache_over_cap` with
-   `cache_over_reason: pinned` rather than pretending the cache is within budget.
-4. Run `whirl next` once more. The unprotected file (the second image) must now
-   be evicted, because the sweep removes unprotected entries until the caps are
-   satisfied or there are none left (5.3), while the pin and the new anchor
-   survive.
+3. Run `whirl next` once more. The cache now holds three protected files (the two
+   pins and the new anchor) against a count cap of 2, and the sweep runs at the
+   end of that rotation. Confirm that (a) the image on screen is the third one,
+   (b) both files pinned in steps 1 and 2 are still present, still match their
+   digests, and are still listed by `whirl favorites`, (c) the current
+   `anchor_path` exists and still matches `anchor_digest`, and (d) `whirl status`
+   reports `cache_over_cap` with `cache_over_reason: pinned` rather than
+   pretending the cache is within budget.
+4. Run `whirl next` once more. The file that is no longer the anchor (the third
+   image) is unprotected now and must be evicted, because the sweep removes
+   unprotected entries until the caps are satisfied or there are none left (5.3),
+   while both pins and the new anchor survive.
 
 `decision:` the check deliberately does not set `cache.max_bytes` to 1. 5.1 makes
 that config invalid, the daemon refuses to start on a config that fails
@@ -594,14 +601,44 @@ file with no index entry is an orphan, and step 3 of the sweep removes it once i
 is past `cache.grace_seconds`, for a reason that has nothing to do with the cap
 being tested.
 
+`decision:` `cache.max_files` is 2 here, and that is the floor's decision rather
+than this check's: 4.3 requires `cache.max_files >= 2`
+(`docs/architecture.md:1475`), `validate_ordering` refuses anything lower and
+names the key (`crates/whirl-core/src/config.rs:1320`), a test asserts that
+refusal (`crates/whirl-core/src/config.rs:2450`), and 8.7 turns it into a refusal
+to start, which is exactly what a value of 1 produced on a real daemon:
+`whirld: cache.max_files (line 3): <config>: 1 is less than 2`, exit 1. Nothing in
+this document says what the floor is for; what 5.3 and 5.5 do imply is that the
+file on screen and the file arriving in a rotation are protected at the same
+time, so a cap of 1 describes a cache that cannot hold an image and its successor
+together. 2 is the tightest value that admits both, and it is also the smallest
+cap under which this check observes anything: the check's pressure is protected
+files exceeding the cap, and a protected set of two does not exceed 2, which is
+why step 2 pins a second image.
+
+`decision:` the check also needs `cache.grace_seconds` at 0. 5.3 protects every
+cache file created inside that window, and at the default of 600 s every file the
+check creates is inside it, so step 4's eviction is not observable: the third
+image is still protected after it stops being the anchor. 4.3's ordering rules do
+not bound `cache.grace_seconds` (the list is `docs/architecture.md:1473-1476`, and
+this key is not in it) and `want_u64` accepts 0
+(`crates/whirl-core/src/config.rs:1503`), so 0 is legal and is what the check
+uses; leaving the default in force would mean waiting out the window between
+steps 3 and 4.
+
+`decision:` the check's last precondition is the build: `cache_over_reason:
+pinned` is a sweep outcome (INV-CACHE-1), so the check is observable only in a
+build that has the cache and the sweep 5.5 specifies, and not in one that stops
+before them.
+
 **INV-CACHE-3 (pins).** No pinned file is removed by the sweep, and every
 favorites entry is either present with a matching digest, or re-materialisable
 from its `origin`, or reported as unrecoverable. `whirl favorites` prints
 `missing` next to an entry whose file is absent, so the state cannot be invisible.
 
 Check: favourite something, evict everything else by lowering `cache.max_files`
-(never below 1) and leaving `cache.max_bytes` legal, restart, and confirm the
-file survived and `whirl favorites` still lists it.
+(never below 2, the floor 4.3 sets) and leaving `cache.max_bytes` legal, restart,
+and confirm the file survived and `whirl favorites` still lists it.
 
 ### 5.5 The sweep
 
@@ -1212,8 +1249,9 @@ Against this card's criteria:
 - **The eviction rule is a testable invariant that protects the displayed
   image.** INV-CACHE-1 states the bound with its four permitted exceptions and
   names the status keys that carry them; INV-CACHE-2 is stated in the adversarial
-  form on a config that is legal under 5.1 (`cache.max_files` of 1, byte cap at
-  its default) so a reviewer can attempt to break it in three steps without
+  form on a config that is legal under 5.1 (`cache.max_files` at 2, the floor
+  `docs/architecture.md` 4.3 sets, byte cap at its default, `cache.grace_seconds`
+  at 0) so a reviewer can attempt to break it in three steps without
   needing a config the document refuses to run; section 5.3 is the protection
   rule; section 5.5 is the one sweep that
   implements it. The "displayed image is never deleted out from under the
