@@ -997,10 +997,12 @@ rewritten branch.
 ### From a fresh clone to a running daemon
 
 This is the sequence, verified end to end against the scaffold described in the
-status section. No daemon installed, no wallpaper touched.
+status section. No daemon installed, no wallpaper touched. The clone names
+`development`, not `main`: `main` is the default branch and its macOS setter is
+still a stub, so a build from it produces a `whirl` that cannot set a wallpaper.
 
 ```sh
-git clone https://github.com/guruor/whirl
+git clone --branch development https://github.com/guruor/whirl
 cd whirl
 cargo build --workspace
 
@@ -1110,12 +1112,15 @@ naming the directory the daemon looked in. That message is the fastest diagnosis
 of a split install, and the experiment below reproduces it.
 
 **From a checkout.** `cargo install --path` builds the release profile in the
-checkout and copies the binary out. One invocation takes one `--path`, so this is
-three commands; three in one invocation is refused with
-`error: the argument '--path <PATH>' cannot be used multiple times`.
+checkout and copies the binary out. The clone below names `--branch development`
+on purpose: `main` is the default branch, its macOS setter is still a stub, and
+an install taken from it succeeds and then fails at the first rotation with
+`ERR set_failed ... the macOS setter is not implemented yet`. One invocation
+takes one `--path`, so this is three commands; three in one invocation is refused
+with `error: the argument '--path <PATH>' cannot be used multiple times`.
 
 ```sh
-git clone https://github.com/guruor/whirl
+git clone --branch development https://github.com/guruor/whirl
 cd whirl
 
 cargo install --path crates/whirl-cli    --locked   # whirl
@@ -1165,8 +1170,11 @@ else in the archive:
 ```
 
 On a machine with no whirl installed yet there is nothing for `command -v whirld`
-to answer with, and that is fine: `PREFIX` is then simply the directory you choose
-to unpack into. What matters is that it is one directory for all three.
+to answer with, and `dirname ""` is `.`, so that line then evaluates to
+`PREFIX=.` and `tar --extract` unpacks the three binaries into whatever directory
+you are standing in. Set it yourself on that first install
+(`PREFIX=/tmp/whirl-prefix` before the block), or stand in the directory you mean.
+What matters is that it is one directory for all three.
 
 No release has been cut yet (the only one so far is the throwaway prerelease in
 section 5), so this path was verified by building the archive with the workflow's
