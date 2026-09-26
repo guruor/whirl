@@ -982,6 +982,30 @@ mod tests {
     }
 
     #[test]
+    fn each_page_of_a_walk_is_requested_by_its_own_number() {
+        // The two counters above say how many pages were walked. This says the
+        // walk asked for the pages it claims to have walked: a `listing_url`
+        // that dropped the page number would keep every counter above green on
+        // a fixture, because the fake hands out its answers in call order.
+        let text = "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
+                    \"wallhaven\", \"collection\": \"example-user/12345\", \"pages\": 2 } ]\n}\n";
+        let recorded = Recorded::answering(vec![
+            (200, page(&[entry("aaaaaa", 3840, 2160, 10)], 1, 20873)),
+            (200, page(&[entry("bbbbbb", 3840, 2160, 11)], 2, 20873)),
+        ]);
+        let (source, seen) = wallhaven(text, recorded, Box::new(Key(None)));
+        source.enumerate(&context()).expect("the listing is read");
+        let asked = seen.borrow();
+        assert_eq!(asked.len(), 2);
+        assert!(asked[0].0.contains("page=1"), "{}", asked[0].0);
+        assert!(
+            asked[1].0.ends_with("page=2"),
+            "the second request is the second page: {}",
+            asked[1].0
+        );
+    }
+
+    #[test]
     fn an_empty_page_ends_the_walk_and_the_rest_is_counted_as_skipped() {
         let text = "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
                     \"wallhaven\", \"collection\": \"example-user/12345\", \"pages\": 3 } ]\n}\n";
