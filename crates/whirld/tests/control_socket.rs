@@ -300,6 +300,80 @@ fn a_manual_set_runs_the_worker_through_the_noop_backend() {
     );
 }
 
+/// 4.3's cache root, end to end, in the case the defect reported: no
+/// `cache.root` in the config and `WHIRL_CACHE_DIR` in the daemon's environment.
+/// `spawn_daemon` puts every daemon in this file under `<dir>/cache`, so the
+/// environment is what names the root here and the config's `root` is null.
+///
+/// Two things are asserted, not one: the answer (`status`'s `cache_dir:`) and
+/// the filesystem the answer names. The daemon creates its cache root as it
+/// starts and probes it (8.4's `tmp/<run>-probe.part`, written and removed), so
+/// `tmp/` existing is the daemon having really opened the directory it reported,
+/// rather than a string it can print without touching.
+#[test]
+fn the_cache_dir_is_whirl_cache_dir_when_the_config_sets_no_root() {
+    let daemon = start("the_cache_dir_is_whirl_cache_dir_when_the_config_sets_no_root");
+    let config =
+        std::fs::read_to_string(config_path(&daemon)).expect("the config the daemon wrote");
+    assert!(
+        config.contains("\"root\": null"),
+        "the default config this test relies on sets no cache root: {config}"
+    );
+
+    let lines = daemon.ask("status");
+    let environment = daemon.dir.join("cache");
+    assert_eq!(
+        value(&lines, "cache_dir"),
+        environment.display().to_string(),
+        "4.3: the environment beats the compiled default"
+    );
+    assert!(
+        environment.join("tmp").is_dir(),
+        "the daemon created and probed the root it reported"
+    );
+    assert_eq!(
+        value(&lines, "cache_writable"),
+        "1",
+        "the root it probed is writable: {lines:?}"
+    );
+}
+
+/// The same knob with the config file also set: `cache.root` names a second
+/// path inside this test's tree, and `WHIRL_CACHE_DIR` still wins. The file's
+/// root is asserted absent rather than merely unused, because a daemon that read
+/// it would have created it: this is the arm of 4.3 the defect put in doubt
+/// (the compiled default winning over the file, and both losing to the
+/// environment).
+#[test]
+fn whirl_cache_dir_beats_a_cache_root_the_config_file_sets() {
+    let daemon = start_prepared(
+        "whirl_cache_dir_beats_a_cache_root_the_config_file_sets",
+        |dir| {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(
+                    "{{\n  \"cache\": {{ \"root\": \"{}\" }},\n  \"sources\": []\n}}\n",
+                    dir.join("from_the_file").display()
+                ),
+            )
+            .expect("a config that sets cache.root");
+        },
+    );
+
+    let lines = daemon.ask("status");
+    let environment = daemon.dir.join("cache");
+    assert_eq!(
+        value(&lines, "cache_dir"),
+        environment.display().to_string(),
+        "4.3: the environment beats the config file"
+    );
+    assert!(environment.join("tmp").is_dir());
+    assert!(
+        !daemon.dir.join("from_the_file").exists(),
+        "the file's root is not the one the daemon opened"
+    );
+}
+
 #[test]
 fn pause_and_resume_flip_the_flag_and_move_the_sequence() {
     let daemon = start("pause_and_resume_flip_the_flag_and_move_the_sequence");
