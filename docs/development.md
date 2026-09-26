@@ -110,8 +110,8 @@ docs/
                                 and a GitHub Release (section 5)
 .github/release-notes-template.md   the shape of a release's notes, and the sections
                                     a release may not publish without (section 5)
-scripts/ci.sh               the gate: one mode per check, each mode the command the
-                            matching job runs, plus the container and msrv modes
+scripts/ci.sh               the gate: one mode per check, each mode the matching
+                            job's command, plus the container and msrv modes
                             (section 3)
 scripts/gate.Dockerfile     the gate's Linux image: the pinned toolchain plus the
                             pinned cargo-nextest, one pin per architecture
@@ -270,10 +270,28 @@ command behind each mode is written down: there is no second copy of it here.
 
 ### The gate: `scripts/ci.sh`
 
-One script, one mode per check, each mode the matching job's command with the
-same flags. That is the contract: one copy of every command, so a local run and a
-CI run cannot drift, and a check that is not a mode of the script is a preference
+One script, one mode per check. The contract is one copy of every command: each
+mode is the matching job's command with the same flags, so a local run and a CI
+run cannot drift, and a check that is not a mode of the script is a preference
 rather than a gate.
+
+Every job in `.github/workflows/ci.yml` calls one mode, `secrets` excepted
+(section 4), which makes the sentence above a fact about this tree rather than a
+rule to aspire to: `grep -n scripts/ci.sh .github/workflows/ci.yml` prints one
+`run: bash scripts/ci.sh <mode>` per job. It became a fact when card t_438e03b0
+(pull request #30, merged as `92fed1e`) pointed every job at the script and
+installed the pinned `cargo-nextest` on the runners.
+
+The `test` mode is the one to read, because it was the exception until that
+merge: it runs `cargo nextest run --workspace --no-tests=fail` and then
+`cargo test --workspace --doc`, and the `test` job runs `bash scripts/ci.sh
+test`, so both sides run both commands. They are not two spellings of one
+command: nextest runs one process per test, which is what the ETXTBSY class needs
+and what the shared-process harness cannot see, and nextest does not run
+doctests, so the mode runs them separately. While the job inlined `cargo test
+--workspace`, a green `test` here was not evidence about the job and the reverse;
+the machine each one runs on is the only difference left, and `linux` below is
+what closes that one.
 
 Before you push, run one thing:
 
@@ -282,7 +300,9 @@ Before you push, run one thing:
 ```
 
 That is `local` (fmt, clippy, test, artifacts), then `windows`, then `msrv`, then
-`linux`. What each mode proves:
+`linux` (the container's `ubuntu` mode: `clippy`, `test`, `artifacts` and `guards`,
+so `guards` is proved inside the container and not on the host). What each mode
+proves:
 
 | mode | what it proves |
 |---|---|
@@ -293,8 +313,20 @@ That is `local` (fmt, clippy, test, artifacts), then `windows`, then `msrv`, the
 | `guards` | zero third-party dependencies, and the release binaries fit the caps in `docs/architecture.md` R2 |
 | `artifacts` | the release build produces the three binaries |
 | `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
-| `linux` | the ubuntu jobs again, in the gate's container, so a Linux-only failure surfaces here rather than in CI |
-| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails three tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
+| `linux` | CI's `clippy`, `test` and `artifacts` jobs as they run on `ubuntu-latest`, plus `guards`, again in the gate's container, so a Linux-only failure surfaces here rather than in CI. `fmt` is not repeated there: rustfmt's output does not depend on the operating system, and `local` has already run it |
+| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails two tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
+
+**What `all` leaves unproven**, so that the answer is here rather than inferred:
+
+- **the `secrets` job.** No mode covers gitleaks: the scanner is a CI-only binary
+  a contributor cannot run, so its absence is deliberate (section 4). `all` says
+  nothing about it, and a green `all` is not evidence that the scan would pass.
+- **Windows execution.** `windows` compiles for the Windows target and runs
+  nothing; `test (windows-latest)` on a Windows runner is the only thing that runs
+  Windows code, and it is not something this machine can do (below).
+- **`linux-amd64`.** Deliberately outside `all`: on Apple silicon it is emulated
+  and it fails two tests that pass on real x86_64. Run it by hand when a change
+  touches something an architecture decides.
 
 `WHIRL_BACKEND=noop` is not a contributor's business any more: the script sets it
 for the whole of `test` and for `msrv`'s test step, so a new test cannot forget
@@ -304,12 +336,75 @@ the container modes, the 1.85.0 toolchain for `msrv`. There is no fallback from
 `test` to `cargo test`: the two commands prove different things, and the gate does
 not guess.
 
+**From a fresh clone to `./scripts/ci.sh all`, in four prerequisites.** The
+toolchain comes from `rust-toolchain.toml` (rustup installs `1.94.0` on the first
+`cargo` command). `rustup toolchain install 1.85.0 --profile minimal` is what
+`msrv` needs, and that mode's own error prints the command. Docker Desktop is what
+the two container modes need. `windows` compiles for the Windows target, so
+`rustup target add x86_64-pc-windows-msvc` is a prerequisite of `all`: without it
+the mode fails with `error[E0463]: can't find crate for std`, and rustc's own note
+names the `rustup target add` that fixes it (measured on this machine 2026-09-26:
+exit 101 without the target, exit 0 after adding it). `cargo-nextest` is the one
+with no installer in the checkout, so here it is:
+
+```sh
+version=$(sed -n 's/^nextest-version = .*"\([^"]*\)".*$/\1/p' .config/nextest.toml)
+triple=universal-apple-darwin    # macOS, either cpu; Linux amd64: x86_64-unknown-linux-gnu, arm64: aarch64-unknown-linux-gnu
+base="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$version"
+curl -fsSL -O "$base/cargo-nextest-$version-$triple.tar.gz"
+curl -fsSL -O "$base/cargo-nextest-$version-$triple.sha256"
+shasum -a 256 -c "cargo-nextest-$version-$triple.sha256"    # sha256sum -c on Linux
+tar -xzf "cargo-nextest-$version-$triple.tar.gz" -C ~/.local/bin    # any directory on your PATH
+```
+
+That is the prebuilt asset checked against the sha256 the release publishes beside
+it, the same scheme `scripts/gate.Dockerfile` repeats inside the image. Run here
+on 2026-09-26: the checksum line prints `OK`, the binary reports
+`cargo-nextest 0.9.146 (8af696ddc 2026-09-21)`, and its sha256 is
+`7a558b157d164ab4fb6cb1a48cbac5a57b7b8ad99f5d3492eb6eda64faf91df0` — the binary
+this gate has been running.
+`cargo install cargo-nextest --locked --version "$version"` installs the same
+version and costs a build. With those four, nothing else in the gate has to be
+installed, and `./scripts/ci.sh all` is the one command to run.
+
 **What the gate cannot prove: Windows behaviour.** `windows` only compiles.
 Nothing on a Mac and nothing in a Linux container runs Windows code, and the
 `test (windows-latest)` job is the only thing that does. So when a change touches
 path handling, process spawning or the transports, open a draft pull request
 after your first commit: that job is the only Windows signal there is, and a
 green gate is not a promise that CI will be green.
+
+### The gate's container, and what it leaves behind
+
+`linux` and `linux-amd64` run `scripts/gate.Dockerfile`'s image. The repository
+owns that Dockerfile because the stock `rust` image has no `cargo-nextest`: a
+container mode built on the stock image could not run the test suite at all. The
+base image is pinned by OCI index digest and each architecture's `cargo-nextest`
+binary by the sha256 the release publishes next to it, and `scripts/ci.sh` builds
+the tag from both pins, so changing either builds a new image rather than reusing
+the old one.
+
+Two image-and-volume pairs are left on the machine on purpose, one per
+architecture the gate has run on:
+
+- `whirl-gate:<toolchain>-<nextest>-<arch>`, here
+  `whirl-gate:1.94.0-0.9.146-arm64` and `whirl-gate:1.94.0-0.9.146-amd64`;
+- `whirl-gate-target-<arch>`, the container's `CARGO_TARGET_DIR`. One volume per
+  architecture, because a shared volume would invalidate every fingerprint each
+  time the gate switched between arm64 and amd64.
+
+They are warm caches: the second run of a mode is seconds instead of a rebuild.
+To give the disk back, both filters were checked against this machine's own docker
+output on 2026-09-26 (two images, two volumes):
+
+```sh
+docker images --filter=reference='whirl-gate:*' -q | xargs docker rmi
+docker volume ls -q --filter name=whirl-gate-target | xargs docker volume rm
+```
+
+The next container run rebuilds the image and repopulates the volume. The pinned
+`rust` base image stays as well; removing it is a separate `docker rmi` once
+nothing built from it is left.
 
 ### What CI cannot prove, and who proves it instead
 
@@ -362,9 +457,18 @@ before opening a pull request is a mode of `scripts/ci.sh` (section 3), and each
 mode is the matching job's command, verbatim.** A check that is not a mode of the
 script is a preference, not a gate: adding one means adding the mode and the job
 that calls it, in the same pull request. Every job in this workflow calls one
-mode, so there is no second copy of a command to keep in step. `secrets` is the
-one job the script does not own, and the reason is in the script's own header:
-gitleaks' pinned binary is not something a contributor can run by hand.
+mode, so there is no second copy of a command to keep in step. The `test` job
+inlined `cargo test --workspace` when this rule was written, and it was the one
+exception the rule had to name; it now runs `bash scripts/ci.sh test` like the
+rest (card t_438e03b0, pull request #30, merged as `92fed1e`), so there is no
+exception left to name.
+
+**The other CI gate with no mode is a deliberate exclusion, not a gap:** `secrets`
+(gitleaks) installs a release binary and scans the commits a change adds, and a
+contributor cannot run that scanner on their machine, so there is no honest mode
+to write and none is pretended. Its consequence is stated where it belongs: `all`
+does not cover it, and section 3 lists it among the three things `all` leaves
+unproven.
 
 Caching is `Swatinem/rust-cache`, pinned like every other action here. It caches
 `~/.cargo` and `./target`, and it keys them on the job, on the rustc release and

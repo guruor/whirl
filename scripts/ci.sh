@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
 # Whirl's one gate: one mode per check, and each mode is the command the
-# matching job in .github/workflows/ci.yml runs, with the same flags. A local
-# run and a CI run cannot drift apart, because there is one copy of every
-# command (docs/development.md, "The gate" in section 3).
+# matching job in .github/workflows/ci.yml runs, with the same flags, so there
+# is one copy of every command and a local run and a CI run cannot drift apart
+# (docs/development.md, "The gate" in section 3).
+#
+# Every job calls one of these modes, which is what makes the sentence above
+# checkable rather than aspirational: each job in the workflow is a
+# `run: bash scripts/ci.sh <mode>` step. The one job that does not call a mode is
+# `secrets`, and that is deliberate rather than a gap: it installs gitleaks and
+# refuses to run on a contributor's machine, so there is no honest mode to write
+# (docs/development.md section 4).
+#
+# `test` was the one exception to the identity until card t_438e03b0 (pull
+# request #30) landed, so it is the mode to read first: it is `cargo nextest run
+# --workspace --no-tests=fail` then `cargo test --workspace --doc`, and the
+# `test` job now runs this mode instead of inlining `cargo test --workspace`.
+# Those are two harnesses, not two spellings of one: nextest runs one process per
+# test, which is what the ETXTBSY class needs and which the shared-process
+# harness cannot see, and nextest does not run doctests, so the mode runs them
+# separately. CI's runner gets cargo-nextest from the pinned
+# taiki-e/install-action step in the workflow, at the version .config/nextest.toml
+# requires here.
 #
 #   ./scripts/ci.sh fmt          cargo fmt --all -- --check
 #   ./scripts/ci.sh clippy       cargo clippy --workspace --all-targets -- -D warnings
@@ -12,7 +30,7 @@
 #   ./scripts/ci.sh artifacts    cargo build --workspace --release
 #   ./scripts/ci.sh windows      cross-check the #[cfg(windows)] code (compile only)
 #   ./scripts/ci.sh local        fmt clippy test artifacts, on this machine
-#   ./scripts/ci.sh linux        the ubuntu jobs in the gate's container, this machine's arch
+#   ./scripts/ci.sh linux        clippy, test, artifacts and guards again, in the gate's container (this machine's arch)
 #   ./scripts/ci.sh linux-amd64  the same, pinned to the runners' x86_64, emulated on Apple silicon
 #   ./scripts/ci.sh all          local, windows, msrv, then linux
 #
@@ -27,7 +45,8 @@ cd "$root"
 die() { printf 'ci.sh: %s\n' "$*" >&2; exit 2; }
 
 need() {
-  command -v "$1" >/dev/null 2>&1 || die "$1 is required for the '$2' mode"
+  # $3, when given, is where the reader finds the install or the fix.
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required for the '$2' mode${3:+: $3}"
 }
 
 # The MSRV here and `rust-version` in Cargo.toml are the same number; the
@@ -70,32 +89,32 @@ esac
 # endianness, or anything that assumes `usize` is 8 bytes.
 LINUX_PLATFORM="linux/amd64"
 
-# Three tests fail under linux/amd64 emulation and pass on real x86_64,
+# Two tests fail under linux/amd64 emulation and pass on real x86_64,
 # deterministically over repeats, with the daemon child logging nothing:
 #
 #   whirld::control_socket a_failed_rotation_is_visible_on_both_planes
 #   whirld::control_socket subscribe_streams_one_event_per_state_change
 #       both "the daemon closed the connection early"
-#   whirld::bin/whirld worker::tests::a_spawn_that_finds_the_script_busy_is_retried
-#       "a script that is busy for 100 ms is not a failed spawn:
-#        Err(Failed { code: WorkerFailed, message: 'the worker exited non-zero
-#        with no message' })"
 #
-# Measured 2026-09-26 on this arm64 host, three runs, the same three every time:
+# Measured 2026-09-26 on this arm64 host at this head, one run, the same two as
+# every earlier run:
 #
 #   ./scripts/ci.sh linux-amd64
-#   -> exit 100, 155 tests run (with .config/nextest.toml's fail-fast = false),
-#      152 passed, 3 failed
+#   -> exit 100, 157 tests run (with .config/nextest.toml's fail-fast = false),
+#      155 passed, 2 failed
 #
-# while all three pass in the same image without --platform (arm64), on macOS,
-# and in CI's own jobs on real x86_64 (run 36222311613: ubuntu-latest,
-# macos-latest and msrv all report them ok). t_62920980 owns the diagnosis and
-# the fix for the two control_socket tests; the worker test arrived with
-# t_7e9836df's new test, after that card measured "exactly two". Until those
-# land, this mode exits non-zero on a clean tree and those three failures are
-# expected: nothing is filtered out and nothing is skipped, and the mode prints
-# the names, the reason and the card on every run, so a red is understood rather
-# than ignored.
+# while both pass in the same image without --platform (arm64), on macOS, and in
+# CI's own jobs on real x86_64 (run 36222311613: ubuntu-latest, macos-latest and
+# msrv all report them ok). t_62920980 owns the diagnosis and the fix. A third
+# name was on this list while this branch was written,
+# whirld::bin/whirld worker::tests::a_spawn_that_finds_the_script_busy_is_retried,
+# which t_7e9836df added after that card measured "exactly two"; it passes under
+# emulation at this head, because development's dec136e (t_43827dc5) makes the
+# test ask the guest for the kernel's refusal instead of assuming emulation
+# reports it. Until the two control_socket fixes land, this mode exits non-zero on
+# a clean tree with those two failures expected: nothing is filtered out and
+# nothing is skipped, and the mode prints the names, the reason and the card on
+# every run, so a red is understood rather than ignored.
 
 usage() {
   # The mode table above, printed from this file rather than repeated here.
@@ -108,7 +127,7 @@ fmt() { cargo fmt --all -- --check; }
 clippy() { cargo clippy --workspace --all-targets -- -D warnings; }
 
 test_suite() {
-  need cargo-nextest test
+  need cargo-nextest test "docs/development.md, \"The gate\", has the install, and the version is this repo's pin"
   # A test that rotates must never reach a real desktop; CI sets this for the
   # whole job so that a new test cannot forget it, and so does this file.
   export WHIRL_BACKEND=noop
@@ -235,14 +254,13 @@ in_the_container() {
 }
 
 amd64_note() {
-  printf 'ci.sh: this run is emulated x86_64, and three tests are expected to fail in it:\n' >&2
+  printf 'ci.sh: this run is emulated x86_64, and two tests are expected to fail in it:\n' >&2
   printf '          whirld::control_socket a_failed_rotation_is_visible_on_both_planes\n' >&2
   printf '          whirld::control_socket subscribe_streams_one_event_per_state_change\n' >&2
-  printf '          whirld::bin/whirld worker::tests::a_spawn_that_finds_the_script_busy_is_retried\n' >&2
-  printf '        all three pass on real x86_64 (CI run 36222311613) and natively here; card t_62920980 owns the\n' >&2
-  printf '        two control_socket ones, and the worker one came with t_7e9836df after that card measured\n' >&2
-  printf '        "exactly two". Nothing is skipped: the run is the whole suite and it exits non-zero until\n' >&2
-  printf '        those land, which is why this mode is opt-in and not part of local or all.\n' >&2
+  printf '        both pass on real x86_64 (CI run 36222311613) and natively here; card t_62920980 owns the\n' >&2
+  printf '        diagnosis and the fix. The worker busy-spawn test was a third until dec136e made it ask the\n' >&2
+  printf '        guest, so it passes here now. Nothing is skipped: the run is the whole suite and it exits\n' >&2
+  printf '        non-zero until the two land, which is why this mode is opt-in and not part of local or all.\n' >&2
 }
 
 on_the_runner() {

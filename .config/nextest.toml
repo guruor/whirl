@@ -1,24 +1,33 @@
 # cargo-nextest's repository configuration: nextest reads it from the workspace
-# root, and it is checked in so that CI and a laptop run the same suite.
+# root, and it is checked in so that the version, the fail-fast rule and the retry
+# policy are one decision for the repository instead of a flag on someone's
+# command line.
 #
 # Every key here is nextest 0.9.146's. The file was run, not only schema-checked:
-# `./scripts/ci.sh test` (155 tests, green) reads it, `linux-amd64` shows
+# `./scripts/ci.sh test` (157 tests, green) reads it, `linux-amd64` shows
 # fail-fast below taking effect, and raising `required` refuses to run at all.
 # The reference is nextest's published schema for the released version,
 # https://nexte.st/schemas/repo-config.json (the schema is generated from
 # nextest's own config parser and each level sets "additionalProperties":
 # false, so a key that is not nextest's is a schema error).
 
-# The runner version is pinned the way rust-toolchain.toml pins the compiler:
-# one version, CI and laptop the same. scripts/gate.Dockerfile installs this
-# version into the gate's image, and reads the same pin in scripts/ci.sh for the
-# image tag.
+# The runner version is pinned the way rust-toolchain.toml pins the compiler: one
+# version, one home, and `required` makes any other nextest refuse to run instead
+# of running with different rules. Four places consume this pin: the gate's image
+# (scripts/gate.Dockerfile installs this version), scripts/ci.sh (which reads it
+# for the image tag), a developer's host, where scripts/ci.sh stops with a remedy
+# if it is missing (docs/development.md section 3 has the install), and CI's
+# `test` job, which runs `bash scripts/ci.sh test` and installs this exact version
+# through the pinned `taiki-e/install-action` step (`cargo-nextest@0.9.146`; card
+# t_438e03b0, pull request #30, merged as `92fed1e`). CI, the gate's container and
+# a laptop therefore run the suite from this file and this version.
 nextest-version = { required = "0.9.146" }
 
 [profile.default]
 # A failure must not hide the other tests. The ubuntu, macOS and Windows jobs
 # each report every failure from one run: without this, nextest stops scheduling
-# after the first failure and the run reports "90/155 tests run".
+# after the first failure and the run reports a partial count, how far it got,
+# instead of every failure in the suite.
 fail-fast = false
 
 # A test still running after one slow period is named in the output; ten slow
