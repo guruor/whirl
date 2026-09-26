@@ -148,3 +148,35 @@ WHIRL_BACKEND=noop cargo test --workspace   # macOS 26.5.2, arm64, rustc 1.94.0
 
 One commit, the same two tests, three environments: red only in the translated
 amd64 guest.
+
+## 3. Does CI run these two tests on x86_64? Yes, and it is green
+
+The workflow says so. `.github/workflows/ci.yml:73-77` is the `test` job,
+`runs-on: ${{ matrix.os }}` with `os: [ubuntu-latest, macos-latest,
+windows-latest]`, and line 92 is its only test step:
+
+    - name: cargo test --workspace
+      run: cargo test --workspace
+
+Both tests are plain `#[test]`s in `crates/whirld/tests/control_socket.rs`
+(`subscribe_streams_one_event_per_state_change` at 1059,
+`a_failed_rotation_is_visible_on_both_planes` at 1160): no `#[ignore]`, no
+`#[cfg]`, so that step runs them, and `ubuntu-latest` is x86_64.
+
+A recent green run says the same. `gh run list` picks run `36221809231`:
+workflow `ci`, event `push` on `development`, head
+`91498bbadb0c086142116d0de95098f5847b8bd5`, conclusion `success`, all thirteen
+jobs `success`.
+
+```sh
+gh run view 36221809231 -R guruor/whirl --log > run.log
+grep "^test (ubuntu-latest)" run.log
+```
+
+    1698: test (ubuntu-latest)  Install the pinned toolchain ...  Default host: x86_64-unknown-linux-gnu
+    1701: test (ubuntu-latest)  Install the pinned toolchain ...  info: syncing channel updates for 1.94.0-x86_64-unknown-linux-gnu
+    1937: test (ubuntu-latest)  cargo test --workspace  ...  test a_failed_rotation_is_visible_on_both_planes ... ok
+    1944: test (ubuntu-latest)  cargo test --workspace  ...  test subscribe_streams_one_event_per_state_change ... ok
+
+The job that runs them is x86_64, it runs both of them, and it is green. So
+there is no CI hole: the platform is not what is wrong, the translation is.
