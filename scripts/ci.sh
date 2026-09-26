@@ -4,18 +4,23 @@
 # is one copy of every command and a local run and a CI run cannot drift apart
 # (docs/development.md, "The gate" in section 3).
 #
-# One mode is deliberately not yet the command its job runs, and this comment is
-# the whole of the difference. `test` here is `cargo nextest run --workspace
-# --no-tests=fail` then `cargo test --workspace --doc`; the `test` job still
-# inlines `cargo test --workspace`. Those are two harnesses, not two spellings of
-# one: nextest runs one process per test, which is what the ETXTBSY class needs
-# and which the shared-process harness cannot see; nextest does not run doctests,
-# so the mode runs them separately; and a test that passes only while it inherits
-# another test's state passes in CI and fails here. A green `test` here is
-# therefore not evidence about the `test` job, and the other way round. The
-# wiring pull request (card t_438e03b0; pull request #30, open and unmerged at
-# this commit) points every job at these modes and installs the pinned
-# cargo-nextest on the runners, and the identity then holds by construction.
+# Every job calls one of these modes, which is what makes the sentence above
+# checkable rather than aspirational: each job in the workflow is a
+# `run: bash scripts/ci.sh <mode>` step. The one job that does not call a mode is
+# `secrets`, and that is deliberate rather than a gap: it installs gitleaks and
+# refuses to run on a contributor's machine, so there is no honest mode to write
+# (docs/development.md section 4).
+#
+# `test` was the one exception to the identity until card t_438e03b0 (pull
+# request #30) landed, so it is the mode to read first: it is `cargo nextest run
+# --workspace --no-tests=fail` then `cargo test --workspace --doc`, and the
+# `test` job now runs this mode instead of inlining `cargo test --workspace`.
+# Those are two harnesses, not two spellings of one: nextest runs one process per
+# test, which is what the ETXTBSY class needs and which the shared-process
+# harness cannot see, and nextest does not run doctests, so the mode runs them
+# separately. CI's runner gets cargo-nextest from the pinned
+# taiki-e/install-action step in the workflow, at the version .config/nextest.toml
+# requires here.
 #
 #   ./scripts/ci.sh fmt          cargo fmt --all -- --check
 #   ./scripts/ci.sh clippy       cargo clippy --workspace --all-targets -- -D warnings
@@ -91,12 +96,12 @@ LINUX_PLATFORM="linux/amd64"
 #   whirld::control_socket subscribe_streams_one_event_per_state_change
 #       both "the daemon closed the connection early"
 #
-# Measured 2026-09-26 on this arm64 host, three runs at this head, the same two
-# every time:
+# Measured 2026-09-26 on this arm64 host at this head, one run, the same two as
+# every earlier run:
 #
 #   ./scripts/ci.sh linux-amd64
-#   -> exit 100, 156 tests run (with .config/nextest.toml's fail-fast = false),
-#      154 passed, 2 failed
+#   -> exit 100, 157 tests run (with .config/nextest.toml's fail-fast = false),
+#      155 passed, 2 failed
 #
 # while both pass in the same image without --platform (arm64), on macOS, and in
 # CI's own jobs on real x86_64 (run 36222311613: ubuntu-latest, macos-latest and

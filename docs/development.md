@@ -111,8 +111,8 @@ docs/
 .github/release-notes-template.md   the shape of a release's notes, and the sections
                                     a release may not publish without (section 5)
 scripts/ci.sh               the gate: one mode per check, each mode the matching
-                            job's command (section 3 names the one deliberate
-                            difference), plus the container and msrv modes
+                            job's command, plus the container and msrv modes
+                            (section 3)
 scripts/gate.Dockerfile     the gate's Linux image: the pinned toolchain plus the
                             pinned cargo-nextest, one pin per architecture
 .config/nextest.toml        the test runner's repository config: the version, the
@@ -273,23 +273,25 @@ command behind each mode is written down: there is no second copy of it here.
 One script, one mode per check. The contract is one copy of every command: each
 mode is the matching job's command with the same flags, so a local run and a CI
 run cannot drift, and a check that is not a mode of the script is a preference
-rather than a gate. One mode is deliberately not its job's command at this
-commit, and it is the one with the most to prove:
+rather than a gate.
 
-- the `test` job in `.github/workflows/ci.yml` runs `cargo test --workspace`;
-- the `test` mode here runs `cargo nextest run --workspace --no-tests=fail` and
-  then `cargo test --workspace --doc`.
+Every job in `.github/workflows/ci.yml` calls one mode, `secrets` excepted
+(section 4), which makes the sentence above a fact about this tree rather than a
+rule to aspire to: `grep -n scripts/ci.sh .github/workflows/ci.yml` prints one
+`run: bash scripts/ci.sh <mode>` per job. It became a fact when card t_438e03b0
+(pull request #30, merged as `92fed1e`) pointed every job at the script and
+installed the pinned `cargo-nextest` on the runners.
 
-Different harnesses, not two spellings of one command: nextest runs one process
-per test, which is what the ETXTBSY class needs and what the shared-process
-harness cannot see; nextest does not run doctests, so the mode runs them
-separately; and a test that passes only while it inherits another test's state
-passes in CI and fails here. A green `test` here is therefore not evidence about
-the `test` job, and a green `test (ubuntu-latest)` in CI is not evidence about
-this mode. The wiring pull request (card t_438e03b0; pull request #30, open and
-unmerged at this commit) rewires every job to call these modes and installs the
-pinned `cargo-nextest` on CI's runners, which makes the mode and the job the same
-command; the rule at the end of section 4 is the frame this exception sits in.
+The `test` mode is the one to read, because it was the exception until that
+merge: it runs `cargo nextest run --workspace --no-tests=fail` and then
+`cargo test --workspace --doc`, and the `test` job runs `bash scripts/ci.sh
+test`, so both sides run both commands. They are not two spellings of one
+command: nextest runs one process per test, which is what the ETXTBSY class needs
+and what the shared-process harness cannot see, and nextest does not run
+doctests, so the mode runs them separately. While the job inlined `cargo test
+--workspace`, a green `test` here was not evidence about the job and the reverse;
+the machine each one runs on is the only difference left, and `linux` below is
+what closes that one.
 
 Before you push, run one thing:
 
