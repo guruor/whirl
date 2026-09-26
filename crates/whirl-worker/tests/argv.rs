@@ -51,13 +51,25 @@ fn json_string(value: &str) -> String {
 }
 
 /// One worker run: the five variables of section 7 plus the argv contract.
+///
+/// Two of the five are named rather than left to `HOME`, because `HOME` is only
+/// where 4.3's default lives on unix. On Windows the same two names resolve from
+/// `%LOCALAPPDATA%` (`paths::local_appdata`), which nothing here sets, so the
+/// tests of this binary shared the runner's real `state/locks/rotate.lock` and
+/// one of them reported `busy` against another's worker. Naming them puts every
+/// root of every spawn inside this test's own directory on every platform, and
+/// leaves the platform default unreached rather than merely elsewhere: 4.3 reads
+/// `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` **before** the default.
 fn run(config: &Path, args: &[&str]) -> Output {
+    let dir = config.parent().expect("a parent");
     Command::new(worker())
         .arg("--config")
         .arg(config)
         .args(args)
         .env("WHIRL_BACKEND", "noop")
-        .env("HOME", config.parent().expect("a parent"))
+        .env("WHIRL_STATE_DIR", dir.join("state"))
+        .env("WHIRL_CACHE_DIR", dir.join("cache"))
+        .env("HOME", dir)
         .output()
         .expect("the worker runs")
 }
