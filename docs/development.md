@@ -419,7 +419,13 @@ the number is the vendor's to change and ours to re-check.
   moves on its own schedule. The greeting carries both, so a stale client fails
   fast with a message instead of behaving strangely.
 - **A release is a git tag `vX.Y.Z` on `main`,** plus the artifacts the tag
-  workflow builds from it (below). No branch is a release. The notes are written
+  workflow builds from it (below). No branch is a release. The rule is not prose
+  only: the `guard` job in `.github/workflows/release.yml` fails unless the
+  tagged commit is an ancestor of `origin/main`, and the build and publish jobs
+  wait behind it (`needs:`), so a tag pushed on any other branch publishes
+  nothing. Ancestry is the question a tag push can be asked, and it admits both
+  legitimate tags: one at `main`'s tip, and one that `main` has moved ahead of
+  since it was cut. The notes are written
   *before* the tag, not after it, because the workflow publishes them from the
   tagged commit: they must include what changed, the per-platform checklist
   results (section 3), and any config key added, removed or defaulted differently.
@@ -462,6 +468,7 @@ is this document's procedure in executable form:
 
 | step | what happens |
 |---|---|
+| guard | the first job, and the one the other two wait behind: it fails unless the tagged commit is an ancestor of `origin/main`, printing the tag, the tagged commit, `origin/main` and what the ancestry check found. A tag on any other branch stops here, with nothing built and no release created |
 | build | `cargo build --workspace --release` on `ubuntu-latest`, `macos-latest` and `windows-latest`: the command the `artifacts` job runs, and the same three binaries per platform |
 | package | one archive per platform, `whirl-<tag>-<os>-<arch>.<ext>`, and the run fails if the runner's architecture is not the one the archive name claims, because a mislabelled artifact is worse than a missing one |
 | notes | `docs/releases/<tag>.md` from the tagged commit. A `vX.Y.Z-rc.N` tag with no such file is rendered from `.github/release-notes-template.md`, placeholders and all, which is what the prerelease flag says out loud. A final release with no notes file is refused, and so is a file that is missing a required section or still holds a placeholder |
@@ -478,11 +485,12 @@ Three consequences worth stating:
   deleting a tag that someone may already have fetched, which is the kind of
   manual repair this workflow exists to remove.
 
-The workflow does not run the test suite, and does not need to: the tagged commit
-is `main`'s tip, which is a promotion's merge commit, and `ci.yml` has already run
-the whole matrix on it, both on the promotion pull request and on the push to
-`main` the merge produced. The tag is the last step of a procedure that starts
-with a green `development`, not a substitute for it.
+The workflow does not run the test suite, and does not need to: the `guard` job
+has established that the tagged commit is on `main`, it is a promotion's merge
+commit, and `ci.yml` has already run the whole matrix on it, both on the
+promotion pull request and on the push to `main` the merge produced. The tag is
+the last step of a procedure that starts with a green `development`, not a
+substitute for it.
 
 ### Cutting a release, step by step
 
