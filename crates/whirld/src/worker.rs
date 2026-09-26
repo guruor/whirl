@@ -10,7 +10,7 @@
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use whirl_core::config::Backend;
 use whirl_core::protocol::{self, ErrorCode, SetRecord, Via};
@@ -127,6 +127,33 @@ const SPAWN_ATTEMPTS: usize = 10;
 /// first attempt with today's message and today's immediacy.
 const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(50);
 
+/// The spawn, with the `ETXTBSY` retry of `SPAWN_ATTEMPTS` and
+/// `SPAWN_RETRY_PAUSE` around it, and nothing else around it: a refusal the
+/// kernel made for any other reason comes back on the first attempt.
+///
+/// The retry is this function rather than a loop inside `Worker::run` so that it
+/// can also be shown working where no kernel refusal reaches the caller, which is
+/// every guest but a native Linux one (the test module measures which, and
+/// `a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds` is the test that
+/// runs on all of them): the caller supplies `spawn`, so a test's closure can
+/// refuse with `ETXTBSY` as many times as it likes.
+fn spawn_with_retry(mut spawn: impl FnMut() -> std::io::Result<Child>) -> std::io::Result<Child> {
+    let mut attempt = 1;
+    loop {
+        match spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
+                if attempt >= SPAWN_ATTEMPTS {
+                    return Err(error);
+                }
+                attempt += 1;
+                std::thread::sleep(SPAWN_RETRY_PAUSE);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub struct Worker {
     program: PathBuf,
     config_path: PathBuf,
@@ -198,31 +225,18 @@ impl Worker {
         // `ETXTBSY` is the kernel refusing before anything ran, so a retry costs
         // nothing and a report would be about a worker that never existed. Every
         // other refusal is today's first-attempt failure.
-        let mut attempt = 1;
-        let mut child = loop {
-            match command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(child) => break child,
-                Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
-                    if attempt >= SPAWN_ATTEMPTS {
-                        return Err(WorkerError::Failed {
-                            code: ErrorCode::WorkerFailed,
-                            message: format!("cannot spawn {}: {error}", self.program.display()),
-                        });
-                    }
-                    attempt += 1;
-                    std::thread::sleep(SPAWN_RETRY_PAUSE);
-                }
-                Err(error) => {
-                    return Err(WorkerError::Failed {
-                        code: ErrorCode::WorkerFailed,
-                        message: format!("cannot spawn {}: {error}", self.program.display()),
-                    });
-                }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match spawn_with_retry(|| command.spawn()) {
+            Ok(child) => child,
+            Err(error) => {
+                return Err(WorkerError::Failed {
+                    code: ErrorCode::WorkerFailed,
+                    message: format!("cannot spawn {}: {error}", self.program.display()),
+                });
             }
         };
 
@@ -355,6 +369,7 @@ fn terminate(child: &mut std::process::Child) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
@@ -917,6 +932,72 @@ mod tests {
     /// first spawn.
     const WRITER_HELD: Duration = Duration::from_millis(100);
 
+    /// `None` when this guest refuses an exec of a script that is held open for
+    /// write, which is the case the test below asserts on; `Some(reason)` when it
+    /// does not, which is a platform fact that test reports rather than fails on.
+    ///
+    /// The question is asked by attempting the exec, because there are three
+    /// platforms behind it and only one of them is Linux:
+    ///
+    /// - Linux refuses the call: `deny_write_access` on the exec target returns
+    ///   `ETXTBSY`, which `Command::spawn` hands back as
+    ///   `ErrorKind::ExecutableFileBusy`.
+    /// - Darwin does not enforce the rule at all, so the script runs and the child
+    ///   exits 0. That is why the test below has always been vacuous on macOS.
+    /// - The emulated amd64 guest does enforce the rule - a hand-written
+    ///   `fork`+`execv` in that same guest still prints `Text file busy` - but the
+    ///   refusal never reaches the caller: `Command::spawn` on Linux is glibc's
+    ///   `posix_spawnp`, and under the translation the errno of a failed exec is
+    ///   lost, so `posix_spawnp` returns 0 and `spawn` returns a child that exits
+    ///   127 (glibc's `SPAWN_ERROR`) having written nothing to either stream.
+    ///   Measured for every exec failure and not only this one - a missing file, a
+    ///   mode-0644 file and a directory all come back the same way - so on that
+    ///   guest no test can see a spawn failure through `Command::spawn` at all.
+    ///
+    /// The probe's script is `exit 0`, so a guest that runs it leaves a child that
+    /// exited 0 with nothing on either stream, and any other outcome is this
+    /// helper's own failure rather than a result to interpret.
+    fn why_the_busy_exec_is_not_refused(scripts: &Scripts) -> Option<&'static str> {
+        let program = scripts.script("exec-probe.sh", "#!/bin/sh\nexit 0\n");
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .expect("a writable handle on the probe script");
+
+        let started = Command::new(&program)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let answer = match started {
+            Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => None,
+            Err(error) => panic!(
+                "the probe's exec of a busy script failed with {error}, which is not the kernel's \
+                 ETXTBSY refusal"
+            ),
+            Ok(child) => {
+                let output = child.wait_with_output().expect("the probe child's output");
+                match output.status.code() {
+                    Some(0) => Some(
+                        "this kernel does not refuse an exec of a file held open for write (Darwin)",
+                    ),
+                    Some(127) if output.stdout.is_empty() && output.stderr.is_empty() => Some(
+                        "this guest cannot report an exec failure through Command::spawn (the \
+                         emulated amd64 translation loses glibc's posix_spawnp errno), so the \
+                         refusal never reaches the caller",
+                    ),
+                    code => panic!(
+                        "the probe child exited {code:?} with stdout {:?} and stderr {:?}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                }
+            }
+        };
+        drop(writer);
+        answer
+    }
+
     /// A spawn the kernel refuses with `ETXTBSY` is re-attempted, and the retry
     /// really runs the worker: the assertion is the parsed `Outcome::Set` and its
     /// fields, not "the spawn did not return an error".
@@ -931,11 +1012,25 @@ mod tests {
     /// writer here stands in for it: the same kernel rule, the same refusal, the
     /// same release.
     ///
-    /// Darwin does not enforce the rule at all, so on macOS this test is vacuous
-    /// (the first spawn simply succeeds); only Linux makes it bite.
+    /// The assertion runs only where the kernel's refusal reaches this process,
+    /// which `busy_exec` measures first: Darwin does not enforce the rule at all,
+    /// and the emulated amd64 guest enforces it with a kernel whose answer never
+    /// arrives here. Both print the reason and return, so a green run on those
+    /// guests says nothing about the retry; the retry itself is asserted on every
+    /// guest by `a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds`, which
+    /// is the test to read for the loop's behaviour rather than for its end.
     #[test]
     fn a_spawn_that_finds_the_script_busy_is_retried() {
         let scripts = Scripts::new("busy");
+
+        if let Some(reason) = why_the_busy_exec_is_not_refused(&scripts) {
+            eprintln!(
+                "note: {reason}; the retry is not exercised end to end here, and \
+                 a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds covers it"
+            );
+            return;
+        }
+
         let digest = "c".repeat(64);
         let program = scripts.script(
             "busy.sh",
@@ -966,5 +1061,70 @@ mod tests {
             }
             other => panic!("a script that is busy for 100 ms is not a failed spawn: {other:?}"),
         }
+    }
+
+    /// The retry loop itself: a spawn refused with `ETXTBSY` is attempted again
+    /// until it succeeds, a refusal that is not `ETXTBSY` comes back on the first
+    /// attempt, and after `SPAWN_ATTEMPTS` the caller sees the last refusal.
+    ///
+    /// The refusals here are the closure's rather than a kernel's, and that is what
+    /// makes this the half of the retry's coverage which runs everywhere: the
+    /// emulated amd64 guest cannot report an exec failure through `Command::spawn`
+    /// at all, and on Darwin the kernel never refuses the exec, so on both of them
+    /// `a_spawn_that_finds_the_script_busy_is_retried` prints its reason and
+    /// returns without asserting anything. The end-to-end case stays there, with
+    /// its writer, its kernel rule and its parsed `Outcome::Set` unchanged.
+    ///
+    /// The budget is the real one, so this test is asleep for about 550 ms by
+    /// design: nine 50 ms pauses in the exhausted case and two in the retried one.
+    #[test]
+    fn a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds() {
+        // 26 is `ETXTBSY` on Linux and on Darwin, and it is the errno the kernel
+        // returns; asking the mapping out loud is what keeps this test from
+        // passing for the wrong reason if that is ever not true.
+        let busy = || {
+            let error = io::Error::from_raw_os_error(26);
+            assert_eq!(
+                error.kind(),
+                ErrorKind::ExecutableFileBusy,
+                "26 must be ETXTBSY here, or this test refuses nothing"
+            );
+            error
+        };
+
+        // Two refusals, and then the spawn the retry is there to reach.
+        let mut attempts = 0;
+        let mut child = spawn_with_retry(|| {
+            attempts += 1;
+            if attempts <= 2 {
+                return Err(busy());
+            }
+            Command::new("/bin/sh").arg("-c").arg("exit 0").spawn()
+        })
+        .expect("the third attempt runs the program");
+        assert_eq!(attempts, 3, "the first success ends the retry");
+        assert!(child.wait().expect("the worker").success());
+
+        // Refusals that do not stop: the caller gets the last one unwrapped, and
+        // `SPAWN_ATTEMPTS` is the whole budget.
+        let mut attempts = 0;
+        let error = spawn_with_retry(|| {
+            attempts += 1;
+            Err::<Child, io::Error>(busy())
+        })
+        .expect_err("ten refusals are not a spawn");
+        assert_eq!(attempts, SPAWN_ATTEMPTS);
+        assert_eq!(error.kind(), ErrorKind::ExecutableFileBusy);
+
+        // Every other errno returns on the first attempt: the retry is for the
+        // kernel refusing before anything ran, not for a spawn that failed.
+        let mut attempts = 0;
+        let error = spawn_with_retry(|| {
+            attempts += 1;
+            Err::<Child, io::Error>(io::Error::from_raw_os_error(2))
+        })
+        .expect_err("a missing program is not a spawn");
+        assert_eq!(attempts, 1, "only ETXTBSY is retried");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 }
