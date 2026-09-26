@@ -903,15 +903,28 @@ fn boxes(bytes: &[u8], from: usize, to: usize) -> Vec<BoxHeader> {
         let Ok(size) = usize::try_from(size) else {
             break;
         };
-        if size < header || at + size > end {
+        // The size is the file's own field (`largesize` is a `u64` nothing
+        // bounds), and both uses below are additions to `at`, so it is bounded
+        // *before* either of them. `at + size` on a `largesize` near `u64::MAX`
+        // is an addition the input supplies the terms of: in debug it panics
+        // (`attempt to add with overflow`, the profile `cargo test` builds), and
+        // in release it wraps to a small number, which the walk below steps by -
+        // landing back at the box it just read and re-reading it forever. The
+        // loop keeps `at <= end`, so `next > end` is exactly `at + size > end`
+        // (equivalently `size > end - at`, which is the subtraction that cannot
+        // overflow) and is what "runs past the parent" in the doc comment means.
+        let Some(next) = at.checked_add(size) else {
+            break;
+        };
+        if size < header || next > end {
             break;
         }
         out.push(BoxHeader {
             kind: [bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]],
             payload: at + header,
-            end: at + size,
+            end: next,
         });
-        at += size;
+        at = next;
     }
     out
 }
@@ -2289,6 +2302,19 @@ mod tests {
         bytes
     }
 
+    /// A box that declares its real size in the 64-bit `largesize` field: a
+    /// 32-bit size of `1`, the type, then the size the file chooses (ISO/IEC
+    /// 14496-12 4.2). The payload is whatever the caller passes; the declared
+    /// size is the caller's number, not the payload's length, which is the point
+    /// of the tests that use it.
+    fn boxed_large(kind: &[u8; 4], largesize: u64, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = 1u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(&largesize.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
     /// The file type box every HEIC starts with: a major brand and a compatible
     /// one, which is all `is_heic` reads.
     fn ftyp() -> Vec<u8> {
@@ -2820,6 +2846,63 @@ mod tests {
             head_window(&long),
             HEAD_WINDOW,
             "the small window measured it, so there is nothing to widen for"
+        );
+    }
+
+    /// A box's size is the file's own number, and the walk adds it to where it
+    /// is, so it is bounded before it is used. This pins the two sizes that
+    /// broke that: `u64::MAX`, which panicked the debug build at the bound
+    /// (`attempt to add with overflow`) and in release wrapped to a small number;
+    /// and `2**64 - 20`, which wraps to exactly `0` - the walk steps back to the
+    /// box it just read and re-reads it forever, in the shipped profile.
+    ///
+    /// A reader that stops is the rule (features.md 2.2: a header that cannot be
+    /// read never becomes a candidate); a reader that dies or spins is not a
+    /// rule at all.
+    #[test]
+    fn a_box_size_that_would_overflow_the_walk_stops_it_instead() {
+        // The 64-byte shape of the card's repro: `ftyp` (20 bytes), then a box
+        // whose 32-bit size is `1` and whose `largesize` is the whole of the
+        // arithmetic. 20 + 0xffff_ffff_ffff_ffec is 0 modulo 2**64.
+        for largesize in [u64::MAX, 0xffff_ffff_ffff_ffec] {
+            let bytes = [ftyp(), boxed_large(b"junk", largesize, &[0u8; 8])].concat();
+            let found = boxes(&bytes, 0, bytes.len());
+            assert_eq!(
+                found.len(),
+                1,
+                "the walk reads the ftyp box and stops at the one it cannot bound \
+                 (largesize {largesize:#018x})"
+            );
+            assert_eq!(found[0].kind, *b"ftyp");
+            assert_eq!(found[0].end, 20);
+            assert_eq!(
+                sniff(&bytes),
+                None,
+                "and a file whose header cannot be read is not measured, rather \
+                 than measured as 0x0"
+            );
+        }
+    }
+
+    /// The bound is on the arithmetic and not on the field: a `largesize` that
+    /// fits is still read and still skipped by, so a file that uses the 64-bit
+    /// form for an ordinary reason is read exactly as before.
+    #[test]
+    fn a_box_size_that_fits_is_still_read_from_largesize() {
+        let bytes = [
+            ftyp(),
+            boxed_large(b"free", 32, &[0u8; 16]),
+            boxed(b"mdat", &[]),
+        ]
+        .concat();
+        let kinds: Vec<[u8; 4]> = boxes(&bytes, 0, bytes.len())
+            .into_iter()
+            .map(|found| found.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![*b"ftyp", *b"free", *b"mdat"],
+            "a 64-bit size of 32 skips its own 16-byte header and 16 payload bytes"
         );
     }
 
