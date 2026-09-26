@@ -626,15 +626,15 @@ this key is not in it) and `want_u64` accepts 0
 uses; leaving the default in force would mean waiting out the window between
 steps 3 and 4.
 
-The check's last precondition is the build, and the piece this build is missing
-is not the cache: the cache and the sweep exist (the sweep is
-`crates/whirld/src/cache.rs`'s `pub fn sweep`, and its `pinned` outcome is
-INV-CACHE-1's `cache_over_reason: pinned` in `whirl status`), while no source kind
-does (`crates/whirl-worker/src/sources/mod.rs`'s `build()` answers `None` for
-`local` and `wallhaven`). Every `whirl next` therefore ends `ERR no_candidates
-stage=source code=no_candidates message=no implementation for kind local in this
-build`, no rotation reaches the cache, and steps 1 to 4 above are unperformable
-in this build until a source kind lands.
+The check drives the cache through rotations (steps 1 to 4), so it cannot be
+exercised end to end until a source kind ships. The cache and the sweep are not
+the gap — `crates/whirld/src/cache.rs`'s `pub fn sweep` exists, and its `pinned`
+outcome is INV-CACHE-1's `cache_over_reason: pinned` in `whirl status`. The gap
+is the sources: at this writing `local` is written and open as PR #33 and
+`wallhaven` is not written, so until #33 merges every `whirl next` ends `ERR
+no_candidates stage=source code=no_candidates message=no implementation for kind
+local in this build` and steps 1 to 4 are unperformable. Once #33 merges, the
+check runs as written against a local source, which needs no network.
 
 **INV-CACHE-3 (pins).** No pinned file is removed by the sweep, and every
 favorites entry is either present with a matching digest, or re-materialisable
