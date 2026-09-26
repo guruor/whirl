@@ -8,15 +8,15 @@ run a rotation without touching your own wallpaper.
 ## Before you open a pull request
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-WHIRL_BACKEND=noop cargo test --workspace
-cargo build --workspace --release
+./scripts/ci.sh all
 ```
 
-These are exactly the commands CI runs. If a check is not in
-`.github/workflows/ci.yml`, it is a preference rather than a gate, so adding a
-check means adding it in both places in the same pull request.
+That is one script whose modes are the commands CI's jobs run: `fmt`, `clippy`,
+`test`, `msrv`, `guards` and `artifacts`, plus the container modes and `windows`.
+`docs/development.md` section 3 is the full picture, including what `all` leaves
+unproven. If a check is not a mode of that script it is a preference rather than a
+gate: adding one means adding the mode and the job that calls it, in the same pull
+request (`secrets` is the one job with no mode, and section 4 says why).
 
 Put the commands you ran and what you observed in the pull request body. "Tests
 pass" without the output is not evidence, and a reviewer who cannot reproduce your
