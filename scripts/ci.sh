@@ -40,7 +40,8 @@ cd "$root"
 die() { printf 'ci.sh: %s\n' "$*" >&2; exit 2; }
 
 need() {
-  command -v "$1" >/dev/null 2>&1 || die "$1 is required for the '$2' mode"
+  # $3, when given, is where the reader finds the install or the fix.
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required for the '$2' mode${3:+: $3}"
 }
 
 # The MSRV here and `rust-version` in Cargo.toml are the same number; the
@@ -121,7 +122,7 @@ fmt() { cargo fmt --all -- --check; }
 clippy() { cargo clippy --workspace --all-targets -- -D warnings; }
 
 test_suite() {
-  need cargo-nextest test
+  need cargo-nextest test "docs/development.md, \"The gate\", has the install, and the version is this repo's pin"
   # A test that rotates must never reach a real desktop; CI sets this for the
   # whole job so that a new test cannot forget it, and so does this file.
   export WHIRL_BACKEND=noop

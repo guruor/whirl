@@ -331,6 +331,37 @@ the container modes, the 1.85.0 toolchain for `msrv`. There is no fallback from
 `test` to `cargo test`: the two commands prove different things, and the gate does
 not guess.
 
+**From a fresh clone to `./scripts/ci.sh all`, in four prerequisites.** The
+toolchain comes from `rust-toolchain.toml` (rustup installs `1.94.0` on the first
+`cargo` command). `rustup toolchain install 1.85.0 --profile minimal` is what
+`msrv` needs, and that mode's own error prints the command. Docker Desktop is what
+the two container modes need. `windows` compiles for the Windows target, so
+`rustup target add x86_64-pc-windows-msvc` is a prerequisite of `all`: without it
+the mode fails with `error[E0463]: can't find crate for std`, and rustc's own note
+names the `rustup target add` that fixes it (measured on this machine 2026-09-26:
+exit 101 without the target, exit 0 after adding it). `cargo-nextest` is the one
+with no installer in the checkout, so here it is:
+
+```sh
+version=$(sed -n 's/^nextest-version = .*"\([^"]*\)".*$/\1/p' .config/nextest.toml)
+triple=universal-apple-darwin    # macOS, either cpu; Linux amd64: x86_64-unknown-linux-gnu, arm64: aarch64-unknown-linux-gnu
+base="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$version"
+curl -fsSL -O "$base/cargo-nextest-$version-$triple.tar.gz"
+curl -fsSL -O "$base/cargo-nextest-$version-$triple.sha256"
+shasum -a 256 -c "cargo-nextest-$version-$triple.sha256"    # sha256sum -c on Linux
+tar -xzf "cargo-nextest-$version-$triple.tar.gz" -C ~/.local/bin    # any directory on your PATH
+```
+
+That is the prebuilt asset checked against the sha256 the release publishes beside
+it, the same scheme `scripts/gate.Dockerfile` repeats inside the image. Run here
+on 2026-09-26: the checksum line prints `OK`, the binary reports
+`cargo-nextest 0.9.146 (8af696ddc 2026-09-21)`, and its sha256 is
+`7a558b157d164ab4fb6cb1a48cbac5a57b7b8ad99f5d3492eb6eda64faf91df0` — the binary
+this gate has been running.
+`cargo install cargo-nextest --locked --version "$version"` installs the same
+version and costs a build. With those four, nothing else in the gate has to be
+installed, and `./scripts/ci.sh all` is the one command to run.
+
 **What the gate cannot prove: Windows behaviour.** `windows` only compiles.
 Nothing on a Mac and nothing in a Linux container runs Windows code, and the
 `test (windows-latest)` job is the only thing that does. So when a change touches
