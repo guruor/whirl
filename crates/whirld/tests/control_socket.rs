@@ -157,21 +157,28 @@ fn config_path(daemon: &Daemon) -> PathBuf {
 /// and `/Volumes/Media/walls`, and the `local` kind has an implementation: the
 /// `candidates=`/`admitted=` counters in a `config check` response would then be
 /// this machine's count, which is the one thing a byte-for-byte assertion cannot
-/// be built on. Here the source's directory is inside the test's own tree and is
-/// left empty, so every counter is zero on every machine, and the two sources and
-/// their weights are 4.2's own (`sources=2` in the `plan:` line is unchanged).
+/// be built on.
 ///
-/// This file is `#![cfg(unix)]`, so the path needs no JSON escaping.
+/// **Both kinds of the schema are implemented now**, so a `wallhaven` source here
+/// would send every `config check` (and every rotation) to the live API and the
+/// counters would be whatever that API answered on the day. Both sources are
+/// therefore `local` over a directory inside the test's own tree, kept empty, and
+/// 4.2's two weights and the `sources=2` of its `plan:` line are unchanged.
+///
+/// This file is `#![cfg(unix)]`, so the paths need no JSON escaping.
 fn write_local_config(dir: &Path) {
     let walls = dir.join("walls");
-    std::fs::create_dir_all(&walls).expect("the source's directory");
+    let archive = dir.join("archive");
+    std::fs::create_dir_all(&walls).expect("the first source's directory");
+    std::fs::create_dir_all(&archive).expect("the second source's directory");
     std::fs::write(
         dir.join("config.json"),
         format!(
             "{{\n  \"config_schema\": 1,\n  \"sources\": [\n    \
              {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [\"{}\"] }},\n    \
-             {{ \"id\": \"space\", \"kind\": \"wallhaven\", \"weight\": 3, \"query\": \"landscape\" }}\n  ]\n}}\n",
-            walls.display()
+             {{ \"id\": \"archive\", \"kind\": \"local\", \"weight\": 3, \"paths\": [\"{}\"] }}\n  ]\n}}\n",
+            walls.display(),
+            archive.display()
         ),
     )
     .expect("the test's own config");
@@ -367,11 +374,11 @@ fn status_answers_the_stable_key_set() {
 /// `whirl-worker` with `set --target`, the noop backend leaves the desktop alone,
 /// and the daemon records what came back.
 ///
-/// A `next` cannot stand in for this one here. Neither `local` nor `wallhaven`
-/// has an implementation in this build, so a rotation asks a source, gets
-/// `no_candidates` back from a real worker, and fails; that path is the test
-/// below, `a_failed_rotation_is_visible_on_both_planes`. A `set path` is the
-/// route that reaches a real worker and a real `set:` line with no source at all.
+/// A `next` cannot stand in for this one here: this daemon runs 4.2's default
+/// config, whose `local` sources point into the user's own home and whose
+/// `wallhaven` kind is implemented now, so a rotation would read the machine's
+/// pictures and, failing that, reach the live API. A `set path` is the route that
+/// reaches a real worker and a real `set:` line without either.
 #[test]
 fn a_manual_set_runs_the_worker_through_the_noop_backend() {
     let daemon = start("a_manual_set_runs_the_worker_through_the_noop_backend");
@@ -613,13 +620,14 @@ const PLAN_CHECK: &str = "plan: schedule.interval_seconds=1800 schedule.worker_d
 /// config order, then exactly one `plan:` line. The two sources are 4.2's, in its
 /// order, with its weights.
 ///
-/// `last` is `-` here because a check has no outcome to report (2.6). The
-/// `local` source has `enabled=1` and its counter group, because its kind has an
-/// implementation in this build; `wallhaven` keeps `enabled=0` and the reason,
-/// because its kind does not. 4.3 fixes the second form and 2.6 says the group is
-/// optional, which is what lets one response carry both.
+/// `last` is `-` here because a check has no outcome to report (2.6). Both
+/// records carry a counter group, because both kinds have an implementation in
+/// this build and a check asks each of them; 2.6's other form, `enabled=0` with a
+/// reason and no group, is a source this build cannot work with, and it is pinned
+/// by `disabled_record`'s own test in `crates/whirl-worker/src/pipeline.rs`
+/// rather than here.
 ///
-/// Every counter is zero and the reason is `-`: `write_local_config` points the
+/// Every counter is zero and the reason is `-`: `write_local_config` points each
 /// source at an empty directory inside this test's own tree, so the assertion is
 /// the record's shape rather than a machine's count of its own pictures.
 fn config_check_lines() -> Vec<String> {
@@ -627,7 +635,7 @@ fn config_check_lines() -> Vec<String> {
         "queued".to_string(),
         "source: pictures local weight=1 enabled=1 last=- candidates=0 admitted=0 rejected_resolution=0 rejected_ratio=0 rejected_size=0 rejected_type=0 rejected_dedupe=0 reason=-"
             .to_string(),
-        "source: space wallhaven weight=3 enabled=0 last=- reason=no implementation for kind wallhaven in this build"
+        "source: archive local weight=3 enabled=1 last=- candidates=0 admitted=0 rejected_resolution=0 rejected_ratio=0 rejected_size=0 rejected_type=0 rejected_dedupe=0 reason=-"
             .to_string(),
         PLAN_CHECK.to_string(),
     ]
@@ -1088,10 +1096,11 @@ fn the_clis_quickstart_commands_answer_over_the_real_socket() {
     // `OK` is the terminator and is not printed as a data line (2.5.1).
     assert!(!status.contains("\nOK\n"), "{status}");
 
-    // `set <path>` rather than `next`: this daemon runs 4.2's default config,
-    // whose `local` source points into the user's own home and whose `wallhaven`
-    // has no implementation in this build. A manual set is the route to a real
-    // worker and a real `set:` line that does not depend on the machine.
+    // `set <path>` rather than `next`: this daemon runs the two empty `local`
+    // sources of `write_local_config`, so a rotation would be a `no_candidates`
+    // failure rather than the `set:` line this test is about. A manual set is the
+    // route to a real worker and a real `set:` line that does not depend on the
+    // machine.
     let file = daemon.dir.join("quickstart.png");
     std::fs::write(&file, b"a file the quickstart sets").expect("a file to set");
     let (ok, next) = whirl(&daemon, &["set", &file.display().to_string()]);
@@ -1413,9 +1422,10 @@ fn subscribe_streams_one_event_per_state_change() {
     // replaced by (2.9).
     //
     // The state change is a manual `set path`: this daemon runs 4.2's default
-    // config, so what a rotation finds is the machine's business (`wallhaven`
-    // has no implementation in this build, and the `local` source points into
-    // the user's home). Either route takes a slot and produces the two events.
+    // config, so what a rotation finds is the machine's business (the `local`
+    // source points into the user's home and the `wallhaven` kind is implemented
+    // now, so a rotation would leave the machine). Either route takes a slot and
+    // produces the two events.
     let file = daemon.dir.join("streamed.png");
     std::fs::write(&file, b"a file the stream set").expect("a file to set");
     let rotation = daemon.ask(&format!("set path {}", file.display()));
@@ -1483,12 +1493,14 @@ fn subscribe_streams_one_event_per_state_change() {
 /// stream -- and `2.10`'s `last_error` carries the code afterwards.
 ///
 /// The failure needs no special worker: the daemon is configured, before it
-/// starts, with one `wallhaven` source and no local one, and no `kind` has an
-/// implementation in this build (`crates/whirl-worker/src/sources`'s dispatch
-/// table), so the worker reports `no_candidates` on stderr with its failing
-/// stage. The config is the minimum 4.3 accepts (`sources` is the only key that
-/// decides this outcome; the rest take their defaults), so this test does not
-/// have to carry 4.2's whole example.
+/// starts, with one `local` source whose directory is inside this test's own tree
+/// and is left empty, so the worker reports `no_candidates` on stderr with its
+/// failing stage. Every kind of the schema is implemented now
+/// (`crates/whirl-worker/src/sources`'s dispatch table), so a `wallhaven` source
+/// here would send the rotation to the live API; an empty `local` directory is the
+/// failure that needs neither a machine nor a socket. The config is the minimum
+/// 4.3 accepts (`sources` is the only key that decides this outcome; the rest take
+/// their defaults), so this test does not have to carry 4.2's whole example.
 ///
 /// A wrong code, a message that is not the worker's own stderr line, the two
 /// fields in the other order, or a stream event whose `seq` does not follow the
@@ -1498,11 +1510,17 @@ fn subscribe_streams_one_event_per_state_change() {
 #[test]
 fn a_failed_rotation_is_visible_on_both_planes() {
     let daemon = start_prepared("a_failed_rotation_is_visible_on_both_planes", |dir| {
+        let walls = dir.join("walls");
+        std::fs::create_dir_all(&walls).expect("the source's directory");
         std::fs::write(
             dir.join("config.json"),
-            "{\n  \"sources\": [\n    { \"id\": \"space\", \"kind\": \"wallhaven\", \"weight\": 3, \"query\": \"landscape\" }\n  ]\n}\n",
+            format!(
+                "{{\n  \"sources\": [\n    {{ \"id\": \"space\", \"kind\": \"local\", \
+                 \"weight\": 3, \"paths\": [\"{}\"] }}\n  ]\n}}\n",
+                walls.display()
+            ),
         )
-        .expect("a wallhaven-only config");
+        .expect("a local-only config");
     });
 
     let stream = UnixStream::connect(&daemon.socket).expect("a connection");

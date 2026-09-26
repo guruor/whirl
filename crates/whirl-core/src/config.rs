@@ -1740,23 +1740,25 @@ pub mod paths {
 /// document) because those are the mistakes that would otherwise be read as
 /// something else, and lenient about nothing else.
 ///
-/// `pub(crate)` rather than private: the state files of
-/// docs/spec/state-and-cache.md section 6 are JSON too, and one reader in the
-/// workspace is the rule (docs/development.md section 1). The error type is
+/// `pub` rather than private: the state files of
+/// docs/spec/state-and-cache.md section 6 are JSON too, and so are the API
+/// responses the `wallhaven` source reads (docs/spec/features.md 2.3), so one
+/// reader in the workspace is the rule (docs/development.md section 1) and a
+/// second one would be the duplication this project refuses. The error type is
 /// [`ConfigError`] because that is what this reader was written against; a
-/// caller reading a state file names the file in its own message, and the
-/// `line N` this reader attaches is the part worth keeping.
-pub(crate) mod json {
+/// caller reading a state file or an HTTP body names the source in its own
+/// message, and the `line N` this reader attaches is the part worth keeping.
+pub mod json {
     use super::ConfigError;
 
     #[derive(Debug, Clone, PartialEq)]
-    pub(crate) struct Node {
-        pub(crate) value: Value,
-        pub(crate) line: usize,
+    pub struct Node {
+        pub value: Value,
+        pub line: usize,
     }
 
     #[derive(Debug, Clone, PartialEq)]
-    pub(crate) enum Value {
+    pub enum Value {
         Null,
         Bool(bool),
         Num(f64),
@@ -1766,7 +1768,7 @@ pub(crate) mod json {
     }
 
     impl Node {
-        pub(crate) fn kind_name(&self) -> &'static str {
+        pub fn kind_name(&self) -> &'static str {
             match self.value {
                 Value::Null => "null",
                 Value::Bool(_) => "boolean",
@@ -1777,39 +1779,39 @@ pub(crate) mod json {
             }
         }
 
-        pub(crate) fn is_null(&self) -> bool {
+        pub fn is_null(&self) -> bool {
             matches!(self.value, Value::Null)
         }
 
-        pub(crate) fn as_str(&self) -> Option<&str> {
+        pub fn as_str(&self) -> Option<&str> {
             match &self.value {
                 Value::Str(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(crate) fn as_bool(&self) -> Option<bool> {
+        pub fn as_bool(&self) -> Option<bool> {
             match self.value {
                 Value::Bool(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(crate) fn as_num(&self) -> Option<f64> {
+        pub fn as_num(&self) -> Option<f64> {
             match self.value {
                 Value::Num(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(crate) fn as_array(&self) -> Option<&[Node]> {
+        pub fn as_array(&self) -> Option<&[Node]> {
             match &self.value {
                 Value::Arr(elements) => Some(elements),
                 _ => None,
             }
         }
 
-        pub(crate) fn as_object(&self) -> Option<&[(String, Node)]> {
+        pub fn as_object(&self) -> Option<&[(String, Node)]> {
             match &self.value {
                 Value::Obj(entries) => Some(entries),
                 _ => None,
@@ -1818,7 +1820,7 @@ pub(crate) mod json {
     }
 
     /// Parse one JSON document.
-    pub(crate) fn parse(text: &str) -> Result<Node, ConfigError> {
+    pub fn parse(text: &str) -> Result<Node, ConfigError> {
         let mut parser = Parser {
             bytes: text.as_bytes(),
             pos: 0,

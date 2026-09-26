@@ -16,6 +16,7 @@
 //! fails with `no_candidates` and a message that names the missing kind.
 
 mod backend;
+mod http;
 mod lock;
 mod pipeline;
 mod sources;
@@ -153,11 +154,17 @@ fn main() -> ExitCode {
         None => pipeline::Window::empty(),
     };
     let platform = pipeline::host_platform();
+    // The one HTTP client this build has, and the transport that chooses by
+    // origin: a `wallhaven` candidate's origin is an `https://` URL and a `local`
+    // one's is a path (`pipeline::Origins`). Both live for the whole process
+    // because `Run` borrows them.
+    let client = http::Curl;
+    let transport = pipeline::Origins::new(&client);
     let run = pipeline::Run {
         config: &config,
         setter: &pipeline::PlatformSet(backend),
         sources: &sources,
-        transport: &pipeline::Paths,
+        transport: &transport,
         cache: &cache,
         window: &window,
         platform,
