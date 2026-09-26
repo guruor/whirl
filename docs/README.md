@@ -1,10 +1,10 @@
 # whirl design docs
 
-Everything here is written before the code it describes, and each document names
-the evidence it rests on. Nothing is final until it has been reviewed against its
-own acceptance criteria: "written" means the document exists, "reviewed" means
-someone who did not write it has reproduced its evidence and said so, in
-`reviews/`.
+Everything in the index below is written before the code it describes, and each
+document names the evidence it rests on. Nothing is final until it has been
+reviewed against its own acceptance criteria: "written" means the document
+exists, "reviewed" means someone who did not write it has reproduced its
+evidence and said so, in `reviews/`.
 
 | document | status | what it decides |
 |---|---|---|
