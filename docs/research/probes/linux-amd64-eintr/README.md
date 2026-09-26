@@ -180,3 +180,73 @@ grep "^test (ubuntu-latest)" run.log
 
 The job that runs them is x86_64, it runs both of them, and it is green. So
 there is no CI hole: the platform is not what is wrong, the translation is.
+
+## 4. The ruling, and the mechanism
+
+**Ruling.** An emulation artifact that exposed a real defect. The translation is
+what delivers the signal; the defect is that the daemon treated a retryable
+`EINTR` as the end of a live connection. So the fix belongs in the daemon, and
+the emulated mode then passes without an exclusion.
+
+1. Every connection sets `SO_RCVTIMEO`: `handle` sets 2.8's 300 s idle timeout,
+   and `subscribe` replaces it with `STREAM_POLL` (100 ms). signal(7) lists a
+   socket read with a timeout in the interfaces that are **never** restarted
+   after a signal handler returns: it fails with `EINTR` instead. In this
+   daemon, then, any signal that reaches a thread parked in
+   `read_request_line` does not restart the read, it surfaces as `Interrupted`.
+2. Under amd64 translation, forking a child delivers such a signal. `probe2.rs`
+   parks a thread in exactly that read (`SO_RCVTIMEO` = 100 ms, looping on
+   `WouldBlock` as `subscribe` does) and spawns and reaps a child from another
+   thread, as `Worker::run` does when it forks `whirl-worker`:
+
+       linux/amd64, two runs:  reader: fill_buf -> Interrupted (raw_os_error=Some(4)) at 324ms / 331ms
+                               result: interrupted=1 timed_out_polls=13
+       linux/arm64, two runs:  result: interrupted=0 timed_out_polls=14
+       macOS,       two runs:  result: interrupted=0 timed_out_polls=15 / 16
+
+   `probe3.rs` moves the spawn from 300 ms to 1200 ms and the interruption moves
+   with it, 320 ms → 1228 ms, so what interrupts the read is the fork and not a
+   clock. Drop the `set_read_timeout` line from either probe and the read is
+   restarted on all three platforms: the timeout is the ingredient that turns
+   the signal into an error.
+3. `read_request_line` propagated that error (`reader.fill_buf()?`), `handle`
+   returned it, and `serve` logged `whirld: connection ended: Interrupted system
+   call` and dropped the socket. The subscriber's next read got EOF, which is
+   the assertion at `control_socket.rs:911`.
+4. The two tests are exactly the ones that hold a subscribed connection parked
+   in that read while a rotation forks the worker. That is why they and not
+   others are red, and why the red is deterministic rather than flaky.
+
+The emulator is not qemu. `/proc/cpuinfo` inside the amd64 container says
+`model name: VirtualApple @ 2.50GHz`, which is Rosetta 2 (Docker Desktop's
+Rosetta translation). The translated guest also catches one signal a native
+guest does not: `SigCgt: 0000000000000450` against `0000000000000440`, bit 4 =
+signal 5, `SIGTRAP`. Which signal interrupts the read is **not** identified:
+ptrace across Rosetta produced an unusable trace (`syscall_0x...` lines instead
+of syscall names), and blocking `SIGTRAP` in the parked thread did not change
+the outcome. Ruling and fix do not need its name: `EINTR` is retryable whatever
+raised it.
+
+### The fix
+
+`crates/whirld/src/socket.rs`'s `read_request_line` retries
+`ErrorKind::Interrupted` on `fill_buf` instead of returning it, with the reason
+and this card's id in the comment above it. Two unit tests pin the behaviour:
+`socket::tests::an_interrupted_read_retries_instead_of_ending_the_connection`
+reads the line behind the interruption, and
+`socket::tests::a_read_error_that_is_not_an_interruption_is_still_reported`
+shows the retry cannot swallow a real failure.
+
+Which platform's behaviour changed: none. On real x86_64 (CI) and natively the
+read is never interrupted, so nothing observable changes there. What changed is
+that an interrupted read no longer ends a live connection: the connection
+survives a signal, which is what a system call that transferred nothing
+requires.
+
+After the fix, in the same emulated container, `cargo test --workspace`:
+
+    running 38 tests  ... test result: ok. 38 passed; 0 failed; ... finished in 8.12s
+    running 19 tests  ... test result: ok. 19 passed; 0 failed; ... finished in 1.85s
+    test a_failed_rotation_is_visible_on_both_planes ... ok
+    test subscribe_streams_one_event_per_state_change ... ok
+    cargo test exit=0

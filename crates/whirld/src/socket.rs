@@ -314,10 +314,26 @@ enum ReadOutcome {
 
 /// One request line, bounded at `MAX_REQUEST_LINE` bytes excluding the newline
 /// (2.2). A `\r` before the newline is tolerated, never required.
+///
+/// An interrupted read is retried, not reported. Every connection here has
+/// `SO_RCVTIMEO` set (2.8's idle timeout, 2.9's `STREAM_POLL`), and signal(7)
+/// puts a socket read that has a timeout in the class that is *never* restarted
+/// after a signal handler returns: it fails with `EINTR` instead. `EINTR` means
+/// nothing was transferred, so the line has not started arriving and the read is
+/// simply repeated. That is not hypothetical for this daemon: under
+/// `linux/amd64` emulation the signal that reaches this thread when
+/// `Worker::run` forks `whirl-worker` closed a subscriber's connection, which is
+/// what `control_socket`'s `subscribe_streams_one_event_per_state_change` and
+/// `a_failed_rotation_is_visible_on_both_planes` saw as "the daemon closed the
+/// connection early" (t_62920980).
 fn read_request_line(reader: &mut impl BufRead) -> io::Result<ReadOutcome> {
     let mut buffer: Vec<u8> = Vec::new();
     loop {
-        let available = reader.fill_buf()?;
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if available.is_empty() {
             return Ok(ReadOutcome::Eof);
         }
@@ -688,4 +704,65 @@ fn write_err(
     message: impl std::fmt::Display,
 ) -> io::Result<()> {
     write_response(out, &Response::err(code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader whose first `read` is interrupted, as a socket read with
+    /// `SO_RCVTIMEO` is when a signal reaches the thread (t_62920980), and which
+    /// then serves one line.
+    struct InterruptedOnce {
+        line: &'static [u8],
+        interrupted: bool,
+    }
+
+    impl io::Read for InterruptedOnce {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let remaining: &'static [u8] = self.line;
+            let length = remaining.len().min(out.len());
+            out[..length].copy_from_slice(&remaining[..length]);
+            self.line = &remaining[length..];
+            Ok(length)
+        }
+    }
+
+    /// The retry itself: `EINTR` must not end the connection, and the request
+    /// line behind the interruption must still be read. Before this, the error
+    /// propagated out of `handle`, which dropped the connection: the client saw
+    /// EOF where its next event should have been.
+    #[test]
+    fn an_interrupted_read_retries_instead_of_ending_the_connection() {
+        let reader = InterruptedOnce {
+            line: b"pause\n",
+            interrupted: false,
+        };
+        let mut reader = BufReader::new(reader);
+        match read_request_line(&mut reader).expect("EINTR is retried") {
+            ReadOutcome::Line(line) => assert_eq!(line, "pause"),
+            _ => panic!("the line behind the interruption is the request"),
+        }
+    }
+
+    /// The other half: a read error that is not an interruption is still
+    /// reported, so the retry above cannot swallow a real failure.
+    #[test]
+    fn a_read_error_that_is_not_an_interruption_is_still_reported() {
+        struct Failing;
+        impl io::Read for Failing {
+            fn read(&mut self, _out: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+        let error = match read_request_line(&mut BufReader::new(Failing)) {
+            Err(error) => error,
+            Ok(_) => panic!("a reset is not an interruption"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    }
 }
