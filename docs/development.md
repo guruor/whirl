@@ -1085,6 +1085,300 @@ Two notes on the sequence above:
   the CLI's own environment, the second for the daemon's. Both are shown because
   copying a line out of a shell history is how this goes wrong.
 
+### Installing whirl on your own machine
+
+The quickstart above builds in the checkout and runs `cargo run`. This is the
+other sequence: the three binaries installed into one directory, started from
+`PATH`, and kept. It is also what a release archive does, so both paths end in the
+same place.
+
+**All three binaries must be in the same directory, and this is not a
+convention.** The daemon does not search `PATH` for its worker: it takes its own
+executable and replaces the file name (`crates/whirld/src/worker.rs:168-178`,
+`default_program`):
+
+```rust
+match std::env::current_exe() {
+    Ok(exe) => exe.with_file_name(name),
+    Err(_) => PathBuf::from(name),
+}
+```
+
+A `whirl-worker` that is on `PATH` but not next to `whirld` therefore cannot be
+found, and a queued rotation fails with `ERR worker_failed cannot spawn <path>`,
+naming the directory the daemon looked in. That message is the fastest diagnosis
+of a split install, and the experiment below reproduces it.
+
+**From a checkout.** `cargo install --path` builds the release profile in the
+checkout and copies the binary out. One invocation takes one `--path`, so this is
+three commands; three in one invocation is refused with
+`error: the argument '--path <PATH>' cannot be used multiple times`.
+
+```sh
+git clone https://github.com/guruor/whirl
+cd whirl
+
+cargo install --path crates/whirl-cli    --locked   # whirl
+cargo install --path crates/whirld       --locked   # whirld
+cargo install --path crates/whirl-worker --locked   # whirl-worker
+```
+
+`--locked` is optional and is the right default: it builds the lock file the
+repository carries rather than letting the resolver update your working tree.
+`cargo install --list` then reports all three packages, each with the binary it
+installed. The directory the binaries went into is not in that listing; it is
+`$CARGO_HOME/bin` (`~/.cargo/bin` on a stock install), or `<dir>/bin` when you
+install with `--root <dir>`:
+
+```sh
+echo "$CARGO_HOME"                       # empty means ~/.cargo
+command -v cargo
+echo "$PATH" | tr ':' '\n' | grep -x "${CARGO_HOME:-$HOME/.cargo}/bin"
+command -v whirl; command -v whirld; command -v whirl-worker
+```
+
+The `grep` must print the directory; it can print it more than once, because
+`PATH` entries repeat. If it prints nothing the prefix is not on your `PATH`, and
+the three `command -v` lines below it will print nothing either; add the directory
+yourself, or install with `--root` into one that is already there. This document
+does not edit your shell configuration.
+
+**From a release archive.** Once a tag has been cut, the archive is the three
+binaries and nothing else (section 5, "What a release artifact is, per platform"),
+stored flat, so the extraction directory *is* the directory all three must share:
+
+```sh
+# whirl-vX.Y.Z-macos-arm64.tar.gz, taken from the release page
+PREFIX="$(dirname "$(command -v whirld)")"   # one directory, for all three
+tar --list --file whirl-vX.Y.Z-macos-arm64.tar.gz
+tar --extract --gzip --file whirl-vX.Y.Z-macos-arm64.tar.gz --directory "$PREFIX"
+```
+
+`tar --list` prints the four lines that make the point, flat and with nothing
+else in the archive:
+
+```
+./
+./whirl
+./whirld
+./whirl-worker
+```
+
+On a machine with no whirl installed yet there is nothing for `command -v whirld`
+to answer with, and that is fine: `PREFIX` is then simply the directory you choose
+to unpack into. What matters is that it is one directory for all three.
+
+No release has been cut yet (the only one so far is the throwaway prerelease in
+section 5), so this path was verified by building the archive with the workflow's
+own command (`release.yml`, "Package the archive (unix)":
+`tar --create --gzip --file "$ARCHIVE" --directory dist .`) out of the installed
+binaries and unpacking it again. The layout is the workflow's; the download is
+not.
+
+**Running it without touching your own wallpaper or your own state.** The daemon
+writes where the five environment variables of the next subsection point, and the
+macOS defaults are real user paths: `~/Library/Application Support/whirl` for the
+config, the socket and the state, `~/Library/Caches/whirl` for the cache. Set all
+five and nothing outside the directory you name is written at all:
+
+```sh
+RUN=/tmp/whirl-sandbox
+WALLS="$HOME/Pictures/Wallpapers"            # the directory your collection is in
+mkdir -p "$RUN/collection" "$RUN/state" "$RUN/cache"
+cp "$WALLS"/*.jpg "$RUN/collection/"         # a copy, not the original directory
+
+cat > "$RUN/config.json" <<JSON
+{
+  "config_schema": 1,
+  "backend": "noop",
+  "sources": [
+    { "id": "walls", "kind": "local", "weight": 1, "paths": ["$RUN/collection"] }
+  ]
+}
+JSON
+
+export WHIRL_CONFIG="$RUN/config.json"
+export WHIRL_SOCKET="$RUN/whirl.sock"
+export WHIRL_STATE_DIR="$RUN/state"
+export WHIRL_CACHE_DIR="$RUN/cache"
+export WHIRL_BACKEND=noop
+
+whirld                                       # terminal 1: the daemon, in the foreground
+```
+
+The copy is the point of the recipe: the one source points into `$RUN`, so a
+rotation cannot take a picture out of your real directory even if it did set one.
+The daemon prints what it resolved before it listens, which is the check that the
+five variables took effect:
+
+```
+whirld: config /tmp/whirl-sandbox/config.json
+whirld: state /tmp/whirl-sandbox/state cache /tmp/whirl-sandbox/cache
+whirld: backend noop
+whirld: listening on /tmp/whirl-sandbox/whirl.sock
+```
+
+With the same five exported in terminal 2, `whirl status` answers with those paths
+in it. This is one real block, unabridged:
+
+```
+$ whirl status
+daemon_version: whirl 0.1.0
+protocol: 2
+platform: macos
+pid: 4515
+seq: 1
+uptime_s: 2
+rss_kb: 1968
+paused: 0
+rotating: 0
+rotation_count: 0
+interval_s: 1800
+next_at: 2026-09-26T17:24:30Z
+next_in_s: 1797
+last_digest: -
+last_origin_key: -
+last_via: -
+last_at: -
+last_error: -
+history_entries: 50
+history_count: 0
+favorites_count: 0
+display_mode: all
+display_mode_effective: all
+display_mode_reason: -
+anchor_digest: -
+anchor_path: -
+anchor_verified: 0
+cache_dir: /tmp/whirl-sandbox/cache
+cache_root_id: 4680d861-4c32-41cb-a839-5506b8b277aa
+cache_files: 0
+cache_bytes: 0
+cache_files_cap: 500
+cache_bytes_cap: 2147483648
+cache_over_cap: 0
+cache_over_reason: -
+cache_writable: 1
+sweep_deferred: 0
+lock_mode: flock
+state_dir: /tmp/whirl-sandbox/state
+state_corrupt: -
+state_quarantined: -
+state_schema_newer: 0
+history_lost: 0
+favorites_degraded: 0
+clock_jump: 0
+respect_manual_effective: 0
+sources: 1
+source: walls local weight=1 enabled=1 last=- reason=-
+```
+
+`backend` is not one of those fields, so the backend has to be read from the
+`plan:` line of `whirl config check` or from the daemon's own startup line above,
+where `backend=noop` is the noop backend of `docs/architecture.md` 4.2:
+
+```
+$ whirl config check
+queued
+source: walls local weight=1 enabled=1 last=- candidates=13 admitted=11 rejected_resolution=2 rejected_ratio=0 rejected_size=0 rejected_type=0 rejected_dedupe=0 reason=-
+plan: schedule.interval_seconds=1800 schedule.worker_deadline_seconds=300 startup.enabled=1 startup.mode=last startup.respect_manual=1 display.mode=all display.mode_effective=all min_width=1600 min_height=900 filters.max_bytes=41943040 filters.ratio_tolerance=0.02 filters.target_ratio=- state.history_entries=50 dedupe.recent_entries=50 cache.root=- cache.max_bytes=2147483648 cache.max_files=500 cache.grace_seconds=600 cache.orphan_grace_seconds=300 backend=noop sources=1
+```
+
+A rotation, against the copy:
+
+```
+$ whirl next
+queued
+set: 8cb8eb1658d98249491a054cc4310e0c583cce5cc9adf556b7bf03a5f9fcce95 walls:4bb4dc93a0683a6405bb20f01b4a1ffd53878aaa4b792626ec515c561c297160 source /tmp/whirl-sandbox/collection/0P9h0fM.jpg
+```
+
+`queued` arrives first and `set:` when the worker finishes, as the quickstart
+says, and the path is the sandbox copy the worker selected.
+
+**The sibling rule, reproduced.** Move the installed worker out of the prefix and
+queue another rotation:
+
+```sh
+PREFIX="$(dirname "$(command -v whirld)")"
+mv "$PREFIX/whirl-worker" /tmp/whirl-worker-aside
+whirl next
+```
+
+```
+queued
+ERR worker_failed cannot spawn <the prefix you just moved it out of>/whirl-worker: No such file or directory (os error 2)
+```
+
+(The path is abridged: the line actually printed carries the resolved absolute
+path, which is the point of the message.) Put it back, and the same command
+succeeds again:
+
+```sh
+mv /tmp/whirl-worker-aside "$PREFIX/whirl-worker"
+whirl next
+```
+
+```
+queued
+set: c077055eb3ca5839e95c798c3257e82174d02b327ab38a8440f15d4e83b7f3cb walls:bf733085d4285fd299b3e6e975553ca1e1aa449922ee1fdb54bd5f3e9054702f source /tmp/whirl-sandbox/collection/huuqt2bhnx361.jpg
+```
+
+That pair is the whole rule. Nothing else in the product looks for
+`whirl-worker`.
+
+**Uninstalling.** `cargo` tracks what it installed, so removal takes the same
+package names, all three in one invocation:
+
+```sh
+cargo uninstall --root /tmp/whirl-prefix whirl-cli whirld whirl-worker
+```
+
+```
+    Removing /tmp/whirl-prefix/bin/whirl
+    Removing /tmp/whirl-prefix/bin/whirld
+    Removing /tmp/whirl-prefix/bin/whirl-worker
+     Summary Successfully uninstalled whirl-cli, whirld, whirl-worker!
+```
+
+Drop `--root <dir>` if the binaries went to the default prefix; the three
+`Removing` lines then name that prefix and the `Summary` line is identical.
+`command -v whirl; command -v whirld; command -v whirl-worker` prints nothing
+afterwards, which is the check. Two things are then left that an install did not
+put there: the sandbox directory you made, which is yours to delete, and, if you
+ever ran the daemon with none of the five variables, your real
+`~/Library/Application Support/whirl` and `~/Library/Caches/whirl`.
+
+**Do I have to publish this to crates.io to install it?** No, and no step here
+needs a registry, a token or a password:
+
+- `cargo install --path` builds a directory you already have, and there is
+  nothing to fetch: `Cargo.lock` is 28 lines, the four workspace crates and no
+  third-party package, which is the dependency rule of section 2.
+- Unpacking a release archive is `tar`, and nothing else.
+
+An install therefore works with the network switched off, which is the proof that
+no registry is consulted:
+
+```sh
+CARGO_NET_OFFLINE=true cargo install --path crates/whirld --root /tmp/whirl-prefix --locked
+```
+
+Publishing is the only thing in this subsection that would need a credential: an
+API token for crates.io, retrieved from <https://crates.io/me> and saved by
+`cargo login` in `$CARGO_HOME/credentials.toml` (`cargo help login`). whirl is not
+published, nothing here runs `cargo publish`, and nothing here reads that file.
+
+**What in this subsection was executed, and what was not.** Every command above
+was run on macOS, arm64, from a worktree of `development` at `607422c`: the three
+installs; the `PATH` check; the archive, built with the workflow's command and
+unpacked into the prefix; the sandbox and its daemon, `whirl status`, `whirl
+config check`, `whirl next` and the moved-worker pair; the uninstall, both with
+`--root` and against the default prefix, and the reinstall after it. The one
+value that differed is `WALLS`, which pointed at the collection on that machine.
+The real `~/Library/Application Support/whirl` and `~/Library/Caches/whirl` were
+listed before and after and did not change. Not executed: a download from a real
+release, because none exists, and anything on Windows or Linux.
+
 ### The five environment variables
 
 Precedence is config file, then environment, then daemon flags
