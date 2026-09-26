@@ -523,6 +523,11 @@ impl Daemon {
     /// files are written back (6.2, 6.3).
     pub fn record_success(&self, digest: &str, origin_key: &str, via: Via, path: Option<&str>) {
         let kind = self.kind_of(origin_key);
+        // 6.1, 6.2, 8.4: the state files name a path only where whirl owns the
+        // bytes. `path` itself stays what the platform was handed, because that
+        // is what the `set:` line (2.6) and 2.9's `rotate_ok` event report, and
+        // 6.1 is the rule that makes the two differ for a `reference`-mode set.
+        let recorded = self.recorded_path(origin_key, path);
         let mut state = self.state();
         let at = now();
         state.running = None;
@@ -534,7 +539,7 @@ impl Daemon {
             origin_key: Some(origin_key.to_string()),
             via: Some(via),
             kind,
-            path: path.map(str::to_string),
+            path: recorded.clone(),
             at: at.clone(),
         });
         state.history.push(HistoryEntry {
@@ -543,7 +548,7 @@ impl Daemon {
             kind,
             origin_key: origin_key.to_string(),
             digest: Some(digest.to_string()),
-            path: path.map(str::to_string),
+            path: recorded,
         });
         Self::announce(
             &mut state,
@@ -576,21 +581,55 @@ impl Daemon {
         self.save_current(&state);
     }
 
-    /// `kind` names the origin, not the mechanism (2.6), and the `origin_key`
-    /// prefix is the source `id` (2.5). A prefix that matches no configured
-    /// source is an `external` image, which is also what 2.6 calls it.
-    fn kind_of(&self, origin_key: &str) -> Kind {
+    /// The configured source an `origin_key` names: its prefix is the source
+    /// `id` (2.5). `None` for a prefix that matches no configured source, which
+    /// is the `external` image of 2.6.
+    fn source_of(&self, origin_key: &str) -> Option<&whirl_core::config::SourceConfig> {
         let prefix = origin_key.split_once(':').map(|(prefix, _)| prefix);
         self.effective
             .config
             .sources
             .iter()
             .find(|source| Some(source.id.as_str()) == prefix)
+    }
+
+    /// `kind` names the origin, not the mechanism (2.6), and the `origin_key`
+    /// prefix is the source `id` (2.5). A prefix that matches no configured
+    /// source is an `external` image, which is also what 2.6 calls it.
+    fn kind_of(&self, origin_key: &str) -> Kind {
+        self.source_of(origin_key)
             .map(|source| match source.kind {
                 whirl_core::config::SourceKind::Local => Kind::Local,
                 whirl_core::config::SourceKind::Wallhaven => Kind::Wallhaven,
             })
             .unwrap_or(Kind::External)
+    }
+
+    /// The path a set records, which is `current.json`'s `anchor.cached_path`
+    /// (6.1) and `history.json`'s `cached_path` (6.2, 8.4): the location of
+    /// whirl's own bytes for the displayed image.
+    ///
+    /// A `local` source in `reference` mode is the case where whirl has none:
+    /// features.md 2.2 has it set the wallpaper from the candidate's own path
+    /// and store nothing, so the file the platform was handed is the user's own
+    /// and 6.1 says the record carries no path for it. Every other set names a
+    /// file whirl owns -- the cache file a store wrote, or the file a `set path`
+    /// request named, which 2.6's `via: manual` and 2.11's history record both
+    /// carry -- so the test is the path and not the mode alone: a reported path
+    /// inside `sha256/` is whirl's file whatever the configured mode says, and
+    /// blanking it would drop the anchor out of 5.3's protected set.
+    fn recorded_path(&self, origin_key: &str, reported: Option<&str>) -> Option<String> {
+        let path = reported?;
+        let referenced = self
+            .source_of(origin_key)
+            .and_then(|source| source.local.as_ref())
+            .is_some_and(|local| local.mode == whirl_core::config::LocalMode::Reference);
+        if referenced
+            && !std::path::Path::new(path).starts_with(self.effective.cache_dir.join("sha256"))
+        {
+            return None;
+        }
+        Some(path.to_string())
     }
 
     /// The `plan:` line of 2.6 for this daemon, from the one implementation
@@ -1378,7 +1417,7 @@ mod tests {
     use super::*;
     use crate::lock::{Attempt, Mode};
     use std::path::{Path, PathBuf};
-    use whirl_core::config::Backend;
+    use whirl_core::config::{Backend, LocalMode, LocalSource, SourceConfig, SourceKind};
 
     /// 2.10's `next_in_s` row, one assertion per state it names, with `now`
     /// passed in: a live deadline counts down, a deadline already passed is `0`
@@ -1830,5 +1869,154 @@ mod tests {
 
         drop(daemon);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 6.1 and 6.2: the record names a path only where whirl owns the bytes. A
+    /// `local` source in `reference` mode (features.md 2.2) hands the platform
+    /// the candidate's own file and stores nothing, so `cached_path` is `null`
+    /// for that set, and `status`'s `anchor_path`, which is the same record
+    /// (2.10), reports `-`. The other two origins keep their path: a store's
+    /// cache file, and the file a `set path` request named, which 2.6's record
+    /// form and 2.11's history both carry.
+    ///
+    /// Every case asserts all three places -- `status`, `current.json` as 6.1
+    /// parses it, and `history.json` as 6.2 parses it -- so a change that stops
+    /// at one of the two writers, or at the in-memory anchor alone, fails here.
+    #[test]
+    fn the_record_names_a_path_only_where_whirl_owns_the_bytes() {
+        let root = std::env::temp_dir().join(format!("whirl-recorded-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut config = Config::default();
+        config
+            .sources
+            .push(local_source("pictures", LocalMode::Reference));
+        config.sources.push(local_source("stash", LocalMode::Copy));
+        let daemon = daemon_with(&root.join("daemon"), Attempt::Acquired, config);
+        let cache_dir = daemon.effective.cache_dir.clone();
+        let user_file = root.join("walls").join("wide.png");
+        let user_file = user_file.to_str().expect("a path").to_owned();
+        let cache_file = whirl_core::state::content_path(&cache_dir, &"b".repeat(64), "jpg");
+        let cache_file = cache_file.to_str().expect("a path").to_owned();
+
+        // A `reference`-mode rotation: the platform was handed the user's own
+        // file, and whirl has no bytes of its own for the record to name.
+        daemon.record_success(
+            &"a".repeat(64),
+            "pictures:1cc43835",
+            Via::Source,
+            Some(&user_file),
+        );
+        assert_eq!(
+            kv(&daemon.status(), "anchor_path"),
+            "-",
+            "2.10's `-` for a set that stored nothing, which is what 6.1 calls `cached_path: null`"
+        );
+        assert_eq!(
+            anchor_path(&daemon),
+            None,
+            "6.1: `cached_path` is `null` for a `reference`-mode local image"
+        );
+        assert_eq!(
+            history_path(&daemon),
+            None,
+            "6.2 and 8.4: its history entry carries no path either"
+        );
+
+        // A `copy`-mode rotation stores, so the file whirl owns is the anchor.
+        daemon.record_success(
+            &"b".repeat(64),
+            "stash:9f2c1d",
+            Via::Source,
+            Some(&cache_file),
+        );
+        assert_eq!(
+            anchor_path(&daemon),
+            Some(cache_file.clone()),
+            "a store's cache file is whirl's own and stays named"
+        );
+        assert_eq!(
+            history_path(&daemon),
+            Some(cache_file.clone()),
+            "and the history entry names it"
+        );
+
+        // `set path` names a file the user already had: 6.1's null is about the
+        // file whirl stores, not about every path outside the cache, so this one
+        // is recorded -- which is what 2.6's record form (`via: manual`) and
+        // 2.11's history record both show.
+        daemon.record_success(
+            &"c".repeat(64),
+            "external:c14fcc08",
+            Via::Manual,
+            Some(&user_file),
+        );
+        assert_eq!(
+            anchor_path(&daemon),
+            Some(user_file.clone()),
+            "2.6's `via: manual` names the file the user set"
+        );
+        assert_eq!(
+            history_path(&daemon),
+            Some(user_file.clone()),
+            "and its history entry carries it"
+        );
+
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `local` source (2.1) in the mode a case needs.
+    fn local_source(id: &str, mode: LocalMode) -> SourceConfig {
+        SourceConfig {
+            id: id.to_owned(),
+            kind: SourceKind::Local,
+            weight: 1,
+            capabilities: SourceConfig::default_capabilities(SourceKind::Local),
+            min_width: None,
+            min_height: None,
+            max_bytes: None,
+            local: Some(LocalSource {
+                mode,
+                ..LocalSource::default()
+            }),
+            wallhaven: None,
+        }
+    }
+
+    /// The anchor's `cached_path`, from `current.json` as 6.1 defines it rather
+    /// than from the field the writer handed over.
+    fn anchor_path(daemon: &Daemon) -> Option<String> {
+        let text = daemon
+            .store
+            .read(File::Current)
+            .expect("current.json is readable")
+            .expect("and the rotation wrote it");
+        CurrentFile::parse(&text)
+            .expect("current.json parses")
+            .value()
+            .expect("at the schema this build reads")
+            .anchor
+            .expect("an anchor")
+            .cached_path
+    }
+
+    /// The newest history entry's `cached_path`, from `history.json` as 6.2
+    /// defines it.
+    fn history_path(daemon: &Daemon) -> Option<String> {
+        let text = daemon
+            .store
+            .read(File::History)
+            .expect("history.json is readable")
+            .expect("and the rotation wrote it");
+        HistoryFile::parse(&text)
+            .expect("history.json parses")
+            .value()
+            .expect("at the schema this build reads")
+            .entries
+            .first()
+            .expect("the entry the rotation just wrote")
+            .path
+            .clone()
     }
 }
