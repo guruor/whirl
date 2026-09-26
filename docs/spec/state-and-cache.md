@@ -563,9 +563,9 @@ modified by whirl for as long as it is the anchor. This holds across cap
 changes, cache clears (which must restore it, section 8.2), and rotations that
 happen to pick the same image again.
 
-Check, the adversarial form, on a config that 4.3 and the validator both accept:
-`cache.max_files` at 2, which is the floor 4.3 sets (`docs/architecture.md:1475`)
-and the lowest value `validate_ordering` admits
+Check, the adversarial form, on a config that `docs/architecture.md` 4.3 and the
+validator both accept: `cache.max_files` at 2, the floor that section sets
+(`docs/architecture.md:1475`) and the lowest value `validate_ordering` admits
 (`crates/whirl-core/src/config.rs:1320`, whose refusal of 1 is asserted at
 `crates/whirl-core/src/config.rs:2450`); the byte cap at its default, so
 `cache.max_bytes >= filters.max_bytes` still holds; and `cache.grace_seconds` at
