@@ -295,7 +295,9 @@ Before you push, run one thing:
 ```
 
 That is `local` (fmt, clippy, test, artifacts), then `windows`, then `msrv`, then
-`linux`. What each mode proves:
+`linux` (the container's `ubuntu` mode: `clippy`, `test`, `artifacts` and `guards`,
+so `guards` is proved inside the container and not on the host). What each mode
+proves:
 
 | mode | what it proves |
 |---|---|
@@ -308,6 +310,18 @@ That is `local` (fmt, clippy, test, artifacts), then `windows`, then `msrv`, the
 | `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
 | `linux` | the ubuntu jobs again, in the gate's container, so a Linux-only failure surfaces here rather than in CI |
 | `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails three tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
+
+**What `all` leaves unproven**, so that the answer is here rather than inferred:
+
+- **the `secrets` job.** No mode covers gitleaks: the scanner is a CI-only binary
+  a contributor cannot run, so its absence is deliberate (section 4). `all` says
+  nothing about it, and a green `all` is not evidence that the scan would pass.
+- **Windows execution.** `windows` compiles for the Windows target and runs
+  nothing; `test (windows-latest)` on a Windows runner is the only thing that runs
+  Windows code, and it is not something this machine can do (below).
+- **`linux-amd64`.** Deliberately outside `all`: on Apple silicon it is emulated
+  and it fails three tests that pass on real x86_64. Run it by hand when a change
+  touches something an architecture decides.
 
 `WHIRL_BACKEND=noop` is not a contributor's business any more: the script sets it
 for the whole of `test` and for `msrv`'s test step, so a new test cannot forget
