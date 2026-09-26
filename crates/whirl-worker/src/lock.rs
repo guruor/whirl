@@ -116,6 +116,15 @@ enum Mode {
 }
 
 /// What one non-blocking exclusive attempt on an open descriptor did.
+///
+/// `Acquired` and `Held` are the two answers only a platform primitive can give,
+/// so on a target whose `platform_attempt` is the `Unsupported` stub they are
+/// unconstructed in every non-test build. That is the design and not an
+/// oversight -- they are 7.2's answers, kept in the type so `select` reads as the
+/// spec's three-way choice on every target -- so the lint is switched off there
+/// rather than the variants being cfg'd away, which would leave an enum that no
+/// longer says what it means on the target that needs the fallback most.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Attempt {
     /// The lock is ours.
@@ -433,5 +442,51 @@ mod tests {
             !path.exists(),
             "8.7: the file goes when the lock goes, so a clean exit leaves nothing"
         );
+    }
+
+    /// The probe's `Acquired` answer: 7.2's own primitive, so the mode is the
+    /// platform lock and the lock file outlives the run -- only the descriptor was
+    /// locked, and closing it was the release. On a target whose
+    /// `platform_attempt` answers `Unsupported`, this is also the only place the
+    /// arm is exercised at all, which is why the probe is a parameter.
+    #[test]
+    fn a_probe_of_acquired_is_the_platform_lock_and_leaves_the_file() {
+        let dir = scratch("probe-acquired");
+        let holder = take_with(&dir, |_| Ok(Attempt::Acquired))
+            .expect("a take that cannot fail")
+            .expect("the file is ours to create");
+        assert_eq!(
+            holder.mode,
+            Mode::Flock,
+            "`flock` acquired is 7.2's primitive"
+        );
+
+        drop(holder);
+        assert!(
+            dir.join(ROTATE_FILE).is_file(),
+            "under `flock` the file outlives the run: closing the descriptor was the release"
+        );
+    }
+
+    /// The probe's remaining answer, which is 7.3 step 2's `busy` and never 8.7's
+    /// fallback: a descriptor someone else holds is a refusal, and on a file this
+    /// process created exclusively it is an answer no descriptor can give, so
+    /// nothing rotates on it either.
+    #[test]
+    fn a_probe_of_held_is_busy_and_never_the_fallback() {
+        let dir = scratch("probe-held");
+        create_locks_dir(&dir).expect("the locks directory");
+        std::fs::write(dir.join(ROTATE_FILE), record(4711)).expect("a planted lock file");
+
+        let refused = take_with(&dir, |_| Ok(Attempt::Held)).expect("a take that cannot fail");
+        assert!(
+            refused.is_none(),
+            "7.3 step 2: a holder is `busy`, which is not 8.7's fallback and not a take"
+        );
+
+        let fresh = scratch("probe-held-fresh");
+        let message = take_with(&fresh, |_| Ok(Attempt::Held))
+            .expect_err("a file this process created exclusively cannot be held");
+        assert!(message.contains("reads as held"), "{message}");
     }
 }
