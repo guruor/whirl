@@ -245,10 +245,21 @@ fn status_answers_the_stable_key_set() {
     }
 }
 
+/// The worker really runs and really reports (1.6): a manual `set path` spawns
+/// `whirl-worker` with `set --target`, the noop backend leaves the desktop alone,
+/// and the daemon records what came back.
+///
+/// A `next` cannot stand in for this one here. Neither `local` nor `wallhaven`
+/// has an implementation in this build, so a rotation asks a source, gets
+/// `no_candidates` back from a real worker, and fails; that path is the test
+/// below, `a_failed_rotation_is_visible_on_both_planes`. A `set path` is the
+/// route that reaches a real worker and a real `set:` line with no source at all.
 #[test]
-fn a_rotation_runs_the_worker_through_the_noop_backend() {
-    let daemon = start("a_rotation_runs_the_worker_through_the_noop_backend");
-    let lines = daemon.ask("next");
+fn a_manual_set_runs_the_worker_through_the_noop_backend() {
+    let daemon = start("a_manual_set_runs_the_worker_through_the_noop_backend");
+    let file = daemon.dir.join("mine.png");
+    std::fs::write(&file, b"a file the user set by hand").expect("a file to set");
+    let lines = daemon.ask(&format!("set path {}", file.display()));
     assert_eq!(lines.last().map(String::as_str), Some("OK"));
     assert_eq!(
         lines[1], "queued",
@@ -262,8 +273,16 @@ fn a_rotation_runs_the_worker_through_the_noop_backend() {
     assert_eq!(fields.len(), 4, "set: <digest> <origin_key> <via> <path>");
     assert_eq!(fields[0].len(), 64, "a content digest is 64 hex chars");
     assert!(fields[0].bytes().all(|b| b.is_ascii_hexdigit()));
-    assert_eq!(fields[2], "source");
-    assert!(fields[1].contains(':'), "an origin_key carries a source id");
+    assert_eq!(fields[2], "manual", "a `set path` is `via: manual` (2.6)");
+    assert!(
+        fields[1].starts_with("external:"),
+        "a hand-set file's origin is `external:<sha256 of the path>` (2.6): {set}"
+    );
+    assert_eq!(
+        fields[3],
+        file.display().to_string(),
+        "the user's own file is referenced, never copied (6.4)"
+    );
 
     let status = daemon.ask("status");
     assert!(
@@ -334,18 +353,18 @@ const PLAN_CHECK: &str = "plan: schedule.interval_seconds=1800 schedule.worker_d
 /// config order, then exactly one `plan:` line. The two sources are 4.2's, in its
 /// order, with its weights.
 ///
-/// `last` is `-` here because a check has no outcome to report (2.6), and the
-/// bracketed counter group of 2.6's record form is absent because the pipeline
-/// that counts candidates does not exist yet (`crates/whirl-worker/src/pipeline.rs`
-/// says which stage is a placeholder, and no source implementation exists). The
-/// group is optional in that form, and these assertions pin the bytes the
-/// scaffold emits today: the group's arrival will fail them, which is the signal
-/// for the pipeline card to update this fixture.
+/// `last` is `-` here because a check has no outcome to report (2.6). `enabled=0`
+/// with the reason and no bracketed counter group: no `kind` has an
+/// implementation in this build, so no source can be enumerated and nothing can
+/// be counted. 4.3 fixes that form and 2.6 says the group is optional; the group
+/// arrives with each source's own card.
 fn config_check_lines() -> Vec<String> {
     vec![
         "queued".to_string(),
-        "source: pictures local weight=1 enabled=1 last=- reason=-".to_string(),
-        "source: space wallhaven weight=3 enabled=1 last=- reason=-".to_string(),
+        "source: pictures local weight=1 enabled=0 last=- reason=no implementation for kind local in this build"
+            .to_string(),
+        "source: space wallhaven weight=3 enabled=0 last=- reason=no implementation for kind wallhaven in this build"
+            .to_string(),
         PLAN_CHECK.to_string(),
     ]
 }
@@ -462,7 +481,12 @@ fn history_reports_the_ring_newest_first_in_the_record_form() {
         );
         assert_eq!(fields[0].len(), 20, "`set_at` is RFC 3339 UTC: {entry}");
         assert_eq!(fields[1], "manual", "a `set path` is `via: manual` (2.6)");
-        assert_eq!(fields[2], "local", "`kind` names the origin (2.6)");
+        assert_eq!(
+            fields[2], "external",
+            "`kind` names the origin, and a hand-set file's origin is external \
+             (state-and-cache's `kind: external` for `history.json`; the \
+             `origin_key` prefix `external:` is what the daemon reads, 2.6)"
+        );
         assert!(
             fields[3].contains(':'),
             "an origin_key carries a source id: {entry}"
@@ -775,7 +799,11 @@ fn the_clis_quickstart_commands_answer_over_the_real_socket() {
     // `OK` is the terminator and is not printed as a data line (2.5.1).
     assert!(!status.contains("\nOK\n"), "{status}");
 
-    let (ok, next) = whirl(&daemon, &["next"]);
+    // `set <path>` rather than `next`: no source has an implementation in this
+    // build, so only a manual set reaches a real worker and a real `set:` line.
+    let file = daemon.dir.join("quickstart.png");
+    std::fs::write(&file, b"a file the quickstart sets").expect("a file to set");
+    let (ok, next) = whirl(&daemon, &["set", &file.display().to_string()]);
     assert!(ok, "{next}");
     assert!(next.lines().any(|line| line == "queued"), "{next}");
     let set = next
@@ -1085,7 +1113,13 @@ fn subscribe_streams_one_event_per_state_change() {
     // start arms `next_at` one interval out, so 5.5 rule 6 has no past deadline
     // to rotate on. Two events is what [M 12]'s duplicate wake had to be
     // replaced by (2.9).
-    let rotation = daemon.ask("next");
+    //
+    // The state change is a manual `set path`: no source has an implementation in
+    // this build, so `next` would reach the worker and fail, which is the test
+    // below. Either route takes a slot and produces the two events.
+    let file = daemon.dir.join("streamed.png");
+    std::fs::write(&file, b"a file the stream set").expect("a file to set");
+    let rotation = daemon.ask(&format!("set path {}", file.display()));
     assert_eq!(rotation.last().map(String::as_str), Some("OK"));
     let set = rotation
         .iter()
@@ -1144,12 +1178,12 @@ fn subscribe_streams_one_event_per_state_change() {
 /// stream -- and `2.10`'s `last_error` carries the code afterwards.
 ///
 /// The failure needs no special worker: the daemon is configured, before it
-/// starts, with one `wallhaven` source and no local one, and
-/// `crates/whirl-worker/src/pipeline.rs` has no HTTP client, so the worker
-/// reports `no_candidates` on stderr with its failing stage. The config is the
-/// minimum 4.3 accepts (`sources` is the only key that decides this outcome; the
-/// rest take their defaults), so this test does not have to carry 4.2's whole
-/// example.
+/// starts, with one `wallhaven` source and no local one, and no `kind` has an
+/// implementation in this build (`crates/whirl-worker/src/sources`'s dispatch
+/// table), so the worker reports `no_candidates` on stderr with its failing
+/// stage. The config is the minimum 4.3 accepts (`sources` is the only key that
+/// decides this outcome; the rest take their defaults), so this test does not
+/// have to carry 4.2's whole example.
 ///
 /// A wrong code, a message that is not the worker's own stderr line, the two
 /// fields in the other order, or a stream event whose `seq` does not follow the
@@ -1264,7 +1298,18 @@ fn subscribe_reports_the_gap_for_a_resume_point() {
 #[test]
 fn the_state_files_are_written_and_read_back_across_a_restart() {
     let mut daemon = start("the_state_files_are_written_and_read_back_across_a_restart");
-    assert_eq!(daemon.ask("next").last().map(String::as_str), Some("OK"));
+    // A manual `set path` rather than `next`: no source has an implementation in
+    // this build, so only a manual set reaches a real worker and a real `set:`
+    // line to record.
+    let file = daemon.dir.join("state.png");
+    std::fs::write(&file, b"a file the state test set").expect("a file to set");
+    assert_eq!(
+        daemon
+            .ask(&format!("set path {}", file.display()))
+            .last()
+            .map(String::as_str),
+        Some("OK")
+    );
     assert_eq!(daemon.ask("pause").last().map(String::as_str), Some("OK"));
     assert_eq!(
         daemon.ask("favorite").last().map(String::as_str),
