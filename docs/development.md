@@ -141,7 +141,7 @@ Where things live, in one line each:
 It is kept, not deleted, and it is not a starting point for new work:
 
 1. **It is the evidence behind the design.** The resident-cost table in
-   `docs/architecture.md` 1.3 and the README (1.8 MB idle, 2.3 MB after 7
+   `docs/architecture.md` 1.3 and the root `README.md` (1.8 MB idle, 2.3 MB after 7
    rotations, 12 MB to 140 MB in-process) cite `prototype/whd/whd.rs` and
    `prototype/README.md` by file and line. Deleting it would leave those rows
    uncited and un-reproducible.
@@ -768,7 +768,7 @@ a platform backend. If `whirld` approaches a megabyte, someone linked one.
   forgotten: distribution packages, Flatpak, and Snap.
 - **Never bundle a helper.** `swaybg`, `hyprpaper`, `feh` and friends belong to
   the session or the compositor. A release that ships one has broken the design
-  rule in the README.
+  rule in the root `README.md`.
 
 ### Upgrading, and what happens to a running daemon
 
@@ -884,7 +884,7 @@ with either "done" or a numbered list of specific changes. A review that could
 have been written by reading the diff alone has not been done.
 
 Reviews of a document use the same rule. The reports live in `docs/reviews/`,
-and the index in `README.md` says what each one covers. Each report records
+and the index in `docs/README.md` says what each one covers. Each report records
 what the reviewer ran, what they observed, and what they could not check,
 marked as unverified rather than assumed either way.
 
