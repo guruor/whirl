@@ -42,11 +42,11 @@
 //! refuses for the key, and it is the same failure.
 //!
 //! **Rate limiting is not implemented, and this is the one place the number
-//! lives.** [`REQUESTS_PER_MINUTE`] is the spec's documented limit, not a
-//! measured one. One rotation asks for at most `pages` (hard cap 5) listing
-//! requests plus one download per admitted candidate, and a default rotation is
-//! half an hour apart, so pacing would be dead code; a 429 is the named
-//! [`SourceErrorKind::RateLimited`] and is never retried.
+//! lives.** [`REQUESTS_PER_MINUTE`] is measured from the API's own
+//! `x-ratelimit-limit` header. One rotation asks for at most `pages` (hard cap 5)
+//! listing requests plus one download per admitted candidate, and a default
+//! rotation is half an hour apart, so pacing would be dead code; a 429 is the
+//! named [`SourceErrorKind::RateLimited`] and is never retried.
 
 use std::process::Command;
 
@@ -61,12 +61,16 @@ use crate::http::{Curl, Fetch, Request};
 /// client that writes it: features.md 2.3 does not name one, and a bare
 /// programmatic client is what such an API's edge blocks.
 ///
-/// The documented rate limit: 45 requests per minute, 429 on exceed
-/// (features.md 2.3, `[1]`). **Not measured** — the research card that
-/// established it could not reach the response headers, and this session did not
-/// probe for them either (the probe would itself spend the budget it measures).
-/// It lives here, in one named place, so that a later measurement has one line
-/// to correct.
+/// The rate limit: 45 requests per minute, features.md 2.3's `[1]`.
+///
+/// **Measured, not just documented.** One keyless `GET /api/v1/search` on
+/// 2026-09-26 answered `x-ratelimit-limit: 45` with `x-ratelimit-remaining: 44`;
+/// the API reports those two headers and neither a reset nor a `retry-after`, so
+/// a client can read how much of the window is left but not when it turns over.
+/// The documented consequence of exceeding it is `429`, which was not observed
+/// (observing one means spending the budget this number measures). The number
+/// lives here, in one named place, so the next measurement has one line to
+/// correct.
 pub const REQUESTS_PER_MINUTE: u32 = 45;
 
 /// The listing endpoints of features.md 2.3's table.
