@@ -1230,6 +1230,18 @@ the three `command -v` lines below it will print nothing either; add the directo
 yourself, or install with `--root` into one that is already there. This document
 does not edit your shell configuration.
 
+`--root <dir>` is also the only pin that survives a machine that is not yours.
+`cargo install --path` spells no destination, so nothing on the command line
+constrains where the binary lands, and `--root` is what decides it. A `cargo` on
+`PATH` that is a version manager's shim can re-export `CARGO_HOME` over the value
+the caller exported, which makes `CARGO_HOME=<dir> cargo install --path …` look
+isolated when it is not: on macOS mise's shim does exactly that, and a run of the
+three installs above that exported a scratch `CARGO_HOME` still replaced this
+machine's own three binaries. Every run whose writes have to stay off the machine
+running it, an acceptance or smoke run in particular, adds `--root <dir>` to all
+three lines; the offline example under "Do I have to publish this to crates.io to
+install it?" below already uses that shape with `/tmp/whirl-prefix`.
+
 **From a release archive.** Once a tag has been cut, the archive is the three
 binaries and nothing else (section 5, "What a release artifact is, per platform"),
 stored flat, so the extraction directory *is* the directory all three must share:
@@ -1464,9 +1476,14 @@ published, nothing here runs `cargo publish`, and nothing here reads that file.
 was run on macOS, arm64, from a worktree of `development` at `607422c`: the three
 installs; the `PATH` check; the archive, built with the workflow's command and
 unpacked into the prefix; the sandbox and its daemon, `whirl status`, `whirl
-config check`, `whirl next` and the moved-worker pair; the uninstall, both with
-`--root` and against the default prefix, and the reinstall after it. The one
-value that differed is `WALLS`, which pointed at the collection on that machine.
+`config check`, `whirl next` and the moved-worker pair; the uninstall, both with
+`--root` and against the default prefix, and the reinstall after it. The
+default-prefix pair was not isolated: "the default prefix" is `$CARGO_HOME/bin`,
+the directory holding the three installed binaries this machine runs, so that
+`cargo uninstall` removed them and the reinstall after it wrote them back there.
+Only the `--root /tmp/whirl-prefix` shapes in this subsection stay inside the
+prefix. The one value that differed is `WALLS`, which pointed at the collection on
+that machine.
 The real `~/Library/Application Support/whirl` and `~/Library/Caches/whirl` were
 listed before and after and did not change. Not executed: a download from a real
 release, because none exists, and anything on Windows or Linux.
