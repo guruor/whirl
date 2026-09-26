@@ -616,7 +616,15 @@ impl Daemon {
     pub fn rotation(&self, run: u64, via: Via, verb: Verb, target: Option<&str>) -> Rotation {
         let deadline = self.worker_deadline();
         let mut reported = None;
-        let outcome = match self.worker.run(verb, target, run, deadline) {
+        // 7.3 step 4's input for 8.8: the pid of the worker this run reaps, once
+        // it has been reaped. It is `None` on every path that leaves a child
+        // unwaited (the deadline), and the sweep then treats the lock file as any
+        // other file left behind by a holder that is gone (8.8).
+        let mut reaped = None;
+        let result = self
+            .worker
+            .run_reporting_reaped(verb, target, run, deadline, &mut reaped);
+        let outcome = match result {
             Ok(Outcome::Set(record)) => {
                 self.record_success(
                     &record.digest,
@@ -667,8 +675,9 @@ impl Daemon {
         // 7.3 step 4 and 5.5's second trigger: the index entry, then the sweep,
         // after the worker has exited. A failed rotation runs the sweep too
         // ("including failed ones") and records no entry, because there is
-        // nothing the worker reported.
-        self.finish_rotation(reported.as_ref());
+        // nothing the worker reported. `reaped` goes with it: under 8.7's
+        // fallback it is what lets the sweep remove that worker's lock file (8.8).
+        self.finish_rotation(reported.as_ref(), reaped);
         outcome
     }
 
@@ -711,13 +720,32 @@ impl Daemon {
     /// has no call site in this build, because 2.5's verb set is closed and holds
     /// no such verb and 6.5's `whirl reset` is a CLI verb that has not landed.
     /// Never on a timer: "a timer is a resident thing to wake up for".
+    ///
+    /// This is the daemon's own take of the lock, so it carries no 8.8 exception:
+    /// see [`Daemon::sweep_with`] for the trigger that does.
     pub fn sweep(&self) {
+        self.sweep_with(None);
+    }
+
+    /// The same sweep, with 7.3 step 4's exception in hand: `reaped` is the pid
+    /// of the worker this daemon has **just reaped**, which is the one holder
+    /// whose `rotate.lock` a take may remove under 8.7's `excl_file` fallback
+    /// (8.8, `crate::lock::take_rotate_after_reaping`). Every other trigger
+    /// passes `None`, and there is then no lock file this can take from a holder.
+    fn sweep_with(&self, reaped: Option<u32>) {
         let config = cache::CacheConfig::from(&self.effective.config.cache);
-        // Step 1: the rotation lock, non-blocking. The worker's own half of 7.2
-        // (it takes `rotate.lock` for its run) is not in this build:
-        // `crates/whirl-worker` has no lock module yet, so a hand-run worker is
-        // the only other process this can meet.
-        let guard = match crate::lock::take_rotate(&self.effective.state_dir) {
+        // Step 1: the rotation lock, non-blocking. Both roles hold it: the worker
+        // for its run (7.3 step 2, `crates/whirl-worker/src/lock.rs`), so a second
+        // rotation's worker exits `busy` rather than queueing, and this sweep for
+        // the work it does (7.2). Under the fallback a file that is already there
+        // is a holder -- a live rotation, or 5.5 step 3's hand-run worker -- and
+        // the answer is the deferral below, unless it is the reaped worker's file
+        // and 8.8's report says so.
+        let taken = match reaped {
+            Some(pid) => crate::lock::take_rotate_after_reaping(&self.effective.state_dir, pid),
+            None => crate::lock::take_rotate(&self.effective.state_dir),
+        };
+        let guard = match taken {
             Ok(Some(guard)) => guard,
             Ok(None) => {
                 // 5.5 step 7's one line, with `deferred=1`: the shape is fixed,
@@ -800,7 +828,11 @@ impl Daemon {
     /// what the worker reported (7.2 makes the daemon the writer of
     /// `cache/index.json`), then the sweep. Both run after every rotation,
     /// including a failed one (5.5).
-    fn finish_rotation(&self, reported: Option<&Reported>) {
+    ///
+    /// `reaped` is the pid of the worker this rotation's process has reaped, and
+    /// it is the sweep's alone: 8.8's one exception to the refusal is the
+    /// `rotate.lock` of that worker, under 8.7's `excl_file` fallback.
+    fn finish_rotation(&self, reported: Option<&Reported>, reaped: Option<u32>) {
         if let Some(reported) = reported {
             let protected = {
                 let state = self.state();
@@ -814,7 +846,7 @@ impl Daemon {
                 Err(message) => eprintln!("whirld: index entry not written: {message}"),
             }
         }
-        self.sweep();
+        self.sweep_with(reaped);
     }
 
     pub fn resolve_id(&self, id: &str) -> Option<Resolved> {
@@ -1573,6 +1605,46 @@ mod tests {
             "the newest is still there"
         );
 
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 8.8's exception, seen from the daemon's own side: the sweep that follows a
+    /// rotation must not take the lock out from under a holder that is still
+    /// there. The holder here is this process's own `flock` on `rotate.lock` --
+    /// the shape of 5.5 step 3's hand-run worker -- and the sweep is handed that
+    /// very pid as the worker it has just reaped, which is the strongest form of
+    /// the question: the pid matches, and the primitive is the reason nothing is
+    /// removed (8.8 keeps the removal to 8.7's `excl_file` fallback).
+    ///
+    /// The sweep defers (5.5 step 1), and both the file and its record are still
+    /// there afterwards, which is what the `sweep_deferred: 1` in `status` claims.
+    #[test]
+    fn a_sweep_after_a_rotation_does_not_remove_a_live_holders_lock_file() {
+        let root = std::env::temp_dir().join(format!("whirl-sweep-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let daemon = daemon(&root, Attempt::Acquired);
+        let state_dir = root.join("state");
+        let path = state_dir.join(crate::lock::ROTATE_FILE);
+        // The record 8.7 asks a holder to write, naming this process, which is
+        // the live holder the `flock` below makes it.
+        let record = format!("pid: {}\nstart: 2026-09-26T06:00:00Z\n", std::process::id());
+        std::fs::write(&path, &record).expect("the holder's record");
+        let holder = crate::lock::take_rotate(&state_dir)
+            .expect("a take that cannot fail")
+            .expect("the lock is free to begin with");
+
+        daemon.sweep_with(Some(std::process::id()));
+
+        assert_eq!(kv(&daemon.status(), "sweep_deferred"), "1");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the holder's file"),
+            record,
+            "the live holder's file, and its record, are untouched"
+        );
+
+        drop(holder);
         drop(daemon);
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -212,7 +212,7 @@ fn take_with(
                 Some(mode) => {
                     // Nobody else can hold a file this process just created, so
                     // the record is written before anything can read it.
-                    write_record(&file, pid)?;
+                    write_record(&path, &file, pid)?;
                     Ok(DaemonLock {
                         path,
                         file: Some(file),
@@ -233,7 +233,7 @@ fn take_with(
             let attempt = probe(&file).map_err(|error| cannot_lock(&path, &error))?;
             match select(attempt) {
                 Some(Mode::Flock) => {
-                    write_record(&file, pid)?;
+                    write_record(&path, &file, pid)?;
                     Ok(DaemonLock {
                         path,
                         file: Some(file),
@@ -280,13 +280,18 @@ fn open_existing(path: &Path) -> Result<File, String> {
         .map_err(|error| format!("cannot open {}: {error}", path.display()))
 }
 
-fn write_record(file: &File, pid: u32) -> Result<(), String> {
+fn write_record(path: &Path, file: &File, pid: u32) -> Result<(), String> {
     let mut writer = file;
     writer
         .seek(SeekFrom::Start(0))
         .and_then(|_| writer.set_len(0))
         .and_then(|_| writer.write_all(DaemonLock::record(pid).as_bytes()))
-        .map_err(|error| format!("cannot write the daemon lock record: {error}"))
+        .map_err(|error| {
+            format!(
+                "cannot write the lock record at {}: {error}",
+                path.display()
+            )
+        })
 }
 
 /// The `pid` and `start` of 7.2's record, as the holder wrote them.
@@ -384,44 +389,54 @@ impl Drop for RotateLock {
 /// caller: the worker exits `busy`, the sweep defers. Creating the `locks`
 /// directory is this function's job for the same reason it is the daemon
 /// lock's: it may be the first thing to touch the state directory.
+///
+/// This is the take without 8.8's exception, which is the one 5.5's startup and
+/// `reset` triggers make: neither of them has reaped a worker, so neither holds
+/// the proof the exception rests on.
 pub fn take_rotate(state_dir: &Path) -> Result<Option<RotateLock>, String> {
-    take_rotate_with(state_dir, flock_attempt)
+    take_rotate_with(state_dir, flock_attempt, None)
+}
+
+/// 8.8's one exception, as an argument: the same non-blocking take, told the pid
+/// of the worker this daemon has **just reaped** (7.3 step 4).
+///
+/// 8.8: "the daemon removes the lock file here when the record in it names the
+/// worker it has just reaped. No liveness probe and no pid-reuse question arise,
+/// because only the parent holds the exit status." So the exception is exactly
+/// this argument and nothing more. Under 8.7's `excl_file` fallback, a file
+/// whose record names `reaped_pid` is removed and the lock is taken in its
+/// place; a file naming any other holder -- a live rotation, or the hand-run
+/// worker of 5.5 step 3 -- is left exactly where it is, which is 5.5 step 1's
+/// deferral and the conservative direction 8.8 asks for. Under `flock` the
+/// argument changes nothing at all, because 8.8 keeps this case to the fallback
+/// alone: there the kernel releases the lock when the holder exits and there is
+/// nothing to judge (7.2).
+pub fn take_rotate_after_reaping(
+    state_dir: &Path,
+    reaped_pid: u32,
+) -> Result<Option<RotateLock>, String> {
+    take_rotate_with(state_dir, flock_attempt, Some(reaped_pid))
 }
 
 /// The same, with the capability probe supplied: 8.7's `ENOTSUP` direction is
 /// one no filesystem on this machine can produce, and under it "the file exists"
-/// means "someone else holds the lock" rather than "we do".
+/// means "someone else holds the lock" rather than "we do". `reaped` is 8.8's
+/// exception, [`take_rotate_after_reaping`]; `None` is every other caller.
 fn take_rotate_with(
     state_dir: &Path,
     probe: impl Fn(&File) -> Result<Attempt, std::io::Error>,
+    reaped: Option<u32>,
 ) -> Result<Option<RotateLock>, String> {
     create_private_dir(state_dir)?;
     create_private_dir(&state_dir.join(LOCK_DIR))?;
     let path = state_dir.join(ROTATE_FILE);
 
     match open_exclusive(&path) {
-        Ok(file) => {
-            let attempt = probe(&file).map_err(|error| {
-                format!(
-                    "cannot take the rotation lock at {}: {error}",
-                    path.display()
-                )
-            })?;
-            match select(attempt) {
-                Some(mode) => Ok(Some(RotateLock {
-                    path,
-                    file: Some(file),
-                    mode,
-                })),
-                // A descriptor this process created exclusively cannot be held
-                // by anyone else, so an OS that says otherwise is not a state to
-                // sweep in.
-                None => Err(format!(
-                    "{} was created exclusively and still reads as held: not sweeping on that answer",
-                    path.display()
-                )),
-            }
-        }
+        // Nobody held it, so there is nothing to remove: the file being already
+        // gone is the usual outcome of a fallback run, because the worker's own
+        // guard removes it on the way out. 8.8's removal has no case to reach
+        // here, and the lock is taken the way 8.7 defines it.
+        Ok(file) => take_created(&path, file, &probe),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let file = open_existing(&path)?;
             let attempt = probe(&file).map_err(|error| {
@@ -438,12 +453,98 @@ fn take_rotate_with(
                 })),
                 // 8.8: under the fallback the file's existence is the lock, so a
                 // file this process did not create is a holder this process does
-                // not remove. 8.8's one exception, the worker the daemon has
-                // just reaped, is the worker's half of 7.2 and lands with it.
+                // not take over -- with the one exception the parent is entitled
+                // to make, the worker whose exit status it holds (7.3 step 4).
+                // The record is what names that worker, so the exception is a
+                // comparison of two pids and not a liveness probe.
+                Some(Mode::ExclFile) if names_the_reaped_worker(&file, reaped) => {
+                    drop(file);
+                    remove_reaped_file(&path)?;
+                    match open_exclusive(&path) {
+                        Ok(file) => take_created(&path, file, &probe),
+                        // The file is back and it is not the one just removed:
+                        // another process took the lock in the window this
+                        // removal opened, so this is the deferral it would have
+                        // answered without 8.8's exception.
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+                        Err(error) => Err(format!("cannot create {}: {error}", path.display())),
+                    }
+                }
                 Some(Mode::ExclFile) | None => Ok(None),
             }
         }
         Err(error) => Err(format!("cannot create {}: {error}", path.display())),
+    }
+}
+
+/// The take that follows an exclusive create: the probe, 8.7's selection, and
+/// the guard. Shared by the two creates this module can perform -- the one at
+/// the top of [`take_rotate_with`], and the one 8.8's exception performs after
+/// removing the reaped worker's file -- so both answer the same way.
+fn take_created(
+    path: &Path,
+    file: File,
+    probe: &impl Fn(&File) -> Result<Attempt, std::io::Error>,
+) -> Result<Option<RotateLock>, String> {
+    let attempt = probe(&file).map_err(|error| {
+        format!(
+            "cannot take the rotation lock at {}: {error}",
+            path.display()
+        )
+    })?;
+    match select(attempt) {
+        Some(mode) => {
+            // 8.7's fallback file "names the holder: its pid, and the platform's
+            // own start time for that pid", and 8.7 says the fallback "covers
+            // both locks of 7.2". This process created the file exclusively, so
+            // nobody else can be holding it and the record is written before the
+            // guard that would let a reader find it exists. Under `flock` no
+            // record is written at all: the file is the kernel's lock and 8.8
+            // has nothing to judge there.
+            if mode == Mode::ExclFile {
+                write_record(path, &file, std::process::id())?;
+            }
+            Ok(Some(RotateLock {
+                path: path.to_path_buf(),
+                file: Some(file),
+                mode,
+            }))
+        }
+        // A descriptor this process created exclusively cannot be held by anyone
+        // else, so an OS that says otherwise is not a state to sweep in.
+        None => Err(format!(
+            "{} was created exclusively and still reads as held: not sweeping on that answer",
+            path.display()
+        )),
+    }
+}
+
+/// 8.8's exception, as the one question it is: does the record in this file name
+/// the worker this daemon has just reaped?
+///
+/// Both halves have to be there. A file with no readable record names nobody,
+/// and a take that was given no reaped pid is no exception at all, which is why
+/// this is one comparison over two `Option`s rather than a test on one of them:
+/// a missing record must not match a missing pid.
+fn names_the_reaped_worker(file: &File, reaped: Option<u32>) -> bool {
+    match (read_record(file).pid, reaped) {
+        (Some(recorded), Some(reaped)) => recorded == reaped,
+        _ => false,
+    }
+}
+
+/// The removal of 8.8's exception.
+///
+/// `ENOENT` is not a failure: the file was there when its record was read, so a
+/// removal that finds nothing means another process removed it in the window
+/// between the read and this call, and "already gone" is the state this step
+/// wants either way. Nothing else is tolerated, because a removal that did not
+/// happen would leave behind the file that makes the take defer.
+fn remove_reaped_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
     }
 }
 
@@ -514,6 +615,7 @@ pub(crate) fn take_as(state_dir: &Path, attempt: Attempt) -> Result<DaemonLock, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("whirl-lock-{}-{name}", std::process::id()));
@@ -589,8 +691,8 @@ mod tests {
         std::fs::write(dir.join(ROTATE_FILE), "pid 4711 start 1790000000\n")
             .expect("a planted lock file");
 
-        let deferred =
-            take_rotate_with(&dir, |_| Ok(Attempt::Unsupported)).expect("a take that cannot fail");
+        let deferred = take_rotate_with(&dir, |_| Ok(Attempt::Unsupported), None)
+            .expect("a take that cannot fail");
         assert!(
             deferred.is_none(),
             "8.8: the file's existence is the holder"
@@ -599,6 +701,160 @@ mod tests {
             dir.join(ROTATE_FILE).is_file(),
             "and a lock this process did not create is not removed"
         );
+    }
+
+    /// The inode of a file: what tells "8.8 removed it and 7.3 step 4 created
+    /// another" apart from "the same file, untouched".
+    fn inode(path: &Path) -> u64 {
+        std::fs::metadata(path).expect("the lock file").ino()
+    }
+
+    /// The record of 8.7, as a holder writes it: the pid and the start time.
+    fn plant_lock(state_dir: &Path, pid: u32) -> PathBuf {
+        create_private_dir(state_dir).expect("the state directory");
+        create_private_dir(&state_dir.join(LOCK_DIR)).expect("locks/");
+        let path = state_dir.join(ROTATE_FILE);
+        std::fs::write(&path, format!("pid: {pid}\nstart: 2026-09-26T06:00:00Z\n"))
+            .expect("a planted lock file");
+        path
+    }
+
+    /// 7.3 step 4 and 8.8's one exception, in the fallback's own direction: the
+    /// `rotate.lock` of the worker this daemon has just reaped is removed, and
+    /// the daemon becomes the holder in its place -- which is what lets the sweep
+    /// that follows every rotation run at all on a filesystem that cannot
+    /// `flock`, instead of deferring behind a holder that is gone.
+    ///
+    /// The record is what authorises the removal, and the inode is what proves
+    /// it: the file at that path after the take is not the worker's file.
+    #[test]
+    fn the_reaped_workers_lock_file_is_removed_under_the_fallback() {
+        let dir = scratch("reaped-worker");
+        let worker = 4711;
+        let path = plant_lock(&dir, worker);
+        let left_behind = inode(&path);
+
+        let guard = take_rotate_with(&dir, |_| Ok(Attempt::Unsupported), Some(worker))
+            .expect("a take that cannot fail")
+            .expect("8.8: the reaped worker's file is not a holder");
+
+        assert_eq!(guard.mode, Mode::ExclFile);
+        assert!(
+            path.is_file(),
+            "7.3 step 4: the daemon holds the lock now, so its file is there"
+        );
+        assert_ne!(
+            inode(&path),
+            left_behind,
+            "the reaped worker's file is gone; this is the file the daemon created"
+        );
+        // 8.7 says the fallback file names its holder, so the record that is there
+        // is the daemon's own and not the worker's.
+        let record = read_record(&File::open(&path).expect("the daemon's lock file"));
+        assert_eq!(record.pid, Some(std::process::id()), "{record:?}");
+
+        drop(guard);
+        assert!(
+            !path.exists(),
+            "8.7: releasing the fallback's lock removes the file"
+        );
+    }
+
+    /// The same question with no file to remove: a worker that exited cleanly
+    /// removed its own file on the way out (8.7's release), so the fallback take
+    /// finds none and creates one, record and all. 8.8's removal has no case for
+    /// "the lock file is already gone" to reach, and this is that path.
+    #[test]
+    fn a_reaping_take_with_no_lock_file_creates_one() {
+        let dir = scratch("reaped-worker-gone");
+        create_private_dir(&dir).expect("the state directory");
+
+        let guard = take_rotate_with(&dir, |_| Ok(Attempt::Unsupported), Some(4711))
+            .expect("a take that cannot fail")
+            .expect("no file existed, so nothing held the lock");
+
+        assert_eq!(guard.mode, Mode::ExclFile);
+        let path = dir.join(ROTATE_FILE);
+        assert!(path.is_file(), "7.3 step 4's take created it");
+        assert_eq!(
+            read_record(&File::open(&path).expect("the lock file")).pid,
+            Some(std::process::id()),
+            "and 8.7's record names the holder that created it"
+        );
+    }
+
+    /// The conservative direction 8.8 asks for, on the same fallback: a file
+    /// whose record names *any other* holder -- a live rotation, or 5.5 step 3's
+    /// hand-run worker -- is left exactly where it is, and the take answers the
+    /// deferral it would have answered without the exception. The file is the
+    /// same file afterwards, not a re-created one.
+    #[test]
+    fn a_lock_file_naming_another_holder_survives_the_reaping_take() {
+        let dir = scratch("other-holder");
+        let path = plant_lock(&dir, 4242);
+        let left_behind = inode(&path);
+
+        let deferred = take_rotate_with(&dir, |_| Ok(Attempt::Unsupported), Some(4711))
+            .expect("a take that cannot fail");
+        assert!(
+            deferred.is_none(),
+            "8.8: a holder other than the reaped worker is not taken from"
+        );
+        assert_eq!(inode(&path), left_behind, "and its file is untouched");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("the planted lock file")
+                .contains("pid: 4242"),
+            "its record is untouched too"
+        );
+    }
+
+    /// The same with no record to read: a lock file left by a holder that
+    /// recorded nothing names nobody, so it is not the reaped worker's and it is
+    /// not removed. This is the case the two `Option`s have to match on `Some`
+    /// for: a file with no pid must not be the reaped worker of a take that was
+    /// told a pid.
+    #[test]
+    fn a_lock_file_with_no_record_is_not_the_reaped_workers() {
+        let dir = scratch("no-record");
+        create_private_dir(&dir).expect("the state directory");
+        create_private_dir(&dir.join(LOCK_DIR)).expect("locks/");
+        let path = dir.join(ROTATE_FILE);
+        std::fs::write(&path, "").expect("a lock file with no record");
+
+        assert!(
+            take_rotate_with(&dir, |_| Ok(Attempt::Unsupported), Some(4711))
+                .expect("a take that cannot fail")
+                .is_none(),
+            "8.8: the record has to name the reaped worker, and this one names nobody"
+        );
+        assert!(path.is_file(), "so the file stays");
+    }
+
+    /// 8.8 keeps the exception to the fallback alone, and this is the other
+    /// primitive's answer: under `flock` the kernel releases the lock when the
+    /// holder exits, so a file that reads as *held* is a live holder and not a
+    /// leftover -- it is not removed even when the take is handed that very
+    /// process's pid. The holder here is this test process's own `flock`, which is
+    /// the shape of 5.5 step 3's hand-run worker.
+    #[test]
+    fn a_held_flock_is_never_removed_by_the_reaping_take() {
+        let dir = scratch("held-flock");
+        let holder = take_rotate(&dir)
+            .expect("a take that cannot fail")
+            .expect("the lock is free to begin with");
+
+        assert!(
+            take_rotate_after_reaping(&dir, std::process::id())
+                .expect("a take that cannot fail")
+                .is_none(),
+            "a live holder is a deferral, not something to remove"
+        );
+        assert!(
+            dir.join(ROTATE_FILE).is_file(),
+            "and the live holder's file is still there"
+        );
+        drop(holder);
     }
 
     /// 1.5 step 1 and 7.2: the lock is real, and the second daemon refuses rather

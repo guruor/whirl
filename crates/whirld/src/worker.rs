@@ -191,6 +191,31 @@ impl Worker {
         run: u64,
         deadline: Duration,
     ) -> Result<Outcome, WorkerError> {
+        self.run_reporting_reaped(verb, target, run, deadline, &mut None)
+    }
+
+    /// The same run, with 8.8's proof attached: `reaped` is where the pid of the
+    /// child this process **has reaped** goes. That pid is the one thing that
+    /// entitles a take of `rotate.lock` to remove a lock file under 8.7's
+    /// `excl_file` fallback (8.8, 7.3 step 4): the parent holds the exit status,
+    /// so the holder is provably gone and no liveness probe is needed.
+    ///
+    /// It stays `None` wherever no child was reaped: the spawn paths that never
+    /// produced a worker, a `try_wait` that failed, and 1.7.1's deadline, where
+    /// `terminate` kills the child and this process does not wait for it. The
+    /// last one is deliberate and not a gap: 8.8's exception is "the worker the
+    /// daemon has just reaped", a killed child that was never waited for is not
+    /// that, and its `rotate.lock` is therefore left where it is and the sweep
+    /// defers (5.5 step 1) rather than being taken from a holder whose death this
+    /// process cannot vouch for.
+    pub(crate) fn run_reporting_reaped(
+        &self,
+        verb: Verb,
+        target: Option<&str>,
+        run: u64,
+        deadline: Duration,
+        reaped: &mut Option<u32>,
+    ) -> Result<Outcome, WorkerError> {
         let mut command = Command::new(&self.program);
         command
             .arg("--config")
@@ -258,6 +283,12 @@ impl Worker {
             }
             std::thread::sleep(POLL);
         };
+
+        // 8.8's proof, and the only place it is obtained: `try_wait` returned the
+        // exit status, so this process has reaped the child that held that pid.
+        // Every path that returns above this line leaves `reaped` exactly as the
+        // caller left it.
+        *reaped = Some(child.id());
 
         // Read after the exit. The contract caps stdout at two lines and stderr
         // at one, so the pipe buffer cannot be full; a worker that ignored the
