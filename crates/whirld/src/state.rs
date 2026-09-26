@@ -628,10 +628,14 @@ impl Daemon {
     pub fn rotation(&self, run: u64, via: Via, verb: Verb, target: Option<&str>) -> Rotation {
         let deadline = self.worker_deadline();
         let mut reported = None;
-        // 7.3 step 4's input for 8.8: the pid of the worker this run reaps, once
-        // it has been reaped. It is `None` on every path that leaves a child
-        // unwaited (the deadline), and the sweep then treats the lock file as any
-        // other file left behind by a holder that is gone (8.8).
+        // 7.3 step 4's input for 8.8: the pid of the worker this run has reaped,
+        // written by the two places that hold an exit status -- the `try_wait`
+        // that saw a normal exit, and `terminate` on the deadline (1.7.1). A
+        // path that holds no exit status leaves it `None`: a spawn that never
+        // produced a worker, a `try_wait` or `wait` that failed. `None` is not
+        // "the holder is gone" but "this daemon cannot say", and the take then
+        // defers and leaves the file alone (5.5 step 1) -- which is why a
+        // timed-out rotation's reap is worth reporting rather than dropping.
         let mut reaped = None;
         let result = self
             .worker
