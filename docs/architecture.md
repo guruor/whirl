@@ -224,8 +224,9 @@ either side can see the whole interface:
   adapters need named session variables rather than the whole environment:
   `PATH`, `HOME`, `WHIRL_CONFIG`, `WHIRL_BACKEND`, `WHIRL_WALLHAVEN_API_KEY` (only when set in the
   daemon's own environment, which is one of the three places a key may come from
-  `[D 5 §2.4]`), `WHIRL_CACHE_DIR` and `WHIRL_STATE_DIR` (only when set in the daemon's own
-  environment), and, on Linux only, nine variables: the four signals
+  `[D 5 §2.4]`), `WHIRL_CACHE_DIR` and `WHIRL_STATE_DIR` (always, set to the directories this daemon
+  resolved whether or not its own environment named them), and, on Linux only, nine variables: the
+  four signals
   `[D 3 §Detecting the environment]` names as decisive (`XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`,
   `SWAYSOCK` with `I3SOCK`, `HYPRLAND_INSTANCE_SIGNATURE` - five variables, because sway and i3
   share a row), plus four more that a session bus or a display connection needs and that the same
@@ -235,15 +236,18 @@ either side can see the whole interface:
   them as such rather than as detection signals. Without them the worker cannot tell a GNOME
   session from a KDE one, and `[D 3 §Detecting the environment]` is explicit that `gsettings` being
   on `PATH` is not a GNOME signal.
-- **The two path knobs are the environment's, not the worker's invention.** `WHIRL_CACHE_DIR` and
-  `WHIRL_STATE_DIR` are on the list because 4.3 puts the environment ahead of the file for the cache
-  root and the state directory, and the worker resolves both itself: it writes
-  `sha256/**` under the cache root and reads the history ring out of the state directory. A scrub
+- **The two path knobs reach the worker as this daemon's resolved directories.** `WHIRL_CACHE_DIR`
+  and `WHIRL_STATE_DIR` are on the list because 4.3 puts the environment ahead of the file for the
+  cache root and the state directory, and the worker is the process that writes `sha256/**` under
+  the cache root and builds the recent window of 4.1 out of the state directory. A scrub
   that dropped them would leave the two processes resolving one knob two ways - the daemon reporting
   the directory the environment named, because it read it, and the worker writing into the compiled
   default, because it never saw it - while `status` reported the daemon's answer as the effective
-  one. Passing the value through is what keeps "the environment wins" true of the worker as well as
-  of the daemon; the daemon still does not set a knob the environment left unset.
+  one. The daemon therefore sets both names to the directories it resolved whether or not its own
+  environment named them, because the platform default is itself chosen by variables this list does
+  not carry (`$XDG_STATE_HOME` and `$XDG_CACHE_HOME` on Linux, `%LOCALAPPDATA%` on Windows;
+  `[D 6 §1.2]`, `[D 6 §1.3]`), and a child left to re-derive them reads a different `history.json`
+  than the daemon wrote and gets a 4.1 window that is silently empty.
 - **stdout:** at most two lines. `downloaded: <digest> <abs path>` after the rename, and
   `set: <digest> <origin_key> <abs path>` after the setter returned success. The daemon parses the
   last non-empty line as the result and keeps the whole capture for the log
