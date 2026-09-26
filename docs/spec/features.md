@@ -57,6 +57,7 @@ not produce both went to Part 3 instead.
 | `whirl config path` / `whirl config check` | Print the config path; validate and print the effective plan (which sources load, which filters apply). `check` runs in the worker, so a bad source is caught before it costs a rotation. |
 | `whirl idle` | Block until state changes. For frontends, so none of them polls. |
 | `whirl version` | Daemon version and protocol version. |
+| `whirl ping` | Is the daemon there? One round trip that does no work: nothing on stdout, exit 0 when it answered, exit 2 when the socket is unreachable. |
 
 `decision:` deliberately not in v0.1, and why each can wait:
 
