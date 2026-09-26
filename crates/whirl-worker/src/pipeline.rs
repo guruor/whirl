@@ -313,6 +313,16 @@ pub fn stage_type(input: Vec<Seeking>, platform: Platform) -> Stage {
 /// 2.5 step 5, the cheap half of dedupe: a candidate whose `origin_key` (or
 /// whose id) is in the recent window of 4.1, "the whole history ring (50 entries
 /// by default) plus the current index".
+///
+/// A window that holds every candidate therefore empties this stage, and that is
+/// the answer 4.1 asks for rather than a case to work around: the rotation ends
+/// as `no_candidates` with nothing set and the slot spent, which is
+/// docs/architecture.md 1711's row 3 ("everything filtered out") and 655's
+/// definition of the code. The alternative, relaxing the window until something
+/// matches, would set the image the rule exists to keep off the screen, and 9's
+/// table prices the larger window as "fewer repeats of an image the user liked,
+/// which is a preference, not a correctness property" - a preference, not a
+/// licence to break the rule.
 pub fn stage_recent(input: Vec<Seeking>, window: &Window) -> Stage {
     let mut stage = Stage::default();
     for seeking in input {
@@ -1257,6 +1267,11 @@ impl Run<'_> {
             };
             let filtered = filter_pipeline(self.config, self.platform, self.window, candidates);
             if filtered.kept.is_empty() {
+                // The exhaustion case of 4.1 is this line: a source offered
+                // candidates and the recent window removed all of them, so
+                // nothing is set and the reason carries the counters. The
+                // daemon has already spent the slot, and 1711's row 3 keeps it
+                // that way rather than inventing a retry.
                 reasons.push(format!(
                     "{}: {:?} candidates, {:?} admitted",
                     entry.config.id, filtered.counters.candidates, filtered.counters.admitted
@@ -1767,7 +1782,9 @@ mod tests {
     use std::io::Cursor;
     use std::rc::Rc;
     use whirl_core::config::{Config, ConfigError};
+    use whirl_core::protocol::{Kind, Via};
     use whirl_core::source::{Capability, Enumerated, FilterSet, Source, SourceError};
+    use whirl_core::state::{HistoryEntry, HistoryFile};
 
     // -- the two things a test owns: a source and a byte source -------------
 
@@ -2239,6 +2256,22 @@ mod tests {
         window: &'a Window,
         setter: &'a dyn Setter,
     ) -> Run<'a> {
+        noop_run_of(config, sources, transport, cache, window, setter, 1)
+    }
+
+    /// The same run with the rotation id of the caller: a rotation's id names
+    /// its part file (`tmp/<run>-<rand>.part`, 1.6), so two consecutive
+    /// rotations are two ids, which is what the window test needs.
+    #[allow(clippy::too_many_arguments)]
+    fn noop_run_of<'a>(
+        config: &'a Config,
+        sources: &'a crate::sources::Sources,
+        transport: &'a dyn Transport,
+        cache: &'a Cache,
+        window: &'a Window,
+        setter: &'a dyn Setter,
+        run: u64,
+    ) -> Run<'a> {
         Run {
             config,
             setter,
@@ -2247,7 +2280,7 @@ mod tests {
             cache,
             window,
             platform: Platform::Macos,
-            run: 1,
+            run,
             draw: 0,
         }
     }
@@ -2589,6 +2622,134 @@ mod tests {
             vec!["pictures:known".to_string()],
             "the source is handed the window rather than left to guess"
         );
+    }
+
+    /// 4.1's recent window across rotations, which is what nothing tested: the
+    /// window is the whole history ring plus the cache index, and its purpose is
+    /// that the image just set is not offered again while an unused candidate
+    /// remains. A unit test of `stage_recent` cannot see this, because it hands
+    /// itself a window; this one builds the window from a real state directory
+    /// with the real [`Window::load`], the way the worker does at start-up, and
+    /// records each rotation the way the daemon does (6.2: newest first, with
+    /// the digest and the `origin_key` the worker reported).
+    ///
+    /// The two candidate ids differ and so do their bytes, so neither level of
+    /// the dedupe can be what moves the second rotation to the other candidate:
+    /// only the window can.
+    ///
+    /// The third rotation is the exhaustion case of 4.1, and its policy is not
+    /// invented here. 4.1's rule is that every candidate in the window is
+    /// dropped; architecture.md 1711's row 3 makes "everything filtered out" a
+    /// `no_candidates` rotation, with `config check` as the diagnostic that
+    /// names the stage that removed them; and architecture.md 655 defines the
+    /// code as "every configured source yielded nothing admissible". So a window
+    /// that holds every candidate means nothing is set and the slot is spent,
+    /// not that the window is relaxed until something matches.
+    #[test]
+    fn consecutive_rotations_do_not_repeat_while_a_candidate_is_unused() {
+        struct Recording {
+            calls: Rc<RefCell<Vec<String>>>,
+        }
+        impl Setter for Recording {
+            fn set(&self, path: &str) -> Result<(), SetError> {
+                self.calls.borrow_mut().push(path.to_string());
+                Ok(())
+            }
+        }
+
+        let dir = scratch("worker-window-rotations");
+        // `copy`, not the fixture's default: the last assertion is about what the
+        // two rotations stored, and features.md 2.2's default is `reference`,
+        // which stores nothing (see `copy_config`'s own note).
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Bytes::of(&[("pictures/one.png", one), ("pictures/two.png", two)]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recording {
+            calls: Rc::new(RefCell::new(Vec::new())),
+        };
+        // The daemon's own encoder, in `whirl-core` beside the schema, so the
+        // file this test writes is the file `Window::load` really reads.
+        let write_history = |entries: &[HistoryEntry]| {
+            fs::create_dir_all(&state_dir).expect("the state directory");
+            let file = HistoryFile {
+                seq: entries.len() as u64 + 1,
+                written_at: "2026-09-26T00:00:00Z".to_string(),
+                entries: entries.to_vec(),
+            };
+            fs::write(state_dir.join(state::HISTORY_FILE), file.encode())
+                .expect("history.json is written");
+        };
+        let entry = |report: &Report| HistoryEntry {
+            set_at: "2026-09-26T00:00:00Z".to_string(),
+            via: Via::Source,
+            kind: Kind::Local,
+            origin_key: report.origin_key.clone(),
+            digest: Some(report.digest.clone()),
+            path: Some(report.path.clone()),
+        };
+
+        // Rotation 1: nothing has been set, so the window is empty and the
+        // first candidate is admissible.
+        let window = Window::load(&state_dir, &cache.index_path(), 50);
+        assert!(
+            !window.contains("pictures:one") && !window.contains("pictures:two"),
+            "an empty state directory is an empty window"
+        );
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation sets a candidate");
+        assert_eq!(first.origin_key, "pictures:one");
+        write_history(&[entry(&first)]);
+
+        // Rotation 2: the window holds the image just set, so the same candidate
+        // must not come back while the other one is unused.
+        let window = Window::load(&state_dir, &cache.index_path(), 50);
+        assert!(
+            window.contains("pictures:one"),
+            "the window must hold the image just set: {} is not in it",
+            first.origin_key
+        );
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation sets the other candidate");
+        assert_eq!(second.origin_key, "pictures:two");
+        assert_ne!(
+            second.origin_key, first.origin_key,
+            "the window must keep the image just set out of the next rotation"
+        );
+        write_history(&[entry(&second), entry(&first)]);
+
+        // Rotation 3: the window now holds every candidate. 4.1's rule leaves
+        // nothing admissible, and 1711's row 3 is the shape of the answer:
+        // `no_candidates`, nothing set, the slot spent by the caller.
+        let window = Window::load(&state_dir, &cache.index_path(), 50);
+        assert!(
+            window.contains("pictures:one") && window.contains("pictures:two"),
+            "the window must hold every candidate that has been set"
+        );
+        match noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3).rotate() {
+            Err(failure) => assert_eq!(failure.code, ErrorCode::NoCandidates),
+            Ok(report) => panic!(
+                "an exhausted window must set nothing, not repeat: {}",
+                report.set_line()
+            ),
+        }
+        assert_eq!(
+            setter.calls.borrow().len(),
+            2,
+            "the third rotation set nothing: the two calls are the two rotations before it"
+        );
+        assert_eq!(count_files(&cache.root().join("sha256")), 2);
     }
 
     /// The invariant of section 3: a partial fetch never becomes a cache file.

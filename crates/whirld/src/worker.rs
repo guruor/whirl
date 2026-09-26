@@ -5,9 +5,11 @@
 //! non-empty stdout line as the result. The environment is `env_clear()` plus
 //! the names 1.6 lists, which is the fix for `[M 16]` (the prototype inherited
 //! the daemon's whole environment) and what lets the Linux adapters see the
-//! session signals they need.
+//! session signals they need. Two of those names are set to this daemon's own
+//! *resolved* paths rather than to whatever the session had -
+//! `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` - because the worker reads the
+//! recent window of 4.1 out of the two files the daemon wrote (7.2).
 
-use std::ffi::OsString;
 use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -17,19 +19,6 @@ use whirl_core::protocol::{self, ErrorCode, SetRecord, Via};
 
 /// The variables the worker always gets (docs/architecture.md 1.6).
 const ALWAYS: [&str; 2] = ["PATH", "HOME"];
-
-/// The two path knobs of docs/architecture.md 4.3's environment layer that the
-/// worker resolves for itself, passed through with the daemon's own values when
-/// the daemon's environment has them (1.6 says so; the list is 1.6's).
-///
-/// They are here because 4.3 puts the environment ahead of the config file for
-/// the cache root and the state directory, and the worker resolves both on its
-/// own (`whirl_worker::pipeline::Cache::resolve` and `state_directory()`). A
-/// scrub that dropped them left the daemon reporting the directory the
-/// environment named while the worker fell through to the compiled default and
-/// wrote somewhere else: two processes, two directories, one rotation. Each name
-/// is passed only when set, which is the rule the API key below already follows.
-const PASSED_THROUGH: [&str; 2] = ["WHIRL_CACHE_DIR", "WHIRL_STATE_DIR"];
 
 /// The nine Linux-only variables: the four decisive session signals (five
 /// names, because sway and i3 share a row) plus the four a session bus or a
@@ -45,18 +34,6 @@ const LINUX_ONLY: [&str; 9] = [
     "WAYLAND_DISPLAY",
     "DISPLAY",
 ];
-
-/// The names the scrub lets through, in one place so the spawn, its test and
-/// 1.6's list cannot drift: `ALWAYS`, then 4.3's two path knobs, each one only
-/// when the lookup finds it. The daemon's own environment is the lookup in
-/// production; a test supplies its own table and asks the same question.
-fn forwarded(lookup: &dyn Fn(&str) -> Option<OsString>) -> Vec<(String, OsString)> {
-    ALWAYS
-        .iter()
-        .chain(PASSED_THROUGH.iter())
-        .filter_map(|name| lookup(name).map(|value| (name.to_string(), value)))
-        .collect()
-}
 
 /// The worker's verb (1.6). `prev` is not one: `prev`'s job is a `set` of a
 /// candidate the daemon already knows, so it spawns `--verb set --target`.
@@ -158,14 +135,31 @@ pub struct Worker {
     program: PathBuf,
     config_path: PathBuf,
     backend: Backend,
+    /// The two directories this daemon resolved and opened (4.3's precedence,
+    /// 7.2's ownership table): where `history.json` is written, and where the
+    /// cache root that holds `index.json` is. They are carried here rather than
+    /// re-derived by the child, which is the defect this pair fixes: a
+    /// `Window::load` whose state directory is not the daemon's reads no
+    /// history, so the recent window of 4.1 is silently empty and consecutive
+    /// rotations repeat.
+    state_dir: PathBuf,
+    cache_dir: PathBuf,
 }
 
 impl Worker {
-    pub fn new(program: PathBuf, config_path: PathBuf, backend: Backend) -> Worker {
+    pub fn new(
+        program: PathBuf,
+        config_path: PathBuf,
+        backend: Backend,
+        state_dir: PathBuf,
+        cache_dir: PathBuf,
+    ) -> Worker {
         Worker {
             program,
             config_path,
             backend,
+            state_dir,
+            cache_dir,
         }
     }
 
@@ -226,13 +220,28 @@ impl Worker {
         }
         command.arg("--run").arg(run.to_string());
         command.env_clear();
-        for (name, value) in forwarded(&|name| std::env::var_os(name)) {
-            command.env(name, value);
+        for name in ALWAYS {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
         }
         // The daemon resolved the backend, so the worker is told rather than
         // asked to re-resolve it (docs/development.md section 7).
         command.env("WHIRL_CONFIG", &self.config_path);
         command.env("WHIRL_BACKEND", self.backend.as_str());
+        // The same reasoning for 4.3's two path knobs, and here it is a
+        // correctness rule rather than a convenience: the worker's recent window
+        // of 4.1 is read from `history.json` in the state directory and
+        // `index.json` in the cache root (7.2's ownership table puts both files
+        // on the daemon). The scrub below would otherwise leave the child to
+        // re-derive both from `HOME` and the compiled defaults, so a daemon that
+        // took either path from the environment (4.3 puts it ahead of the file)
+        // would write history the worker never reads and get an empty window
+        // back. The values are this daemon's resolved ones, not whatever the
+        // session had: a forwards-when-set pass-through would still rely on the
+        // child resolving exactly as the daemon did.
+        command.env("WHIRL_STATE_DIR", &self.state_dir);
+        command.env("WHIRL_CACHE_DIR", &self.cache_dir);
         // Only when the daemon's own environment sets it, and never written to
         // a file (docs/architecture.md 6.3). The value is never printed.
         if let Some(value) = std::env::var_os("WHIRL_WALLHAVEN_API_KEY") {
@@ -566,12 +575,16 @@ mod tests {
 
     /// The config path is never read: every script here ignores its argv, which
     /// is itself part of what is being shown (1.6's argv is fixed and the
-    /// program is told, not asked).
+    /// program is told, not asked). The two directories are the daemon's
+    /// resolved ones; nothing here reads them either, except the one test that
+    /// asks what the child was told.
     fn worker(program: PathBuf) -> Worker {
         Worker::new(
             program,
             PathBuf::from("/nonexistent/whirl/config.json"),
             Backend::Noop,
+            PathBuf::from("/nonexistent/whirl/state"),
+            PathBuf::from("/nonexistent/whirl/cache"),
         )
     }
 
@@ -627,11 +640,12 @@ mod tests {
     }
 
     /// 1.6's environment rule, as a set equality rather than a membership test:
-    /// the child sees the two names that are always set, the two the daemon
-    /// adds, 4.3's two path knobs when the daemon's own environment has them, the
-    /// API key when the daemon has one, the nine Linux session variables on Linux
-    /// when they are set, and nothing else. The shell sets `PWD`, `SHLVL` and `_`
-    /// for itself, which is why they are named here instead of silently tolerated.
+    /// the child sees the two names that are always set, the four the daemon
+    /// adds (the config path, the backend, and this daemon's resolved state and
+    /// cache directories), the API key when the daemon has one, the nine Linux
+    /// session variables on Linux when they are set, and nothing else. The shell
+    /// sets `PWD`, `SHLVL` and `_` for itself, which is why they are named here
+    /// instead of silently tolerated.
     ///
     /// An implementation that forgot `env_clear()` fails on the extra names: the
     /// test process's own environment has at least `CARGO_*` in it under
@@ -661,11 +675,12 @@ mod tests {
         let mut expected: Vec<String> = ALWAYS.iter().map(|name| name.to_string()).collect();
         expected.push("WHIRL_CONFIG".to_string());
         expected.push("WHIRL_BACKEND".to_string());
-        for name in PASSED_THROUGH {
-            if std::env::var_os(name).is_some() {
-                expected.push(name.to_string());
-            }
-        }
+        // The two path knobs of 4.3 the worker resolves for itself. They are set
+        // unconditionally, to this daemon's resolved directories, so the child
+        // cannot read a different `history.json` than the daemon wrote: that is
+        // the recent window of 4.1, and an empty one repeats the image just set.
+        expected.push("WHIRL_STATE_DIR".to_string());
+        expected.push("WHIRL_CACHE_DIR".to_string());
         if std::env::var_os("WHIRL_WALLHAVEN_API_KEY").is_some() {
             expected.push("WHIRL_WALLHAVEN_API_KEY".to_string());
         }
@@ -705,47 +720,52 @@ mod tests {
         }
     }
 
-    /// The pure half of the same rule, so the spawn and the list cannot drift:
-    /// `PASSED_THROUGH` reaches the worker when the daemon's own environment has
-    /// it, and is absent - not empty - when it does not. The lookup is the
-    /// parameter here rather than the process environment, because a test that
-    /// mutated its own environment would be racing every other test in this
-    /// binary.
+    /// The daemon's own resolved state and cache directories reach the worker,
+    /// and they are this daemon's values rather than whatever the test process's
+    /// session had.
+    ///
+    /// This is the seam the recent window of 4.1 was dropped across.
+    /// `whirl_worker::pipeline::Window::load` reads `history.json` from
+    /// `WHIRL_STATE_DIR` and `index.json` from `WHIRL_CACHE_DIR`, so a scrub that
+    /// left the child to re-derive both from `HOME` and the compiled defaults
+    /// handed it a window built from a directory the daemon never wrote: the
+    /// window came out empty, and consecutive rotations set the same image while
+    /// an unused candidate sat in the source's own list.
     #[test]
-    fn the_4_3_path_knobs_are_passed_through_only_when_the_daemon_has_them() {
-        fn names(environment: Vec<(String, OsString)>) -> Vec<String> {
-            environment.into_iter().map(|(name, _)| name).collect()
-        }
-
-        let scratch = |name: &str| match name {
-            "PATH" | "HOME" | "WHIRL_CACHE_DIR" | "WHIRL_STATE_DIR" => {
-                Some(OsString::from(format!("/{name}")))
-            }
-            _ => None,
-        };
-        assert_eq!(
-            names(forwarded(&scratch)),
-            ["PATH", "HOME", "WHIRL_CACHE_DIR", "WHIRL_STATE_DIR"],
-            "1.6's list, and the two knobs carry the daemon's own values"
+    fn the_daemons_resolved_directories_reach_the_worker() {
+        let scripts = Scripts::new("resolved-paths");
+        let dump = scripts.path("paths.txt");
+        let program = scripts.script(
+            "paths.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s %s' \"$WHIRL_STATE_DIR\" \"$WHIRL_CACHE_DIR\" > '{}'\n",
+                dump.display()
+            ),
         );
-        assert_eq!(
-            forwarded(&scratch)
-                .into_iter()
-                .filter(|(name, _)| name == "WHIRL_CACHE_DIR")
-                .map(|(_, value)| value)
-                .collect::<Vec<OsString>>(),
-            [OsString::from("/WHIRL_CACHE_DIR")],
-            "the value the worker is given is the daemon's, not a re-resolution"
+        // Deliberately not the platform defaults, and deliberately not this
+        // process's environment: a scrub that forwarded the ambient values would
+        // pass with the defaults and fail here.
+        let state_dir = scripts.path("state");
+        let cache_dir = scripts.path("cache");
+        let worker = Worker::new(
+            program,
+            PathBuf::from("/nonexistent/whirl/config.json"),
+            Backend::Noop,
+            state_dir.clone(),
+            cache_dir.clone(),
         );
 
-        let bare = |name: &str| match name {
-            "PATH" | "HOME" => Some(OsString::from("/x")),
-            _ => None,
-        };
+        let outcome = worker.run(Verb::Rotate, None, 1, generous());
+        assert!(
+            matches!(outcome, Err(WorkerError::Failed { .. })),
+            "the script prints no set: line: {outcome:?}"
+        );
+
         assert_eq!(
-            names(forwarded(&bare)),
-            ["PATH", "HOME"],
-            "an unset knob is not passed through as an empty value"
+            scripts.text("paths.txt"),
+            format!("{} {}", state_dir.display(), cache_dir.display()),
+            "the worker must be told the directories the daemon resolved; re-deriving its own \
+             leaves the recent window of 4.1 empty"
         );
     }
 

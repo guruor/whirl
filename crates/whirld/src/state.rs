@@ -1527,6 +1527,8 @@ mod tests {
             PathBuf::from("whirl-worker"),
             effective.config_path.clone(),
             Backend::Noop,
+            effective.state_dir.clone(),
+            effective.cache_dir.clone(),
         );
         let lock = crate::lock::take_as(&state_dir, attempt).expect("the lock is taken");
         let mut daemon = Daemon::load(effective, worker, lock);
@@ -1805,8 +1807,13 @@ mod tests {
         config.schedule.worker_deadline_seconds = DEADLINES[0];
 
         let mut daemon = daemon_with(&root, Attempt::Unsupported, config);
-        daemon.worker =
-            crate::worker::Worker::new(program, root.join("config.json"), Backend::Noop);
+        daemon.worker = crate::worker::Worker::new(
+            program,
+            root.join("config.json"),
+            Backend::Noop,
+            state_dir.clone(),
+            cache_dir.clone(),
+        );
 
         // 1.7.1's deadline races the worker's own start-up, and that race is the
         // one thing this test cannot remove: the child has to be forked, exec'd
