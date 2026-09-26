@@ -40,17 +40,16 @@ MSRV="1.85.0"
 # image is not optional: the stock image has no cargo-nextest, so a container
 # mode built on it could not run the test suite at all.
 # The tag names both pins, so a change to either builds a new image instead of
-# reusing the old one. The toolchain version is read from its single home
-# (rust-toolchain.toml; docs/development.md section 4 is the rule) rather than
-# restated here; the nextest version is read from .config/nextest.toml in item
-# 3's commit, and is the version the Dockerfile installs.
+# reusing the old one. Both are read from their single homes (rust-toolchain.toml
+# and .config/nextest.toml; docs/development.md section 4 is the rule) rather
+# than restated here.
 GATE_DOCKERFILE="scripts/gate.Dockerfile"
-GATE_NEXTEST="0.9.146"
-GATE_IMAGE_BASE="whirl-gate:$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)-${GATE_NEXTEST}"
-
-if [ "$GATE_IMAGE_BASE" = "whirl-gate:-${GATE_NEXTEST}" ]; then
-  die "cannot read the toolchain channel from rust-toolchain.toml"
+GATE_TOOLCHAIN="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+GATE_NEXTEST="$(sed -n 's/^nextest-version = .*"\([^"]*\)".*$/\1/p' .config/nextest.toml)"
+if [ -z "$GATE_TOOLCHAIN" ] || [ -z "$GATE_NEXTEST" ]; then
+  die "cannot read the toolchain channel from rust-toolchain.toml or the nextest version from .config/nextest.toml"
 fi
+GATE_IMAGE_BASE="whirl-gate:${GATE_TOOLCHAIN}-${GATE_NEXTEST}"
 
 # `linux` runs the container on this machine's own architecture, and pins it
 # explicitly. A bare `docker run rust:1.94.0-bookworm` resolves to whichever
@@ -71,19 +70,29 @@ esac
 # endianness, or anything that assumes `usize` is 8 bytes.
 LINUX_PLATFORM="linux/amd64"
 
-# Two tests in whirld's control_socket suite fail under linux/amd64 emulation and
-# pass natively, deterministically, with the daemon child logging nothing:
-# `a_failed_rotation_is_visible_on_both_planes` and
-# `subscribe_streams_one_event_per_state_change`, both "the daemon closed the
-# connection early". Measured 2026-09-26 on this arm64 host, emulated:
+# Three tests fail under linux/amd64 emulation and pass on real x86_64,
+# deterministically over repeats, with the daemon child logging nothing:
+#
+#   whirld::control_socket a_failed_rotation_is_visible_on_both_planes
+#   whirld::control_socket subscribe_streams_one_event_per_state_change
+#       both "the daemon closed the connection early"
+#   whirld::bin/whirld worker::tests::a_spawn_that_finds_the_script_busy_is_retried
+#       "a script that is busy for 100 ms is not a failed spawn:
+#        Err(Failed { code: WorkerFailed, message: 'the worker exited non-zero
+#        with no message' })"
+#
+# Measured 2026-09-26 on this arm64 host, three runs, the same three every time:
 #
 #   ./scripts/ci.sh linux-amd64
 #   -> exit 100, 155 tests run (with .config/nextest.toml's fail-fast = false),
-#      92 passed, 2 failed
+#      152 passed, 3 failed
 #
-# while the same two tests pass in the same image without --platform (arm64) and
-# on macOS, 155 of 155. t_62920980 owns the diagnosis and the fix. Until it
-# lands, this mode exits non-zero on a clean tree and those two failures are
+# while all three pass in the same image without --platform (arm64), on macOS,
+# and in CI's own jobs on real x86_64 (run 36222311613: ubuntu-latest,
+# macos-latest and msrv all report them ok). t_62920980 owns the diagnosis and
+# the fix for the two control_socket tests; the worker test arrived with
+# t_7e9836df's new test, after that card measured "exactly two". Until those
+# land, this mode exits non-zero on a clean tree and those three failures are
 # expected: nothing is filtered out and nothing is skipped, and the mode prints
 # the names, the reason and the card on every run, so a red is understood rather
 # than ignored.
@@ -226,11 +235,14 @@ in_the_container() {
 }
 
 amd64_note() {
-  printf 'ci.sh: this run is emulated x86_64, and two tests are expected to fail in it:\n' >&2
+  printf 'ci.sh: this run is emulated x86_64, and three tests are expected to fail in it:\n' >&2
   printf '          whirld::control_socket a_failed_rotation_is_visible_on_both_planes\n' >&2
   printf '          whirld::control_socket subscribe_streams_one_event_per_state_change\n' >&2
-  printf '        both "the daemon closed the connection early", under emulation only; card t_62920980 owns it\n' >&2
-  printf '        nothing is skipped: the run is the whole suite, and it exits non-zero until that card lands\n' >&2
+  printf '          whirld::bin/whirld worker::tests::a_spawn_that_finds_the_script_busy_is_retried\n' >&2
+  printf '        all three pass on real x86_64 (CI run 36222311613) and natively here; card t_62920980 owns the\n' >&2
+  printf '        two control_socket ones, and the worker one came with t_7e9836df after that card measured\n' >&2
+  printf '        "exactly two". Nothing is skipped: the run is the whole suite and it exits non-zero until\n' >&2
+  printf '        those land, which is why this mode is opt-in and not part of local or all.\n' >&2
 }
 
 on_the_runner() {
