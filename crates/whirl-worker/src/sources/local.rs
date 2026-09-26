@@ -1006,9 +1006,15 @@ mod tests {
             reason.contains(&absent.display().to_string()),
             "and the path that failed: {reason}"
         );
+        // The errno text is the platform's, so the test asks the platform for it
+        // rather than hardcoding Unix's: `unreadable_root` reports the same
+        // `symlink_metadata` failure this line provokes.
+        let why = std::fs::symlink_metadata(&absent)
+            .expect_err("the path is still missing")
+            .to_string();
         assert!(
-            reason.contains("No such file or directory"),
-            "and why: {reason}"
+            reason.contains(&why),
+            "and why, in this platform's own words ({why}): {reason}"
         );
     }
 
