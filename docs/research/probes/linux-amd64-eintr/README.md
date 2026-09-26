@@ -254,15 +254,19 @@ After the fix, in the same emulated container, `cargo test --workspace`:
 ## 5. What the gate should say now
 
 `scripts/ci.sh` had not landed in the repository when this was written, so this
-card has no gate file to change and, with the cause fixed, no exclusion to add:
-the mode runs the two tests and passes. Two things the gate's text must not
-inherit from the design it comes from:
+card has no gate file to change. With the cause fixed there is no exclusion to
+add for the two tests this card rules on: the mode runs them and they pass
+(section 6). The mode as a whole is not green, because a third emulation red
+arrived with `development` after this card's base, so the gate has to carry that
+one instead. Two things the gate's text must not inherit from the design it
+comes from:
 
 1. `design.md` and the proposed `ci.sh` record "under emulation `cargo test
    --workspace` is red on two tests ... That is why the pin is not the
    default". The measurement was right; the cause is now fixed, so the amd64
    mode must not carry an exclusion, a skip or a known-red label for these two
-   tests. It is green, and a red there is a real finding again.
+   tests. They pass, and a red there is a real finding again.
+
 2. Pin **one platform manifest digest per mode**, not the index digest together
    with `--platform`. Measured on this machine: once the store holds the arm64
    image for the index, `docker run --platform linux/amd64
@@ -271,3 +275,54 @@ inherit from the design it comes from:
    after its first one has run. The three digests are in section 1: index
    `sha256:36546847...`, `linux/amd64` `sha256:4673f78d...`, `linux/arm64`
    `sha256:94aaa0b4...`.
+
+## 6. Re-verification on the merged tree, and the third red it turned up
+
+`development` moved 37 commits while this was being written, so the branch
+merges it (`git merge origin/development`, no conflicts) and every measurement
+above is repeated on the merged tree.
+
+* The two tests this document rules on are green under emulation. In the
+  emulated container, `cargo test --workspace --no-fail-fast`:
+
+      test result: ok. 0 passed ... test result: ok. 4 passed ... test result: ok. 47 passed
+      test result: ok. 21 passed ... test result: ok. 7 passed
+      test result: FAILED. 52 passed; 1 failed
+      test result: ok. 22 passed; 0 failed   <- control_socket
+      test result: ok. 3 passed ... test result: ok. 0 passed
+      test a_failed_rotation_is_visible_on_both_planes ... ok
+      test subscribe_streams_one_event_per_state_change ... ok
+
+* Natively the same merged tree is green: `cargo test --workspace` exit 0 on
+  macOS, `cargo fmt --all -- --check` clean, `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+* Line numbers moved with the merge: the `read_line` helper whose empty read
+  panics is at `control_socket.rs:1081` now (911 in section 1's run), and the two
+  tests are at 1230 and 1349 (1059 and 1160 then).
+* The emulated mode is **not** green as a whole.
+  `worker::tests::a_spawn_that_finds_the_script_busy_is_retried`, added to
+  `development` by `2deceea` ("worker: retry a spawn the kernel refused with
+  ETXTBSY") after this card's base, fails there deterministically: 3 runs of
+  that test alone, 3 failures, each in 0.14 s. It is not the mechanism in
+  section 4 and not reachable from this branch's diff, which touches `socket.rs`
+  and this directory.
+
+  The test holds a script open for write and expects `execve` to be refused with
+  `ETXTBSY` until the handle closes, so that the daemon's 10 x 50 ms retry rides
+  it out. In the translated guest the call is not refused at all; the child
+  starts, exits 127, and writes nothing to stdout or stderr, which is why the
+  daemon reports its fallback `the worker exited non-zero with no message`.
+  Standalone probe (`rustc -O`, hold the file open, spawn it, print the result):
+
+      linux/amd64 guest:  held open: spawn Ok, status=ExitStatus(unix_wait_status(32512)) stdout="" stderr="" in 1.7ms
+                          after close: spawn Ok, status=ExitStatus(unix_wait_status(0)) stdout="set: ccc\n" in 11.7ms
+      macOS, arm64:       held open: spawn Ok, status=ExitStatus(unix_wait_status(0)) stdout="set: ccc\n" in 469.6ms
+
+  So on real x86_64 Linux the rule bites and the test's premise holds; in the
+  translated guest it does not, and the retry the test exists to exercise never
+  fires. That is a test whose premise the emulation does not satisfy, not a
+  second `EINTR`; a follow-up card owns it.
+
+One reproduction detail: plain `cargo test --workspace` stops at the first red
+binary, so on the merged tree the emulated run reports the third red and never
+reaches `control_socket`. Use `--no-fail-fast` to see the whole map.
