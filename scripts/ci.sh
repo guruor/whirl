@@ -289,6 +289,13 @@ target_volume() { printf 'whirl-gate-target-%s\n' "${1##*/}"; }
 # directory this user's and its contents root's, which is the one state a look
 # at the directory cannot tell from a finished handover, and it is the state
 # that would come back later as a permission error from cargo.
+#
+# The record is a statement about a finished chown, not an attempted one: the
+# `|| exit 1` makes a failed `chown -R` stop the handover here, with chown's own
+# error, instead of stamping a volume whose tree it did not finish handing over.
+# Without it the stamp lands anyway (chown and printf are separate commands and
+# this `sh -c` has no `set -e`), and every later run then skips the chown it
+# needs and meets `Permission denied` inside cargo with nothing naming the cause.
 hand_over_target_volume() {
   local platform="$1" volume
   volume="$(target_volume "$platform")"
@@ -297,7 +304,7 @@ hand_over_target_volume() {
     "$(gate_image "$platform")" \
     sh -c "[ \"\$(cat /tmp/target/.gate-owner 2>/dev/null)\" = \"$GATE_UID:$GATE_GID\" ] || { \
              echo \"ci.sh: handing $volume to $GATE_UID:$GATE_GID\" >&2; \
-             chown -R \"$GATE_UID:$GATE_GID\" /tmp/target; \
+             chown -R \"$GATE_UID:$GATE_GID\" /tmp/target || exit 1; \
              printf '%s\\n' \"$GATE_UID:$GATE_GID\" > /tmp/target/.gate-owner; }"
 }
 
