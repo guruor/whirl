@@ -374,6 +374,74 @@ fn whirl_cache_dir_beats_a_cache_root_the_config_file_sets() {
     );
 }
 
+/// 4.3's whole environment layer, one daemon, all five names of the list. The
+/// config file is written to disagree with every one of them, so a name the
+/// daemon ignored would show up as the file's value in the answer: this is the
+/// class of defect the cache root was one instance of.
+///
+/// What each name is checked against, and why that is the check: `WHIRL_CONFIG`
+/// against the file the daemon says it read (`config path`), which is what makes
+/// every decoy below reachable at all; `WHIRL_SOCKET` against the socket this
+/// test is talking to, with the file's socket asserted unbound, because a daemon
+/// that preferred the file would be listening where this test cannot see it;
+/// `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` against `status`'s two directories,
+/// with the file's cache root asserted uncreated; `WHIRL_BACKEND` against the
+/// plan `config check` prints, where the file says `native` and the environment
+/// says `noop`.
+#[test]
+fn every_environment_name_in_4_3_beats_the_config_file() {
+    let daemon = start_prepared(
+        "every_environment_name_in_4_3_beats_the_config_file",
+        |dir| {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(
+                    "{{\n  \"socket\": \"{}\",\n  \"cache\": {{ \"root\": \"{}\" }},\n  \
+                 \"backend\": \"native\",\n  \"sources\": []\n}}\n",
+                    dir.join("decoy.sock").display(),
+                    dir.join("decoy-cache").display()
+                ),
+            )
+            .expect("a config that disagrees with the environment");
+        },
+    );
+
+    let config = daemon.ask("config path");
+    assert_eq!(
+        value(&config, "config"),
+        config_path(&daemon).display().to_string(),
+        "WHIRL_CONFIG: the daemon read the file the environment named"
+    );
+
+    let lines = daemon.ask("status");
+    assert!(
+        !daemon.dir.join("decoy.sock").exists(),
+        "WHIRL_SOCKET wins over `socket`: this daemon bound the environment's path"
+    );
+    assert_eq!(
+        value(&lines, "state_dir"),
+        daemon.dir.join("state").display().to_string(),
+        "WHIRL_STATE_DIR wins over the platform default"
+    );
+    assert_eq!(
+        value(&lines, "cache_dir"),
+        daemon.dir.join("cache").display().to_string(),
+        "WHIRL_CACHE_DIR wins over `cache.root`"
+    );
+    assert!(
+        !daemon.dir.join("decoy-cache").exists(),
+        "the file's cache root is not the one the daemon opened"
+    );
+
+    let check = daemon.ask("config check");
+    assert!(
+        check
+            .iter()
+            .any(|line| line.starts_with("plan: ") && line.contains("backend=noop")),
+        "WHIRL_BACKEND=noop wins over `backend: native`: {check:?}"
+    );
+}
+
 #[test]
 fn pause_and_resume_flip_the_flag_and_move_the_sequence() {
     let daemon = start("pause_and_resume_flip_the_flag_and_move_the_sequence");
