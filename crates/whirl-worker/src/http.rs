@@ -36,6 +36,16 @@ use std::process::{Command, Stdio};
 /// single call may spend.
 pub const TIMEOUT_SECONDS: u32 = 120;
 
+/// The user agent every request this client makes carries.
+///
+/// docs/spec/features.md 2.3 does not name one. A bare programmatic client
+/// (`curl/8.x`, or a UA that says `whirl/0.1`) is the fingerprint such a
+/// blocklist is built from, so this is an ordinary desktop-browser string with
+/// no version of this project's own in it. It lives with the client rather than
+/// with the source because it is on every request, listing and image alike.
+pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+                             (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 /// One request: a URL, and the API key when there is one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request<'a> {
@@ -137,6 +147,7 @@ fn configuration(request: &Request<'_>) -> String {
     out.push_str("silent\nshow-error\n");
     out.push_str(&format!("max-time = {TIMEOUT_SECONDS}\n"));
     out.push_str(&format!("url = {}\n", quoted(request.url)));
+    out.push_str(&format!("user-agent = {}\n", quoted(USER_AGENT)));
     if let Some(key) = request.key {
         out.push_str(&format!(
             "header = {}\n",
@@ -197,12 +208,13 @@ mod tests {
     }
 
     #[test]
-    fn a_keyless_request_sends_no_header_at_all() {
+    fn a_keyless_request_sends_no_key_header_and_still_names_a_browser() {
         let config = configuration(&Request {
             url: "https://wallhaven.cc/api/v1/search",
             key: None,
         });
         assert!(!config.contains("header"), "{config}");
+        assert!(config.contains("user-agent = \"Mozilla/5.0"), "{config}");
     }
 
     #[test]

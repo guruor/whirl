@@ -28,9 +28,10 @@
 //!   load when a key is needed and none resolves rather than trusting the API to
 //!   say so.
 //! - A request with **no `User-Agent` at all** answered 200, not the documented
-//!   403. The client still sends a browser user agent (a bare programmatic
-//!   client is what a WAF blocks, and the block is per-request and not per-code
-//!   path), and any 403 that does arrive is the named
+//!   403. The client still sends a browser user agent
+//!   ([`crate::http::USER_AGENT`], on every request it makes: a bare
+//!   programmatic client is what a WAF blocks, and the block is per-request and
+//!   not per-code path), and any 403 that does arrive is the named
 //!   [`SourceErrorKind::Forbidden`].
 //!
 //! **The one configuration ambiguity.** features.md 2.3 says `collection` "Uses
@@ -56,15 +57,10 @@ use whirl_core::source::{
 
 use crate::http::{Curl, Fetch, Request};
 
-/// The user agent every request carries.
+/// The user agent every request carries is [`crate::http::USER_AGENT`], with the
+/// client that writes it: features.md 2.3 does not name one, and a bare
+/// programmatic client is what such an API's edge blocks.
 ///
-/// features.md 2.3 does not name one; a bare programmatic client is what the
-/// API's edge blocks, so this is an ordinary desktop-browser string. It carries
-/// no version of this project's own, because a UA that says `whirl/0.1` is the
-/// fingerprint a blocklist is built from.
-pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-                             (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
 /// The documented rate limit: 45 requests per minute, 429 on exceed
 /// (features.md 2.3, `[1]`). **Not measured** — the research card that
 /// established it could not reach the response headers, and this session did not
@@ -664,7 +660,7 @@ mod tests {
     /// what it was asked. It never opens a socket.
     struct Recorded {
         answers: Vec<(u16, String)>,
-        seen: Rc<RefCell<Vec<(String, Option<String>)>>>,
+        seen: Asked,
     }
 
     impl Recorded {
@@ -675,7 +671,7 @@ mod tests {
             }
         }
 
-        fn handle(&self) -> Rc<RefCell<Vec<(String, Option<String>)>>> {
+        fn handle(&self) -> Asked {
             Rc::clone(&self.seen)
         }
     }
@@ -1211,10 +1207,11 @@ mod tests {
 
     #[test]
     fn the_user_agent_is_an_ordinary_browser_one() {
-        assert!(USER_AGENT.starts_with("Mozilla/5.0"), "{USER_AGENT}");
-        assert!(USER_AGENT.contains("AppleWebKit"), "{USER_AGENT}");
+        let agent = crate::http::USER_AGENT;
+        assert!(agent.starts_with("Mozilla/5.0"), "{agent}");
+        assert!(agent.contains("AppleWebKit"), "{agent}");
         assert!(
-            !USER_AGENT.contains("whirl"),
+            !agent.contains("whirl"),
             "a UA that names this project is the fingerprint a blocklist is built from"
         );
     }
