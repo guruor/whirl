@@ -118,6 +118,33 @@ fn config_path(daemon: &Daemon) -> PathBuf {
     daemon.dir.join("config.json")
 }
 
+/// A config this test owns and can predict, written before the daemon starts and
+/// therefore the file it reads instead of 4.2's annotated default.
+///
+/// It exists because the default's `local` source points at `~/Pictures/Wallpapers`
+/// and `/Volumes/Media/walls`, and the `local` kind has an implementation: the
+/// `candidates=`/`admitted=` counters in a `config check` response would then be
+/// this machine's count, which is the one thing a byte-for-byte assertion cannot
+/// be built on. Here the source's directory is inside the test's own tree and is
+/// left empty, so every counter is zero on every machine, and the two sources and
+/// their weights are 4.2's own (`sources=2` in the `plan:` line is unchanged).
+///
+/// This file is `#![cfg(unix)]`, so the path needs no JSON escaping.
+fn write_local_config(dir: &Path) {
+    let walls = dir.join("walls");
+    std::fs::create_dir_all(&walls).expect("the source's directory");
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"sources\": [\n    \
+             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [\"{}\"] }},\n    \
+             {{ \"id\": \"space\", \"kind\": \"wallhaven\", \"weight\": 3, \"query\": \"landscape\" }}\n  ]\n}}\n",
+            walls.display()
+        ),
+    )
+    .expect("the test's own config");
+}
+
 /// The platform default config path of docs/architecture.md 4.2's `socket`
 /// comment, resolved from `home` (the rules live in
 /// `crates/whirl-core/src/config.rs::paths`).
@@ -353,15 +380,19 @@ const PLAN_CHECK: &str = "plan: schedule.interval_seconds=1800 schedule.worker_d
 /// config order, then exactly one `plan:` line. The two sources are 4.2's, in its
 /// order, with its weights.
 ///
-/// `last` is `-` here because a check has no outcome to report (2.6). `enabled=0`
-/// with the reason and no bracketed counter group: no `kind` has an
-/// implementation in this build, so no source can be enumerated and nothing can
-/// be counted. 4.3 fixes that form and 2.6 says the group is optional; the group
-/// arrives with each source's own card.
+/// `last` is `-` here because a check has no outcome to report (2.6). The
+/// `local` source has `enabled=1` and its counter group, because its kind has an
+/// implementation in this build; `wallhaven` keeps `enabled=0` and the reason,
+/// because its kind does not. 4.3 fixes the second form and 2.6 says the group is
+/// optional, which is what lets one response carry both.
+///
+/// Every counter is zero and the reason is `-`: `write_local_config` points the
+/// source at an empty directory inside this test's own tree, so the assertion is
+/// the record's shape rather than a machine's count of its own pictures.
 fn config_check_lines() -> Vec<String> {
     vec![
         "queued".to_string(),
-        "source: pictures local weight=1 enabled=0 last=- reason=no implementation for kind local in this build"
+        "source: pictures local weight=1 enabled=1 last=- candidates=0 admitted=0 rejected_resolution=0 rejected_ratio=0 rejected_size=0 rejected_type=0 rejected_dedupe=0 reason=-"
             .to_string(),
         "source: space wallhaven weight=3 enabled=0 last=- reason=no implementation for kind wallhaven in this build"
             .to_string(),
@@ -380,7 +411,10 @@ fn config_check_lines() -> Vec<String> {
 /// asserted separately.
 #[test]
 fn config_check_reports_the_sources_and_the_plan() {
-    let daemon = start("config_check_reports_the_sources_and_the_plan");
+    let daemon = start_prepared(
+        "config_check_reports_the_sources_and_the_plan",
+        write_local_config,
+    );
     let lines = daemon.ask("config check");
     assert_eq!(lines[0], "OK whirl 0.1.0 protocol 2", "the greeting (2.4)");
     assert_eq!(lines.last().map(String::as_str), Some("OK"));
@@ -777,7 +811,10 @@ fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
 /// has to terminate its request line, or both ends wait forever.
 #[test]
 fn the_clis_quickstart_commands_answer_over_the_real_socket() {
-    let daemon = start("the_clis_quickstart_commands_answer_over_the_real_socket");
+    let daemon = start_prepared(
+        "the_clis_quickstart_commands_answer_over_the_real_socket",
+        write_local_config,
+    );
 
     let (ok, status) = whirl(&daemon, &["status"]);
     assert!(ok, "{status}");
@@ -799,8 +836,10 @@ fn the_clis_quickstart_commands_answer_over_the_real_socket() {
     // `OK` is the terminator and is not printed as a data line (2.5.1).
     assert!(!status.contains("\nOK\n"), "{status}");
 
-    // `set <path>` rather than `next`: no source has an implementation in this
-    // build, so only a manual set reaches a real worker and a real `set:` line.
+    // `set <path>` rather than `next`: this daemon runs 4.2's default config,
+    // whose `local` source points into the user's own home and whose `wallhaven`
+    // has no implementation in this build. A manual set is the route to a real
+    // worker and a real `set:` line that does not depend on the machine.
     let file = daemon.dir.join("quickstart.png");
     std::fs::write(&file, b"a file the quickstart sets").expect("a file to set");
     let (ok, next) = whirl(&daemon, &["set", &file.display().to_string()]);
@@ -1114,9 +1153,10 @@ fn subscribe_streams_one_event_per_state_change() {
     // to rotate on. Two events is what [M 12]'s duplicate wake had to be
     // replaced by (2.9).
     //
-    // The state change is a manual `set path`: no source has an implementation in
-    // this build, so `next` would reach the worker and fail, which is the test
-    // below. Either route takes a slot and produces the two events.
+    // The state change is a manual `set path`: this daemon runs 4.2's default
+    // config, so what a rotation finds is the machine's business (`wallhaven`
+    // has no implementation in this build, and the `local` source points into
+    // the user's home). Either route takes a slot and produces the two events.
     let file = daemon.dir.join("streamed.png");
     std::fs::write(&file, b"a file the stream set").expect("a file to set");
     let rotation = daemon.ask(&format!("set path {}", file.display()));
@@ -1298,9 +1338,9 @@ fn subscribe_reports_the_gap_for_a_resume_point() {
 #[test]
 fn the_state_files_are_written_and_read_back_across_a_restart() {
     let mut daemon = start("the_state_files_are_written_and_read_back_across_a_restart");
-    // A manual `set path` rather than `next`: no source has an implementation in
-    // this build, so only a manual set reaches a real worker and a real `set:`
-    // line to record.
+    // A manual `set path` rather than `next`: this daemon runs 4.2's default
+    // config, so whether a rotation finds anything is the machine's business. A
+    // manual set is the route to a real worker and a real `set:` line to record.
     let file = daemon.dir.join("state.png");
     std::fs::write(&file, b"a file the state test set").expect("a file to set");
     assert_eq!(

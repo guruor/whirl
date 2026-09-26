@@ -1229,7 +1229,8 @@ impl Run<'_> {
     /// resolves against the cache: a digest whose file is there is set where it
     /// is, which is what makes a re-materialised favorite land at the same path
     /// (state-and-cache 2.1). Re-materialising from a recorded origin needs the
-    /// source that owns it, and no source has an implementation yet.
+    /// source that owns it, and this build has no route from an id back to its
+    /// origin: an id resolves here only when the cache holds it.
     pub fn set(&self, target: &str) -> Result<Report, Failure> {
         if looks_like_a_path(target) {
             return self.set_reference(target);
@@ -1251,7 +1252,7 @@ impl Run<'_> {
             "set",
             ErrorCode::NotFound,
             format!(
-                "{target} is not a cached digest: re-materialising an origin_key needs the source that owns it, and no source has an implementation in this build"
+                "{target} is not a cached digest: re-materialising an origin_key needs the source that owns it, and this build has no route from an id back to its origin"
             ),
         ))
     }
@@ -2003,22 +2004,29 @@ mod tests {
 
     #[test]
     fn a_disabled_source_prints_a_reason_and_no_counter_group() {
-        let dir = scratch("worker-disabled");
-        let config = config(&dir, "");
+        // A kind with no arm in the dispatch table. `local` has one now, so the
+        // example is `wallhaven`, which does not
+        // (crates/whirl-worker/src/sources/mod.rs).
+        let config = Config::parse(
+            "{\n  \"config_schema\": 1,\n  \"sources\": [ { \"id\": \"space\", \"kind\": \
+             \"wallhaven\", \"weight\": 3, \"query\": \"landscape\" } ]\n}\n",
+        )
+        .expect("the fixture config parses")
+        .config;
         let line = disabled_record(
             &config.sources[0],
             crate::sources::missing_reason(&config.sources[0]),
         );
         assert_eq!(
             line,
-            "source: pictures local weight=1 enabled=0 last=- reason=no implementation for kind local in this build"
+            "source: space wallhaven weight=3 enabled=0 last=- reason=no implementation for kind wallhaven in this build"
         );
         let parsed = protocol::parse_source_record(&line).expect("the daemon reads it");
         assert!(!parsed.enabled);
         assert!(parsed.counters.is_empty());
         assert_eq!(
             parsed.reason.as_deref(),
-            Some("no implementation for kind local in this build")
+            Some("no implementation for kind wallhaven in this build")
         );
     }
 
