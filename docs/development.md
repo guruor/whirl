@@ -179,6 +179,49 @@ These are rules. A pull request that breaks one is rejected, not discussed.
   between releases, so an unpinned toolchain means "my formatting is wrong on your
   machine". One version, everywhere, and a one-line pull request when it moves.
 
+- **A toolchain manager that injects `RUSTUP_TOOLCHAIN` defeats the pin, and two
+  commands tell you which compiler you are on.** rustup gives that variable
+  precedence over `rust-toolchain.toml`, so on a machine whose manager resolves
+  `rust` from its own config, `rustup show active-toolchain` prints
+
+  ```
+  1.98.1-aarch64-apple-darwin (overridden by environment variable RUSTUP_TOOLCHAIN)
+  ```
+
+  while the file above still says 1.94.0. `command -v cargo` answers the other
+  half: `.../mise/shims/cargo` means the shim decides, `$HOME/.cargo/bin/cargo`
+  means rustup does. To make the file win for one command, drop the variable and
+  put rustup's own `bin` directory first on `PATH`:
+
+  ```sh
+  env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" ./scripts/ci.sh all
+  ```
+
+  Both halves are needed, and both were measured on this machine (macOS, mise
+  2026.9.1) on 2026-09-27. The shim sets `RUSTUP_TOOLCHAIN` in the process it
+  execs, so with the shim as `cargo`, `env -u RUSTUP_TOOLCHAIN cargo --version`
+  still prints `cargo 1.98.1`. And where activation has exported the variable
+  into the shell, `PATH="$HOME/.cargo/bin:$PATH" cargo --version` still prints
+  `cargo 1.98.1`. Unsetting it inside a mode of `scripts/ci.sh` is not a fix for
+  the same reason: the shim sets it again. What that produces does not look like
+  a toolchain problem: the clean tree dies in `clippy` with `error: manual
+  implementation of Option::filter`, `crates/whirl-core/src/protocol.rs:798`,
+  exit 101, and the same mode under 1.94.0 exits 0. CI has no shim and no such
+  variable, which is how one commit is green there and red here. The container
+  modes are not affected either way: `scripts/gate.Dockerfile` builds on
+  `rust:1.94.0`.
+
+- **The cure is the machine's, not this repository's.** A manager that reads this
+  file instead of its own pin injects the pin rather than its own: mise reads
+  `rust-toolchain.toml` once `idiomatic_version_file_enable_tools` lists `rust`,
+  and then exports `RUSTUP_TOOLCHAIN=1.94.0` (measured on this machine, mise
+  2026.9.1, 2026-09-27:
+  `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=rust rustup show active-toolchain`
+  prints `1.94.0-aarch64-apple-darwin`, where the same command without the
+  variable prints `1.98.1-aarch64-apple-darwin`). That is the machine owner's
+  config to change, and it is why no mode of `scripts/ci.sh` works around it: a
+  checkout cannot promise how the machine it is cloned onto resolves a compiler.
+
 - **The MSRV is 1.85.0, and it is declared in `[workspace.package]` as
   `rust-version`.** 1.85 is the first release with edition 2024, and edition 2024
   is what the workspace uses, so the MSRV is the edition's floor rather than a
@@ -298,6 +341,11 @@ Before you push, run one thing:
 ```sh
 ./scripts/ci.sh all
 ```
+
+On a machine whose toolchain manager injects `RUSTUP_TOOLCHAIN`, that runs the
+host modes under the wrong compiler and dies in `clippy`; section 2 names the
+command that shows it and the one that puts the pin back:
+`env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" ./scripts/ci.sh all`.
 
 That is `local` (fmt, clippy, test, artifacts), then `windows`, then `msrv`, then
 `linux` (the container's `ubuntu` mode: `clippy`, `test`, `artifacts` and `guards`,
