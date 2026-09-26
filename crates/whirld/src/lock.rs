@@ -837,6 +837,42 @@ mod tests {
         assert!(path.is_file(), "so the file stays");
     }
 
+    /// The other half of the same match, and the direction 8.8 does not grant: a
+    /// take that was given **no** reaped pid has no exception to make at all, so a
+    /// fallback file whose record *is* readable names a holder and stays. A
+    /// missing pid is not a wildcard. The record planted here is 8.7's own, prefix
+    /// and all, which is the only thing that separates this case from the reaped
+    /// worker's file: the argument the take was not given, and nothing about the
+    /// bytes on disk.
+    #[test]
+    fn a_readable_record_survives_a_take_with_no_reaped_pid() {
+        let dir = scratch("no-reaped-pid");
+        let path = plant_lock(&dir, 4242);
+        let planted = std::fs::read_to_string(&path).expect("the planted lock file");
+        let left_behind = File::open(&path).expect("the planted lock file");
+
+        let deferred = take_rotate_with(&dir, |_| Ok(Attempt::Unsupported), None)
+            .expect("a take that cannot fail");
+
+        assert!(
+            deferred.is_none(),
+            "5.5 step 1: with no reaped worker to name, a readable record is a holder"
+        );
+        assert_eq!(
+            left_behind
+                .metadata()
+                .expect("the planted lock file")
+                .nlink(),
+            1,
+            "and its file is untouched: still linked, neither removed nor replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the planted lock file"),
+            planted,
+            "its record is the one 8.7's holder wrote, byte for byte"
+        );
+    }
+
     /// 8.8 keeps the exception to the fallback alone, and this is the other
     /// primitive's answer: under `flock` the kernel releases the lock when the
     /// holder exits, so a file that reads as *held* is a live holder and not a
