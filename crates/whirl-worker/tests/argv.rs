@@ -51,13 +51,25 @@ fn json_string(value: &str) -> String {
 }
 
 /// One worker run: the five variables of section 7 plus the argv contract.
+///
+/// Two of the five are named rather than left to `HOME`, because `HOME` is only
+/// where 4.3's default lives on unix. On Windows the same two names resolve from
+/// `%LOCALAPPDATA%` (`paths::local_appdata`), which nothing here sets, so the
+/// tests of this binary shared the runner's real `state/locks/rotate.lock` and
+/// one of them reported `busy` against another's worker. Naming them puts every
+/// root of every spawn inside this test's own directory on every platform, and
+/// leaves the platform default unreached rather than merely elsewhere: 4.3 reads
+/// `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` **before** the default.
 fn run(config: &Path, args: &[&str]) -> Output {
+    let dir = config.parent().expect("a parent");
     Command::new(worker())
         .arg("--config")
         .arg(config)
         .args(args)
         .env("WHIRL_BACKEND", "noop")
-        .env("HOME", config.parent().expect("a parent"))
+        .env("WHIRL_STATE_DIR", dir.join("state"))
+        .env("WHIRL_CACHE_DIR", dir.join("cache"))
+        .env("HOME", dir)
         .output()
         .expect("the worker runs")
 }
@@ -302,6 +314,18 @@ fn help_prints_the_argv_contract_and_exits_zero() {
 /// processes agreed. What a relative value costs is visible in the answer - the
 /// path in the `set:` line is relative, because the root it came from is - and
 /// that is a property of the operator's override rather than of this resolution.
+///
+/// The two roots this spawn does **not** name are its own as well. 4.3 resolves
+/// what a process is not given from the platform default, and on this machine the
+/// platform default is the human's own `~/Library/Application Support/whirl` and
+/// `~/Library/Caches/whirl`; `set` is a rotation, so the worker took
+/// `<that>/locks/rotate.lock` (7.2, and `main.rs` takes it for `Verb::Set` too).
+/// A spawn with only the two names below therefore rewrote the human's real lock
+/// file on every run of this suite, and contended with his own worker for it if
+/// he rotated at that moment. `WHIRL_STATE_DIR` and `HOME` now point inside the
+/// same scratch directory, which also stops this test reading whatever history
+/// ring the human's state directory happens to hold: the recent window it builds
+/// is empty rather than his.
 #[test]
 fn set_finds_a_digest_under_whirl_cache_dir() {
     const DIGEST: &str = "264e1a838572fcf30c2e019ed8760ea0c8134f318097718fcfac1390af19cd37";
@@ -326,6 +350,11 @@ fn set_finds_a_digest_under_whirl_cache_dir() {
         .args(["--verb", "set", "--target", DIGEST, "--run", "3"])
         .env("WHIRL_BACKEND", "noop")
         .env("WHIRL_CACHE_DIR", "cache")
+        // The other two roots of 4.3, inside this test's own tree: the state
+        // directory the lock lives in, and `HOME`, which 4.3's platform default
+        // is resolved from (`paths::home`) so no other default escapes either.
+        .env("WHIRL_STATE_DIR", dir.join("state"))
+        .env("HOME", &dir)
         .current_dir(&dir)
         .output()
         .expect("the worker runs");
