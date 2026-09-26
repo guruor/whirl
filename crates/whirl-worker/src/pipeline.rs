@@ -537,6 +537,64 @@ impl Transport for Paths {
     }
 }
 
+/// The production transport: the candidate's **origin** decides which way its
+/// bytes come.
+///
+/// features.md 2.2 fixes the two shapes an origin has. A `local` candidate's is a
+/// path on the user's disk. A `wallhaven` candidate's is the `https://` URL the
+/// API's own `path` field named (crates/whirl-worker/src/sources/wallhaven.rs),
+/// because that is what the API hands out and there is no local file behind it.
+/// The pipeline is handed an origin and nothing else, so the choice belongs to
+/// the origin's scheme and not to the source's kind, which is also what makes it
+/// testable: a test drives it with a [`crate::http::Bytes`] of its own and no
+/// socket, or with a path in its own scratch directory and no URL at all.
+///
+/// This is the whole of the defect `t_3ebd4de8` was written for: before it, the
+/// only transport in the binary was [`Paths`], and a wallhaven rotation handed
+/// `fs::File::open` an `https://` URL and reported `offline` with the errno of a
+/// file that never existed.
+pub struct Origins<'a> {
+    client: &'a dyn crate::http::Bytes,
+}
+
+impl<'a> Origins<'a> {
+    /// The real transport, handed the one HTTP client this build has.
+    pub fn new(client: &'a dyn crate::http::Bytes) -> Origins<'a> {
+        Origins { client }
+    }
+}
+
+impl Transport for Origins<'_> {
+    fn open(&self, origin: &str) -> Result<Box<dyn Read>, String> {
+        if !is_url(origin) {
+            return Paths.open(origin);
+        }
+        // No key, deliberately. features.md 2.4's key authenticates a *listing*
+        // (`purity`, the favourites endpoints), and the API publishes the image
+        // URL itself for anyone: the proof this card came from fetched exactly
+        // such a URL with the client's user agent and no key, and got 2,689,221
+        // bytes back. A key sent here would be a key on a request with no
+        // business carrying one.
+        self.client.bytes(&crate::http::Request {
+            url: origin,
+            key: None,
+        })
+    }
+}
+
+/// Whether an origin names bytes to fetch rather than a file to open.
+///
+/// Two schemes and no parsing: `http` and `https` are the two the `wallhaven`
+/// source can produce, and anything else is a path. A scheme is case-insensitive
+/// (RFC 3986 section 3.1), so `HTTPS://` is a URL like any other.
+fn is_url(origin: &str) -> bool {
+    ["http://", "https://"].iter().any(|scheme| {
+        origin
+            .get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    })
+}
+
 /// The platform setter, behind a trait for the one reason [`Transport`] is: the
 /// call that leaves the process cannot be made in a test, and features.md 1.4's
 /// behaviour on a setter that refuses ("the candidate is marked bad and one more
@@ -1026,6 +1084,32 @@ fn write_failure(origin: &str, error: std::io::Error) -> Failure {
     Failure::new("download", code, format!("{origin}: {error}"))
 }
 
+/// Whether a failure out of the download stage belongs to the candidate or to
+/// the machine.
+///
+/// The three that belong to the candidate are the three ways a *byte stream* can
+/// be unusable, and features.md 1.4 gives one rule for one bad candidate — mark
+/// it bad, try the next — wherever the badness came from:
+///
+/// - `offline`: the transport could not produce the bytes at all, which for a
+///   `wallhaven` candidate is the CDN's answer to that one URL.
+/// - `not_an_image`: the bytes arrived and section 3 step 5 could not read a
+///   header out of them, which is what a 4xx error page looks like from here.
+/// - `too_large`: the bytes ran past the source's own cap mid-stream (section 3
+///   step 4), which is a fact about that file.
+///
+/// A cache that cannot be written is not one of those. 1.4, "Disk full or
+/// unwritable cache", says the `*.part` file is removed and "the error is
+/// reported" — and every remaining candidate would meet the same obstacle, so the
+/// rotation stops rather than turning one disk problem into a log line per
+/// candidate.
+fn candidate_failure(failure: &Failure) -> bool {
+    matches!(
+        failure.code,
+        ErrorCode::Offline | ErrorCode::NotAnImage | ErrorCode::TooLarge
+    )
+}
+
 fn owner_only_dir(path: &Path) {
     #[cfg(unix)]
     {
@@ -1126,9 +1210,17 @@ impl Run<'_> {
     ///
     /// The walk follows features.md 1.4: a source that yields nothing
     /// admissible is left and the remaining sources are tried in descending
-    /// weight order, at most one enumeration per source per rotation; a setter
-    /// failure marks the candidate bad and one more candidate is tried; and if
-    /// nothing is admissible at all the rotation fails with `no_candidates`.
+    /// weight order, at most one enumeration per source per rotation; a
+    /// candidate whose bytes cannot be had, and a candidate the setter refuses,
+    /// are both marked bad and the next candidate is tried ([`candidate_failure`]
+    /// is the line between that and a cache failure, which stops the rotation);
+    /// and if nothing is admissible at all the rotation fails with
+    /// `no_candidates`.
+    ///
+    /// The end state is 1.4's "No network" item 2 rather than a `no_candidates`:
+    /// if candidates were found and every one of them failed on its bytes, the
+    /// failure reported is the last download failure, so `status` gains the
+    /// `offline` that section names instead of a message blaming the filters.
     pub fn rotate(&self) -> Result<Report, Failure> {
         let order = weighted_order(&self.sources.weights(), self.draw);
         if order.is_empty() {
@@ -1151,6 +1243,7 @@ impl Run<'_> {
         }
         let mut bad: HashSet<String> = HashSet::new();
         let mut set_failures: Vec<SetError> = Vec::new();
+        let mut fill_failures: Vec<Failure> = Vec::new();
         let mut reasons: Vec<String> = Vec::new();
         for index in order {
             let entry = &self.sources.entries()[index];
@@ -1174,9 +1267,29 @@ impl Run<'_> {
                 if bad.contains(&seeking.candidate.id) {
                     continue;
                 }
-                let filled = match self.fill(&seeking, &mut reasons)? {
-                    Some(filled) => filled,
-                    None => continue,
+                let filled = match self.fill(&seeking, &mut reasons) {
+                    Ok(Some(filled)) => filled,
+                    Ok(None) => continue,
+                    // features.md 1.4's per-candidate rule, where what failed is
+                    // the bytes rather than the setter: "the bad cache entry is
+                    // deleted, the candidate id is marked bad for the rest of
+                    // the run, one more candidate is tried". The failure is this
+                    // candidate's and not the rotation's, which is what makes
+                    // 1.4's "No network" rules true rather than decorative: a
+                    // source that does not need the network is still tried, and
+                    // one image the CDN will not serve no longer takes the whole
+                    // rotation with it.
+                    Err(failure) if candidate_failure(&failure) => {
+                        eprintln!("warning: {}: {}", failure.stage, failure.message);
+                        bad.insert(seeking.candidate.id.clone());
+                        fill_failures.push(failure);
+                        continue;
+                    }
+                    // A cache that cannot be written is not this candidate's
+                    // problem, and every remaining candidate would meet the same
+                    // one: 1.4, "Disk full or unwritable cache" says the part
+                    // file is removed and "the error is reported", once.
+                    Err(failure) => return Err(failure),
                 };
                 // 1.6's first line belongs to the store, and a reference-mode
                 // candidate reached the setter without one: nothing was
@@ -1212,6 +1325,13 @@ impl Run<'_> {
         }
         if let Some(last) = set_failures.pop() {
             return Err(Failure::new("set", last.code, last.message));
+        }
+        // 1.4, "No network" item 2 is the end state of the rule above: a rotation
+        // whose every candidate failed on its bytes reports that failure, so
+        // `status` gains the `offline` the section names, rather than a
+        // `no_candidates` that would blame the filters for a download.
+        if let Some(last) = fill_failures.pop() {
+            return Err(last);
         }
         Err(Failure::new(
             "source",
@@ -1721,6 +1841,104 @@ mod tests {
                 None => Err(format!("{origin}: no such file")),
             }
         }
+    }
+
+    /// The HTTP client a test hands [`Origins`]: the bodies it wrote, and every
+    /// request it was asked for.
+    ///
+    /// This is the whole of "the test suite stays offline" for the URL route.
+    /// Nothing in it opens a socket, and a URL it has no body for is a failure
+    /// rather than a real request, so a test that quietly reached the network
+    /// would go red instead of slow.
+    struct Recorded {
+        bodies: HashMap<String, Vec<u8>>,
+        seen: RefCell<Vec<(String, Option<String>)>>,
+    }
+
+    impl Recorded {
+        fn of(pairs: &[(&str, Vec<u8>)]) -> Recorded {
+            Recorded {
+                bodies: pairs
+                    .iter()
+                    .map(|(url, bytes)| (url.to_string(), bytes.clone()))
+                    .collect(),
+                seen: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// The requests, in order: the URL, and the key if one was sent.
+        fn requests(&self) -> Vec<(String, Option<String>)> {
+            self.seen.borrow().clone()
+        }
+    }
+
+    impl crate::http::Bytes for Recorded {
+        fn bytes(&self, request: &crate::http::Request<'_>) -> Result<Box<dyn Read>, String> {
+            self.seen
+                .borrow_mut()
+                .push((request.url.to_string(), request.key.map(str::to_string)));
+            match self.bodies.get(request.url) {
+                Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
+                None => Err(format!("{}: 404", request.url)),
+            }
+        }
+    }
+
+    fn read_all(mut reader: Box<dyn Read>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .expect("the fixture body reads to its end");
+        bytes
+    }
+
+    /// features.md 2.2's two origin shapes, and the choice between them: an
+    /// `https://` origin is *fetched* and a path is *opened*, decided from the
+    /// origin alone.
+    ///
+    /// The defect this closes was precisely that the choice did not exist: the
+    /// only transport in the binary was [`Paths`], so a `wallhaven` candidate's
+    /// `https://` URL reached `fs::File::open` and the rotation reported the errno
+    /// of a file that never existed (`t_3ebd4de8`). Neither direction can pass by
+    /// accident here — the URL is not a file on this machine, and the path is
+    /// something the recorded client has never heard of — so a transport that
+    /// picked one route for both would fail on one of the two halves.
+    ///
+    /// The key is asserted to be absent as well: the API hands the image URL out
+    /// to anyone, and 2.4's key authenticates a listing.
+    #[test]
+    fn the_transport_is_chosen_by_the_origin() {
+        let dir = scratch("origin-route");
+        let path = dir.join("pictures").join("one.png");
+        fs::create_dir_all(path.parent().expect("a parent")).expect("the fixture directory");
+        let file_bytes = long_png(1600, 900, 16);
+        fs::write(&path, &file_bytes).expect("the fixture file");
+
+        let url = "https://w.wallhaven.cc/full/83/wallhaven-83dp81.png";
+        let url_bytes = long_png(1600, 901, 16);
+        let client = Recorded::of(&[(url, url_bytes.clone())]);
+        let transport = Origins::new(&client);
+
+        assert_eq!(
+            read_all(transport.open(url).expect("the URL is fetched")),
+            url_bytes
+        );
+        assert_eq!(
+            client.requests(),
+            vec![(url.to_string(), None)],
+            "one request for the image, and no key on it"
+        );
+
+        let origin = path.display().to_string();
+        assert_eq!(
+            read_all(transport.open(&origin).expect("the path is opened")),
+            file_bytes
+        );
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "a path is not a request: the recorded client never saw it"
+        );
     }
 
     // -- minimal files of each format, enough for the sniff -----------------
@@ -2407,6 +2625,11 @@ mod tests {
         );
     }
 
+    /// features.md 1.4's "No network" item 2 is the end state of the per-candidate
+    /// rule: this is the rotation whose *only* candidate failed on its bytes, so
+    /// there is nothing left to try and the failure is reported — `offline`, the
+    /// code the section names, rather than a `no_candidates` that would send the
+    /// operator to the filters. Nothing is published either way.
     #[test]
     fn a_fetch_that_fails_publishes_nothing_and_says_why() {
         let dir = scratch("worker-fetch");
@@ -2641,6 +2864,89 @@ mod tests {
             "a file the setter refused stays a cache entry"
         );
         assert_eq!(count_files(&state::tmp_dir(cache.root())), 0);
+    }
+
+    /// features.md 1.4's per-candidate rule where the failure is the *download*
+    /// rather than the setter: the candidate whose bytes cannot be had is marked
+    /// bad and one more candidate is tried, in the same source.
+    ///
+    /// The defect this pins is the `?` that used to sit here: `Run::rotate`
+    /// propagated the first `fill` failure straight out, so a rotation against a
+    /// live wallhaven source ended with `stage=download code=offline` on the first
+    /// image the CDN would not serve, without ever asking for the candidate behind
+    /// it. The second candidate is fetched, published and set here, and the failed
+    /// one leaves nothing behind: no part file, no cache entry, and one call to
+    /// the setter.
+    #[test]
+    fn an_unfetchable_candidate_is_marked_bad_and_the_next_one_is_tried() {
+        let dir = scratch("worker-candidate-failure");
+        let config = copy_config(&dir);
+        let bytes = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("gone", "pictures/gone.png", 1600, 900, 100),
+                candidate("here", "pictures/here.png", 1600, 901, bytes.len() as u64),
+            ]),
+        );
+        let transport = Bytes::of(&[("pictures/here.png", bytes.clone())]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = empty_window(&dir);
+        let setter = Recorder::default();
+        let run = noop_run(&config, &sources, &transport, &cache, &window, &setter);
+
+        let report = run
+            .rotate()
+            .expect("the candidate behind the missing one is admitted");
+
+        assert_eq!(report.origin_key, "pictures:here");
+        assert_eq!(report.digest, protocol::sha256_hex(&bytes));
+        assert_eq!(
+            setter.targets(),
+            vec![report.path.clone()],
+            "the setter is handed the candidate that was fetched, once"
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            1,
+            "only the fetched candidate is published"
+        );
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "the failed fetch leaves no part file"
+        );
+    }
+
+    /// The line `Run::rotate` draws between a failure that belongs to the
+    /// candidate and one that belongs to the machine, pinned on the predicate
+    /// itself so the policy is stated in one test rather than inferred from four.
+    ///
+    /// features.md 1.4, "Disk full or unwritable cache": the part file is removed
+    /// and "the error is reported" — once, and not per candidate, which is the
+    /// whole reason the cache codes below are not in the first list.
+    #[test]
+    fn only_the_candidates_own_failures_are_candidate_failures() {
+        for code in [
+            ErrorCode::Offline,
+            ErrorCode::NotAnImage,
+            ErrorCode::TooLarge,
+        ] {
+            assert!(
+                candidate_failure(&Failure::new("download", code, "test")),
+                "{code:?} is the candidate's"
+            );
+        }
+        for code in [
+            ErrorCode::CacheUnwritable,
+            ErrorCode::CacheReadonly,
+            ErrorCode::Enospc,
+        ] {
+            assert!(
+                !candidate_failure(&Failure::new("download", code, "test")),
+                "{code:?} is the machine's, and the rotation stops"
+            );
+        }
     }
 
     /// The floor of 2.5 step 1 against the header, for a source that claimed a
