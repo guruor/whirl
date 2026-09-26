@@ -17,7 +17,7 @@ someone who did not write it has reproduced its evidence and said so, in
 | `architecture.md` | reviewed | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
 | `development.md` | reviewed | repo layout, build and test matrix, release process, contribution workflow |
 | `decisions/` | template in place, no decisions recorded yet | one ADR per decision that changes the architecture; template in `0000-template.md` |
-| `reviews/` | four reports: the pack in two rounds, the architecture set in two rounds | one review report per reviewed document: what the reviewer ran, what they observed, what they could not check |
+| `reviews/` | four reports: the pack in two rounds, the architecture set in two rounds | one report per reviewed **pack**, not one per document: `research-spec-review.md` and its round 2 cover the six-document research and spec pack, `architecture-review.md` and its round 2 cover the two architecture documents; each says what the reviewer ran, what they observed, what they could not check |
 
 ## Reading order
 
