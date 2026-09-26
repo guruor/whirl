@@ -907,14 +907,14 @@ and it only happens when a daemon dies.
 
 | Path | Writer | Readers |
 |---|---|---|
-| `config.json` | the user, in an editor | daemon, at start and on reload |
+| `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path |
 | `state/current.json` | daemon | daemon; humans with `cat` |
-| `state/history.json` | daemon | daemon |
+| `state/history.json` | daemon | daemon; the worker, for the recent window of 4.1 |
 | `state/favorites.json` | daemon | daemon |
 | `log` | daemon | humans |
 | `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup |
 | `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both |
-| `cache/index.json` | daemon | daemon; `whirl status` |
+| `cache/index.json` | daemon | daemon; the worker, for the recent window of 4.1; `whirl status` |
 | `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only |
 | `cache/tmp/**` | the worker run that created it | nobody |
 
