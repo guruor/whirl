@@ -258,12 +258,15 @@ What each CI job exercises, and how to run the same thing locally.
 
 | job | runner(s) | command | what it actually exercises |
 |---|---|---|---|
-| `fmt` | ubuntu | `cargo fmt --all -- --check` | formatting only |
-| `clippy` | ubuntu, macos, windows | `cargo clippy --workspace --all-targets -- -D warnings` | all three `cfg` paths compile clean, including the three transports and the Windows named-pipe code |
-| `test` | ubuntu, macos, windows | `cargo test --workspace` | unit tests plus the integration tests; `WHIRL_BACKEND=noop` |
-| `msrv` | ubuntu | `cargo +1.85.0 check --workspace --all-targets` then `cargo +1.85.0 test --workspace` | the declared MSRV is real |
-| `guards` | ubuntu | `cargo metadata` plus a `Cargo.lock` scan, then a release build and a size check | zero third-party dependencies, and the binary size caps |
-| `artifacts` | ubuntu, macos, windows | `cargo build --workspace --release` plus `upload-artifact` | the release build produces `whirld`, `whirl`, `whirl-worker` on every platform |
+| `fmt` | ubuntu | `bash scripts/ci.sh fmt` | formatting only |
+| `clippy` | ubuntu, macos, windows | `bash scripts/ci.sh clippy` | all three `cfg` paths compile clean, including the three transports and the Windows named-pipe code |
+| `test` | ubuntu, macos, windows | `bash scripts/ci.sh test` | unit tests plus the integration tests; `WHIRL_BACKEND=noop` |
+| `msrv` | ubuntu | `bash scripts/ci.sh msrv` | the declared MSRV is real |
+| `guards` | ubuntu | `bash scripts/ci.sh guards` | zero third-party dependencies, and the binary size caps |
+| `artifacts` | ubuntu, macos, windows | `bash scripts/ci.sh artifacts` plus `upload-artifact` | the release build produces `whirld`, `whirl`, `whirl-worker` on every platform |
+
+Every one of those jobs calls the gate, and the gate section below is where the
+command behind each mode is written down: there is no second copy of it here.
 
 ### The gate: `scripts/ci.sh`
 
@@ -358,15 +361,20 @@ The rule that keeps it honest: **every command a contributor is expected to run
 before opening a pull request is a mode of `scripts/ci.sh` (section 3), and each
 mode is the matching job's command, verbatim.** A check that is not a mode of the
 script is a preference, not a gate: adding one means adding the mode and the job
-that calls it, in the same pull request. The jobs are switched to calling the
-modes by their own pull requests, so while a job still inlines its command, that
-command and its mode must stay textually identical.
+that calls it, in the same pull request. Every job in this workflow calls one
+mode, so there is no second copy of a command to keep in step. `secrets` is the
+one job the script does not own, and the reason is in the script's own header:
+gitleaks' pinned binary is not something a contributor can run by hand.
 
-Caching covers `~/.cargo/registry`, `~/.cargo/git` and `target`, keyed by runner
-OS and the `Cargo.lock` hash. With zero dependencies there is little to cache
-today; the cache exists because the compiled `target` directory and the pinned
-toolchain download are the two costs that grow the first time a dependency or a
-platform backend arrives.
+Caching is `Swatinem/rust-cache`, pinned like every other action here. It caches
+`~/.cargo` and `./target`, and it keys them on the job, on the rustc release and
+host, and on a hash of the manifests, `Cargo.lock` and the `rust-toolchain`
+files. The key is the point: the three hand-written `actions/cache` steps it
+replaces keyed on `hashFiles('**/Cargo.lock')` alone, so bumping the toolchain
+restored a `target/` built by the previous rustc. With zero dependencies there is
+little to cache today; the cache exists because the compiled `target` directory
+and the pinned toolchain download are the two costs that grow the first time a
+dependency or a platform backend arrives.
 
 No untrusted input reaches a shell: nothing in the workflow interpolates an event
 payload into a `run:` step. The `secrets` job is the one place that reads two of
@@ -998,8 +1006,8 @@ the `set:` report, and skips exactly one stage: the platform setter
 
 - `whirl next` is safe to run all day. It exercises everything but the two lines
   of platform code.
-- `cargo test --workspace` and the CI `test` job set it, so a test cannot set a
-  real wallpaper by accident.
+- The gate's `test` mode, and the CI `test` job that calls it, set it for the
+  whole run, so a test cannot set a real wallpaper by accident.
 - What noop does *not* cover is the platform setter itself. That is what the
   real-hardware checklists in section 3 are for, by design.
 
@@ -1070,15 +1078,11 @@ your head. All of them need the workspace scaffold to have landed.
    one error type and the message shape is specified; implement the unknown-key
    warning and an out-of-range refusal with the key and both values
    (`docs/architecture.md` 4.3).
-5. **The `guards` job's dependency check, as a local script.** It is currently a
-   `python3` heredoc inside the workflow; a `scripts/` entry would let a
-   contributor run it before pushing and would let the workflow call one thing
-   (this document, section 4).
-6. **The Linux GNOME adapter, light and dark keys.** One `gsettings` call per
+5. **The Linux GNOME adapter, light and dark keys.** One `gsettings` call per
    key, the failure mode where the schema is absent, and the detection signal that
    is not "`gsettings` exists" (`docs/research/linux.md`, GNOME section 4 and
    "Detecting the environment"; `docs/spec/features.md` for the backend contract).
-7. **A README quickstart that matches section 7 of this document,** including the
+6. **A README quickstart that matches section 7 of this document,** including the
    `WHIRL_BACKEND=noop` line, so the front door tells the same story as the guide.
 
 ## Sources
