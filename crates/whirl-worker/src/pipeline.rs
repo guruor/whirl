@@ -2109,6 +2109,51 @@ mod tests {
         assert_eq!(count_files(&state::tmp_dir(cache.root())), 0);
     }
 
+    /// The not-an-image path of section 3 step 5, driven directly rather than
+    /// through the code path that shares it: a download whose bytes sniff as
+    /// nothing features.md 2.2 defines fails with the code 2.7's table names
+    /// (`not_an_image`), and leaves neither a cache entry nor its part file.
+    #[test]
+    fn a_download_that_is_not_an_image_fails_and_publishes_nothing() {
+        let dir = scratch("worker-not-an-image");
+        let config = config(&dir, "");
+        let sources = table(
+            &config,
+            Fixture::with(vec![candidate("text", "pictures/text.png", 1600, 900, 100)]),
+        );
+        // Plain text behind a `.png` name: the source's extension claims an
+        // image, and the header sniff is the thing that decides.
+        let transport = Bytes::of(&[(
+            "pictures/text.png",
+            b"not an image at all, only text\n".to_vec(),
+        )]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = empty_window(&dir);
+        let setter = PlatformSet(Backend::Noop);
+        let run = noop_run(&config, &sources, &transport, &cache, &window, &setter);
+
+        let failure = run.rotate().expect_err("the header is not an image");
+
+        assert_eq!(failure.code, ErrorCode::NotAnImage);
+        assert_eq!(failure.code.as_str(), "not_an_image");
+        assert_eq!(failure.stage, "download");
+        assert!(
+            failure.message.contains("pictures/text.png"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            0,
+            "no cache entry from a download that is not an image"
+        );
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "the part file is deleted on the not-an-image path"
+        );
+    }
+
     /// Every rejection is counted with the stage name 2.5 fixes, rather than
     /// swallowed: the counter group of 2.6.
     #[test]
