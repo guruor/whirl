@@ -70,6 +70,26 @@ if [ -z "$GATE_TOOLCHAIN" ] || [ -z "$GATE_NEXTEST" ]; then
 fi
 GATE_IMAGE_BASE="whirl-gate:${GATE_TOOLCHAIN}-${GATE_NEXTEST}"
 
+# The container modes run the suite as the invoking user, never as root, and
+# that is not a nicety: CI's runner is a non-root user, and one test can only
+# mean what it says when this process is not root (whirl-worker's
+# sources::local plants a file with mode 0o000 and asserts the read fails, so
+# "the fixture has to be unreadable for this test to mean anything"). As root
+# that read succeeds and the assertion fails, which is how `linux` and `all`
+# came to exit 100 on a clean tree (t_207186c7). `--user` takes the uid and gid
+# from the machine the gate is running on, which is exactly the difference
+# between this container and CI that the mode exists to close.
+#
+# `CARGO_HOME` and `RUSTUP_HOME` are 0777 in the rust image, so a non-root uid
+# needs nothing there; the target directory is the one path that has to be
+# handed over, because a Docker volume belongs to root until something chowns
+# it (hand_over_target_volume, below).
+#
+# A gate invoked by root runs the container as root too: the uid is whoever
+# invoked the gate, and that is the only honest reading of the flag.
+GATE_UID="$(id -u)"
+GATE_GID="$(id -g)"
+
 # `linux` runs the container on this machine's own architecture, and pins it
 # explicitly. A bare `docker run rust:1.94.0-bookworm` resolves to whichever
 # manifest is in the local store, and on this machine that has been both: the
@@ -83,38 +103,42 @@ case "$(uname -m)" in
 esac
 
 # `linux-amd64` pins the runners' x86_64. On Apple silicon that means emulation,
-# which costs wall clock and which cannot pass two of the tests, so it is an
+# which costs wall clock and which cannot pass one of the tests, so it is an
 # opt-in mode rather than part of `local` or `all`. It is the mode to run when a
 # change touches something architecture decides: pointer width, atomics, SIMD,
 # endianness, or anything that assumes `usize` is 8 bytes.
 LINUX_PLATFORM="linux/amd64"
 
-# Two tests fail under linux/amd64 emulation and pass on real x86_64,
-# deterministically over repeats, with the daemon child logging nothing:
+# One test fails under linux/amd64 emulation and passes on real x86_64: the mode
+# pins that a spawn which never produced a worker leaves `reaped` alone, and the
+# emulated run reports a reaped pid instead, so it fails at worker.rs:1210 with
+# "no worker existed, so this process holds no exit status and names no pid":
 #
-#   whirld::control_socket a_failed_rotation_is_visible_on_both_planes
-#   whirld::control_socket subscribe_streams_one_event_per_state_change
-#       both "the daemon closed the connection early"
+#   whirld::bin/whirld worker::tests::a_spawn_that_never_produced_a_worker_reports_no_reaped_pid
 #
-# Measured 2026-09-26 on this arm64 host at this head, one run, the same two as
-# every earlier run:
+# Measured 2026-09-27 on this arm64 host at this head, four runs -- three as the
+# invoking user and one as root -- the same one every time:
 #
 #   ./scripts/ci.sh linux-amd64
-#   -> exit 100, 157 tests run (with .config/nextest.toml's fail-fast = false),
-#      155 passed, 2 failed
+#   -> exit 100, 247 tests run (with .config/nextest.toml's fail-fast = false),
+#      246 passed, 1 failed
 #
-# while both pass in the same image without --platform (arm64), on macOS, and in
-# CI's own jobs on real x86_64 (run 36222311613: ubuntu-latest, macos-latest and
-# msrv all report them ok). t_62920980 owns the diagnosis and the fix. A third
-# name was on this list while this branch was written,
+# while it passes in the same image without --platform (arm64, 247 of 247), on
+# macOS, and in CI's own jobs on real x86_64 (run 36272882168: ubuntu-latest,
+# macos-latest and msrv all report it ok). t_26eefd55 owns the diagnosis and the
+# fix.
+#
+# This list used to name two control_socket tests, and those are fixed rather
+# than relabelled: t_62920980 found the EINTR the translation delivered to a read
+# parked in read_request_line, and development's retry makes both pass here. A
+# third name was on the list while this file was written,
 # whirld::bin/whirld worker::tests::a_spawn_that_finds_the_script_busy_is_retried,
-# which t_7e9836df added after that card measured "exactly two"; it passes under
-# emulation at this head, because development's dec136e (t_43827dc5) makes the
-# test ask the guest for the kernel's refusal instead of assuming emulation
-# reports it. Until the two control_socket fixes land, this mode exits non-zero on
-# a clean tree with those two failures expected: nothing is filtered out and
-# nothing is skipped, and the mode prints the names, the reason and the card on
-# every run, so a red is understood rather than ignored.
+# which passes since dec136e (t_43827dc5) made it ask the guest for the kernel's
+# refusal instead of assuming emulation reports it. Until the one above is
+# diagnosed, this mode exits non-zero on a clean tree with that one failure
+# expected: nothing is filtered out and nothing is skipped, and the mode prints
+# the name, the reason and the card on every run, so a red is understood rather
+# than ignored.
 
 usage() {
   # The mode table above, printed from this file rather than repeated here.
@@ -232,6 +256,30 @@ gate_image() { printf '%s-%s\n' "$GATE_IMAGE_BASE" "${1##*/}"; }
 
 target_volume() { printf 'whirl-gate-target-%s\n' "${1##*/}"; }
 
+# A named volume is created root-owned, and a volume an earlier root run wrote
+# holds root-owned files, so `--user` would meet `Permission denied` on the
+# first write into CARGO_TARGET_DIR. One short root container hands the volume
+# over instead of a delete-and-rebuild: it chowns the tree in place, which keeps
+# the warm cache, and it says so when it does, so the first run after this fix
+# does not look like nothing happened.
+#
+# What a later run reads is the record this leaves at the volume's root, not the
+# directory's own ownership: a `chown -R` that was interrupted leaves the
+# directory this user's and its contents root's, which is the one state a look
+# at the directory cannot tell from a finished handover, and it is the state
+# that would come back later as a permission error from cargo.
+hand_over_target_volume() {
+  local platform="$1" volume
+  volume="$(target_volume "$platform")"
+  docker run --rm --platform "$platform" --user 0:0 \
+    -v "$volume:/tmp/target" \
+    "$(gate_image "$platform")" \
+    sh -c "[ \"\$(cat /tmp/target/.gate-owner 2>/dev/null)\" = \"$GATE_UID:$GATE_GID\" ] || { \
+             echo \"ci.sh: handing $volume to $GATE_UID:$GATE_GID\" >&2; \
+             chown -R \"$GATE_UID:$GATE_GID\" /tmp/target; \
+             printf '%s\\n' \"$GATE_UID:$GATE_GID\" > /tmp/target/.gate-owner; }"
+}
+
 ensure_gate_image() {
   local platform="$1" image
   image="$(gate_image "$platform")"
@@ -245,7 +293,15 @@ in_the_container() {
   local platform="$1" mode="$2"
   need docker "$mode"
   ensure_gate_image "$platform"
+  hand_over_target_volume "$platform"
+  # `--user` is the fix for the root defect, and the only thing the container
+  # needs to be honest: the suite runs as the user who invoked the gate, which
+  # is CI's own arrangement (the runner is not root) and what makes the 0o000
+  # fixture mean anything (GATE_UID, above). Nothing in the run needs a
+  # privileged uid: the target directory has just been handed over, and the /w
+  # mount is written by cargo only through CARGO_TARGET_DIR=/tmp/target.
   docker run --rm --platform "$platform" \
+    --user "$GATE_UID:$GATE_GID" \
     -v "$root:/w" -w /w \
     -v "$(target_volume "$platform"):/tmp/target" \
     -e CARGO_TARGET_DIR=/tmp/target \
@@ -254,13 +310,13 @@ in_the_container() {
 }
 
 amd64_note() {
-  printf 'ci.sh: this run is emulated x86_64, and two tests are expected to fail in it:\n' >&2
-  printf '          whirld::control_socket a_failed_rotation_is_visible_on_both_planes\n' >&2
-  printf '          whirld::control_socket subscribe_streams_one_event_per_state_change\n' >&2
-  printf '        both pass on real x86_64 (CI run 36222311613) and natively here; card t_62920980 owns the\n' >&2
-  printf '        diagnosis and the fix. The worker busy-spawn test was a third until dec136e made it ask the\n' >&2
-  printf '        guest, so it passes here now. Nothing is skipped: the run is the whole suite and it exits\n' >&2
-  printf '        non-zero until the two land, which is why this mode is opt-in and not part of local or all.\n' >&2
+  printf 'ci.sh: this run is emulated x86_64, and one test is expected to fail in it:\n' >&2
+  printf '          whirld::bin/whirld worker::tests::a_spawn_that_never_produced_a_worker_reports_no_reaped_pid\n' >&2
+  printf '        which passes on real x86_64 (CI run 36272882168), in this image without --platform and\n' >&2
+  printf '        natively here; card t_26eefd55 owns the diagnosis and the fix. The two control_socket names\n' >&2
+  printf '        here were fixed by t_62920980, not relabelled. Nothing is skipped: the run is the whole\n' >&2
+  printf '        suite and it exits non-zero until that lands, which is why this mode is opt-in and not part\n' >&2
+  printf '        of local or all.\n' >&2
 }
 
 on_the_runner() {
