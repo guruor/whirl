@@ -313,7 +313,7 @@ proves:
 | `artifacts` | the release build produces the three binaries |
 | `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
 | `linux` | CI's `clippy`, `test` and `artifacts` jobs as they run on `ubuntu-latest`, plus `guards`, again in the gate's container, as the invoking user rather than root (`--user "$(id -u):$(id -g)"`, below), so a Linux-only failure surfaces here rather than in CI. `fmt` is not repeated there: rustfmt's output does not depend on the operating system, and `local` has already run it |
-| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails two tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
+| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails one test that passes on real x86_64 (card t_26eefd55). Opt-in: it is not in `local` or `all` |
 
 **What `all` leaves unproven**, so that the answer is here rather than inferred:
 
@@ -324,8 +324,8 @@ proves:
   nothing; `test (windows-latest)` on a Windows runner is the only thing that runs
   Windows code, and it is not something this machine can do (below).
 - **`linux-amd64`.** Deliberately outside `all`: on Apple silicon it is emulated
-  and it fails two tests that pass on real x86_64. Run it by hand when a change
-  touches something an architecture decides.
+  and it fails one test that passes on real x86_64 (card t_26eefd55). Run it
+  by hand when a change touches something an architecture decides.
 
 `WHIRL_BACKEND=noop` is not a contributor's business any more: the script sets it
 for the whole of `test` and for `msrv`'s test step, so a new test cannot forget
@@ -398,9 +398,12 @@ target volume, which Docker creates root-owned.
 `scripts/ci.sh` hands it over before the suite runs, with one short root
 container that does nothing else: it chowns the tree in place, so the warm cache
 survives instead of being deleted and rebuilt, and it prints the line
-`ci.sh: whirl-gate-target-<arch> holds root-owned files; handing them to
-<uid>:<gid>` the first time it has to. On a volume that already belongs to that
-uid it only looks, which is the normal case from the second run on.
+`ci.sh: handing whirl-gate-target-<arch> to <uid>:<gid>` when it does. What a
+later run reads is the record that handover leaves at the volume's root
+(`.gate-owner`), not the directory's own ownership: a `chown -R` interrupted
+halfway leaves the directory this user's and its contents root's, and the record
+is what tells those two states apart. On a volume that has already been handed
+over it only looks, which is the normal case from the second run on.
 
 Two image-and-volume pairs are left on the machine on purpose, one per
 architecture the gate has run on:
