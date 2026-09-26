@@ -6,8 +6,16 @@ name: ci
 # (docs/architecture.md 4.2, `backend`).
 #
 # Rule (docs/development.md, "Continuous integration"): every command a
-# contributor runs before opening a pull request appears here verbatim. If a
-# check is not in this file it is a preference, not a gate.
+# contributor runs before opening a pull request lives in `scripts/ci.sh`, which
+# is the only copy of them. Each job below calls one mode of that file, so a
+# local run and this workflow cannot drift: `bash scripts/ci.sh fmt`, `clippy`,
+# `test`, `msrv`, `guards`, `artifacts`. The one job this file still owns is
+# `secrets`: a developer cannot run gitleaks' pinned binary by hand. The one step
+# it still owns is the `guards` job's R2 dependency check: it reads a dependency
+# edge rather than running a command, and `guards` is already a mode.
+# `bash scripts/ci.sh windows` is the one check here that is not a job: it
+# compiles the #[cfg(windows)] code on a laptop, and it cannot replace
+# `test (windows-latest)`, which runs it.
 #
 # Triggers (docs/development.md section 6): `development` integrates, `main`
 # releases. So this workflow runs for a push to either branch, and for a pull
@@ -41,11 +49,12 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain and its components
         run: rustup show
       - name: cargo fmt --all -- --check
-        run: cargo fmt --all -- --check
+        run: bash scripts/ci.sh fmt
+        shell: bash
 
   clippy:
     name: clippy (${{ matrix.os }})
@@ -55,19 +64,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain and its components
         run: rustup show
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo clippy --workspace --all-targets -- -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: bash scripts/ci.sh clippy
+        shell: bash
 
   test:
     name: test (${{ matrix.os }})
@@ -77,58 +80,43 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain and its components
         run: rustup show
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install the test runner, pinned
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: cargo test --workspace
-        run: cargo test --workspace
-        env:
-          # A test that rotates must never reach a real desktop.
-          WHIRL_BACKEND: noop
+          tool: cargo-nextest@0.9.146
+      - name: the test suite, then the doctests
+        run: bash scripts/ci.sh test
+        shell: bash
 
   msrv:
     name: msrv (1.85.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.85.0 --profile minimal
-      - name: cargo +1.85.0 check --workspace --all-targets
-        run: cargo +1.85.0 check --workspace --all-targets
-      - name: cargo +1.85.0 test --workspace
-        run: cargo +1.85.0 test --workspace
-        env:
-          WHIRL_BACKEND: noop
+      - name: the declared MSRV, checked and tested
+        run: bash scripts/ci.sh msrv
+        shell: bash
 
   guards:
     name: guards (dependencies and binary size)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain
         run: rustup show
-      - name: Assert the workspace has no third-party dependencies
-        run: |
-          cargo metadata --format-version 1 > /dev/null
-          python3 - <<'PY'
-          import re
-          import sys
-
-          ours = {"whirl-core", "whirld", "whirl-worker", "whirl-cli"}
-          names = re.findall(r'^name = "([^"]+)"', open("Cargo.lock").read(), re.M)
-          extra = sorted(set(names) - ours)
-          if extra:
-              sys.exit("third-party dependencies appeared: " + ", ".join(extra))
-          print(f"Cargo.lock holds {len(names)} entries, all ours: {sorted(set(names))}")
-          PY
+      - name: no third-party dependencies, and the binary size caps
+        run: bash scripts/ci.sh guards
+        shell: bash
+      # R2 is two claims (docs/architecture.md line 1808): `whirld` does not depend
+      # on the worker's platform crate, and its binary stays under a megabyte. The
+      # second is a size cap and lives in the `guards` mode above; the first is a
+      # dependency edge in the workspace graph, so it is asserted here.
       - name: Assert the daemon does not link the worker's platform crate
         run: |
           python3 - <<'PY'
@@ -137,10 +125,11 @@ jobs:
           import sys
 
           # docs/architecture.md R2: "whirld does not depend on the worker's platform
-          # crate, and its binary stays under a megabyte". The size cap below measures
-          # the second half; this measures the first, so that half is checked rather
-          # than remembered. Platform code lives in whirl-worker because it is the
-          # only crate allowed to grow it (docs/development.md, "Dependencies: zero").
+          # crate, and its binary stays under a megabyte". The size cap in
+          # `bash scripts/ci.sh guards` above measures the second half; this measures
+          # the first, so that half is checked rather than remembered. Platform code
+          # lives in whirl-worker because it is the only crate allowed to grow it
+          # (docs/development.md, "Dependencies: zero").
           metadata = json.loads(
               subprocess.run(
                   ["cargo", "metadata", "--format-version", "1"],
@@ -157,34 +146,7 @@ jobs:
               )
           print("whirld depends on whirl-core only, so it links no platform backend")
           PY
-      - name: Build the release binaries
-        run: cargo build --workspace --release
-      - name: Assert the binary size caps
-        run: |
-          python3 - <<'PY'
-          import os
-          import sys
-
-          # docs/architecture.md R2: the daemon stays under a megabyte and never
-          # links a platform backend. Caps are in MiB.
-          caps = {"whirld": 1.0, "whirl": 2.0, "whirl-worker": 12.0}
-          suffixes = ["", ".exe"]
-          failed = []
-          for name, cap in caps.items():
-              path = next(
-                  (f"target/release/{name}{s}" for s in suffixes
-                   if os.path.exists(f"target/release/{name}{s}")), None,
-              )
-              if path is None:
-                  failed.append(f"{name}: no release binary")
-                  continue
-              size = os.path.getsize(path) / (1024 * 1024)
-              print(f"{name}: {size:.2f} MiB (cap {cap:.2f} MiB)")
-              if size > cap:
-                  failed.append(f"{name}: {size:.2f} MiB over the {cap:.2f} MiB cap")
-          if failed:
-              sys.exit("; ".join(failed))
-          PY
+        shell: bash
 
   secrets:
     name: secrets (gitleaks)
@@ -198,7 +160,7 @@ jobs:
       # to trust: the version, the URL and the digest are all pinned here.
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The scan compares two commits, and the base commit is not in a
           # shallow clone.
@@ -372,19 +334,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: cargo build --workspace --release
-        run: cargo build --workspace --release
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the release build
+        run: bash scripts/ci.sh artifacts
+        shell: bash
       - name: Collect the binaries
         shell: bash
         run: |
@@ -397,7 +353,7 @@ jobs:
             done
           done
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: whirl-${{ runner.os }}-${{ github.sha }}
           path: dist/

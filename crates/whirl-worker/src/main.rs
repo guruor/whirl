@@ -9,12 +9,15 @@
 //! whirl-worker --config <abs path> --verb <rotate|set|check> [--target <path|id>] --run <rotation id>
 //! ```
 //!
-//! A scaffold: the verb set, the argv and the stdout shape are the contract, and
-//! the stages behind them are not written yet (no source, no download, no
-//! filter, no cache). [`pipeline`] says exactly which stage is a placeholder.
+//! A scaffold no longer: the argv, the environment and stdout are the contract
+//! (1.6), and the stages behind them are implemented end to end except the
+//! sources themselves. `local` and `wallhaven` are separate cards, so
+//! [`sources::Sources::from_config`] returns an empty table today and a rotation
+//! fails with `no_candidates` and a message that names the missing kind.
 
 mod backend;
 mod pipeline;
+mod sources;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -117,13 +120,48 @@ fn main() -> ExitCode {
         Err(failure) => return failure.report(),
     };
 
+    let sources = sources::Sources::from_config(&config);
+    let cache = match pipeline::Cache::resolve(&config) {
+        Ok(cache) => cache,
+        Err(failure) => return failure.report(),
+    };
+    // The recent window is the history ring plus the index, read and never
+    // written: the daemon owns both files (4.1, 7.2).
+    let window = match pipeline::state_directory() {
+        Some(state_dir) => pipeline::Window::load(
+            &state_dir,
+            &cache.index_path(),
+            config.dedupe.recent_entries,
+        ),
+        None => pipeline::Window::empty(),
+    };
+    let platform = pipeline::host_platform();
+    let run = pipeline::Run {
+        config: &config,
+        setter: &pipeline::PlatformSet(backend),
+        sources: &sources,
+        transport: &pipeline::Paths,
+        cache: &cache,
+        window: &window,
+        platform,
+        run: args.run,
+        draw: pipeline::draw(args.run),
+    };
+
     let result = match args.verb {
         Verb::Check => {
-            pipeline::check(&config, backend);
+            pipeline::check(&config, backend, &sources, &window, platform);
             return ExitCode::SUCCESS;
         }
-        Verb::Rotate => pipeline::rotate(&config, backend),
-        Verb::Set => pipeline::set(&config, backend, args.target.as_deref(), args.run),
+        Verb::Rotate => run.rotate(),
+        Verb::Set => match args.target.as_deref() {
+            Some(target) => run.set(target),
+            None => Err(pipeline::Failure::new(
+                "set",
+                ErrorCode::BadArgs,
+                "--target is required for `set`",
+            )),
+        },
     };
     match result {
         Ok(_) => ExitCode::SUCCESS,

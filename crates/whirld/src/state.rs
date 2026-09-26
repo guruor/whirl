@@ -11,14 +11,21 @@
 //! guessed: `pid` is this process, `uptime_s` is its own clock, `rss_kb` is
 //! `/proc/self/statm` or `ps`, and the cache totals come from walking the cache
 //! root this daemon created.
+//!
+//! The sweep (5.5) hangs off this module rather than beside it, because its
+//! three trigger points are state transitions: daemon start (`crate::run`), the
+//! end of every rotation (`Daemon::rotation`), and a `reset` verb, which this
+//! build's protocol does not have (2.5's verb set is closed and holds no such
+//! verb, and 6.5's `whirl reset` is a CLI verb that has not landed). The sweep's
+//! own mechanics are `crate::cache`.
 
+use crate::cache::{self, Attempt, Protected, Reported};
 use crate::events::{Bus, Event, unix_seconds};
 use crate::lock::DaemonLock;
 use crate::plan::Effective;
 use crate::statefile::{Kind as File, Store};
 use crate::worker::{Outcome, Verb, WorkerError};
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::mpsc::Receiver;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -76,10 +83,15 @@ pub struct State {
     /// The persisted deadline, wall clock, RFC 3339 UTC (2.10 `next_at`).
     /// Frozen while `paused`, re-armed from now by `resume` (2.9, 5.5 rule 8).
     pub next_at: Option<i64>,
-    /// 5.5 step 1 is this key's only trigger, and no sweep runs yet, so nothing
-    /// sets it: `status` reports the field rather than a literal, and the value
-    /// is 0 until the sweep card lands.
-    pub sweep_deferred: bool,
+    /// The cache's identity, from `cache/index.json` (2.1): what `status`'s
+    /// `cache_root_id` and 6.1's `cache` block report, and the value that lets a
+    /// state file tell "the cache was cleared" from "the cache is a different
+    /// cache". `None` only when the index exists and cannot be read.
+    pub cache_root_id: Option<String>,
+    /// 5.5 step 1's outcome, and 5.4's `sweep_error` with it: one value, so
+    /// `sweep_deferred` and `cache_over_reason` cannot disagree about the last
+    /// attempt. `Attempt::Pending` until the first sweep runs.
+    pub sweep: Attempt,
     /// 8.4's probe. Kept live: it is re-taken at every rotation, not cached.
     pub cache_writable: bool,
     /// 6.4 step 2's sticky report: the file that failed to parse, and where it
@@ -114,7 +126,8 @@ impl State {
             favorites: BTreeMap::new(),
             current: None,
             next_at: None,
-            sweep_deferred: false,
+            cache_root_id: None,
+            sweep: Attempt::Pending,
             cache_writable: true,
             state_corrupt: None,
             state_quarantined: None,
@@ -253,6 +266,21 @@ impl Daemon {
         load_favorites(&store, &mut state);
         rebuild_current(&mut state);
 
+        // 2.1's `root_id`, read from `index.json` rather than minted here: the
+        // identity is minted on the way to a write, so there is one id per cache
+        // directory and not one per reader of it. A cache that has never been
+        // written has none yet, which `status` reports as `-`; the startup sweep
+        // (5.5's first trigger) writes it microseconds later. An index that cannot
+        // be read is not fatal at startup (the sweep reports it as 5.4's
+        // `sweep_error`).
+        match cache::load(&effective.cache_dir, unix_seconds()) {
+            Ok(index) if !index.root_id.is_empty() => {
+                state.cache_root_id = Some(index.root_id.clone())
+            }
+            Ok(_) => {}
+            Err(message) => eprintln!("whirld: index.json: {message}"),
+        }
+
         // 2.10 `next_at`: the persisted deadline, or a fresh one. A first run
         // has no file to read it from.
         let interval = effective.config.schedule.interval_seconds as i64;
@@ -287,7 +315,38 @@ impl Daemon {
         let state = self.state();
         let config = &self.effective.config;
         let current = state.current.as_ref();
-        let cache = cache_usage(&self.effective.cache_dir);
+        // 5.4's check is the definition of these totals: the files under
+        // `sha256/`, measured now, against the two caps. One walk answers
+        // `cache_files`, `cache_bytes`, `cache_over_cap` and the reason, so the
+        // four keys cannot disagree with each other.
+        let cache = cache::survey(&self.effective.cache_dir).ok();
+        let protected = protected_set(&state);
+        let over = cache.as_ref().and_then(|survey| {
+            if state.favorites_degraded {
+                // 5.3 and 6.4 step 3 both say this without a condition on the
+                // caps: while the pin set is unreadable the status line reports
+                // `cache_over_reason: favorites_degraded` "rather than a bound it
+                // is not enforcing". The reason is a property of the degraded
+                // state, so it is reported the moment the state exists, and
+                // `cache_over_cap` stays the separate fact that a cap is
+                // exceeded.
+                Some(cache::Cause::FavoritesDegraded)
+            } else if state.sweep != Attempt::Ran {
+                // 5.4: the four causes are exhaustive, so a sweep that did not
+                // enforce the bound is named rather than exempted.
+                (survey.bytes > config.cache.max_bytes || survey.files > config.cache.max_files)
+                    .then_some(cache::Cause::SweepError)
+            } else {
+                cache::over_cause(
+                    survey,
+                    config.cache.max_bytes,
+                    config.cache.max_files,
+                    &protected,
+                    unix_seconds(),
+                    config.cache.grace_seconds,
+                )
+            }
+        });
         let mut response = Response::ok()
             .kv(
                 "daemon_version",
@@ -349,37 +408,27 @@ impl Daemon {
             )
             .kv("anchor_verified", u8::from(state.anchor_verified))
             .kv("cache_dir", self.effective.cache_dir.display())
-            // 2.1 puts the root id inside `index.json`, which the cache card
-            // owns; until that file exists there is no identity to report, and
-            // 6.1's `cache` block is written the same way.
-            .kv("cache_root_id", "-")
+            // 2.1 mints the root id inside `index.json`, which this daemon is the
+            // writer of (7.2) and reads at startup.
+            .kv("cache_root_id", dash(state.cache_root_id.clone()))
             .kv(
                 "cache_files",
-                dash(cache.map(|(files, _)| files.to_string())),
+                dash(cache.as_ref().map(|survey| survey.files.to_string())),
             )
             .kv(
                 "cache_bytes",
-                dash(cache.map(|(_, bytes)| bytes.to_string())),
+                dash(cache.as_ref().map(|survey| survey.bytes.to_string())),
             )
             .kv("cache_files_cap", config.cache.max_files)
             .kv("cache_bytes_cap", config.cache.max_bytes)
-            .kv(
-                "cache_over_cap",
-                u8::from(matches!(cache, Some((_, bytes)) if bytes > config.cache.max_bytes)),
-            )
-            // 5.4's four causes are sweep outcomes. One of them is reachable
-            // here: 6.4 says a degraded favorites file reports itself rather
-            // than a bound the daemon is not enforcing.
+            .kv("cache_over_cap", u8::from(over.is_some()))
             .kv(
                 "cache_over_reason",
-                if state.favorites_degraded {
-                    "favorites_degraded"
-                } else {
-                    "-"
-                },
+                over.map(|cause| cause.as_str().to_string())
+                    .unwrap_or_else(|| "-".to_string()),
             )
             .kv("cache_writable", u8::from(state.cache_writable))
-            .kv("sweep_deferred", u8::from(state.sweep_deferred))
+            .kv("sweep_deferred", u8::from(state.sweep.deferred()))
             // The primitive actually holding `state/locks/daemon.lock`, read from
             // the lock this daemon took at startup (2.10's `lock_mode` row: two
             // values, no third, and the value names the primitive and not the
@@ -566,7 +615,8 @@ impl Daemon {
     /// or `record_failure` is what clears `running` again.
     pub fn rotation(&self, run: u64, via: Via, verb: Verb, target: Option<&str>) -> Rotation {
         let deadline = self.worker_deadline();
-        match self.worker.run(verb, target, run, deadline) {
+        let mut reported = None;
+        let outcome = match self.worker.run(verb, target, run, deadline) {
             Ok(Outcome::Set(record)) => {
                 self.record_success(
                     &record.digest,
@@ -574,6 +624,16 @@ impl Daemon {
                     via,
                     record.path.as_deref(),
                 );
+                // 7.3 step 4's input: the three fields the worker's `set:` line
+                // carries, with the kind from the source the daemon spawned. An
+                // empty path is a `set:` line without one, which is not a cache
+                // path and so records no index entry.
+                reported = Some(Reported {
+                    digest: record.digest.clone(),
+                    origin_key: record.origin_key.clone(),
+                    path: record.path.clone().unwrap_or_default(),
+                    kind: self.kind_of(&record.origin_key),
+                });
                 Rotation::Set(record)
             }
             // A rotation verb answered with `source:`/`plan:` lines is not the
@@ -603,7 +663,13 @@ impl Daemon {
                 self.record_failure(code, &message);
                 Rotation::Failed { code, message }
             }
-        }
+        };
+        // 7.3 step 4 and 5.5's second trigger: the index entry, then the sweep,
+        // after the worker has exited. A failed rotation runs the sweep too
+        // ("including failed ones") and records no entry, because there is
+        // nothing the worker reported.
+        self.finish_rotation(reported.as_ref());
+        outcome
     }
 
     /// Spend the slot of a due rotation: the deadline advances by whole
@@ -633,6 +699,122 @@ impl Daemon {
             "whirld: clock jump: the wall clock moved {seconds} s, next_at re-anchored to {}",
             protocol::rfc3339_utc(next_at)
         );
+    }
+
+    /// 5.5's sweep: one implementation, three trigger points, and it always runs
+    /// while holding the rotation lock (7.2), which is what makes it unable to
+    /// race a download.
+    ///
+    /// **Triggers.** `crate::run` calls this after the socket is bound and before
+    /// the first slot; [`Daemon::finish_rotation`] calls it at the end of every
+    /// rotation, including failed ones; and 5.5's third trigger, a `reset` verb,
+    /// has no call site in this build, because 2.5's verb set is closed and holds
+    /// no such verb and 6.5's `whirl reset` is a CLI verb that has not landed.
+    /// Never on a timer: "a timer is a resident thing to wake up for".
+    pub fn sweep(&self) {
+        let config = cache::CacheConfig::from(&self.effective.config.cache);
+        // Step 1: the rotation lock, non-blocking. The worker's own half of 7.2
+        // (it takes `rotate.lock` for its run) is not in this build:
+        // `crates/whirl-worker` has no lock module yet, so a hand-run worker is
+        // the only other process this can meet.
+        let guard = match crate::lock::take_rotate(&self.effective.state_dir) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                // 5.5 step 7's one line, with `deferred=1`: the shape is fixed,
+                // and two numbers of it are measured rather than left empty.
+                let measured = cache::survey(&self.effective.cache_dir).ok();
+                eprintln!(
+                    "sweep files={} bytes={} removed=0 reclaimed=0 orphans=0 deferred=1",
+                    measured
+                        .as_ref()
+                        .map(|measured| measured.files.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    measured
+                        .as_ref()
+                        .map(|measured| measured.bytes.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                self.record_sweep(Attempt::Deferred, None);
+                return;
+            }
+            Err(message) => {
+                eprintln!("whirld: sweep failed: {message}");
+                self.record_sweep(Attempt::Failed, None);
+                return;
+            }
+        };
+        let protected = {
+            let state = self.state();
+            protected_set(&state)
+        };
+        let now = unix_seconds();
+        match cache::sweep(&self.effective.cache_dir, &config, &protected, now) {
+            Ok(swept) => {
+                // Step 7: one line, in the shape 5.5 prints.
+                eprintln!(
+                    "sweep files={} bytes={} removed={} reclaimed={} orphans={} deferred=0",
+                    swept.files, swept.bytes, swept.removed, swept.reclaimed, swept.orphans
+                );
+                self.record_sweep(Attempt::Ran, Some(swept));
+            }
+            Err(message) => {
+                eprintln!("whirld: sweep failed: {message}");
+                self.record_sweep(Attempt::Failed, None);
+            }
+        }
+        drop(guard);
+    }
+
+    /// What the last sweep attempt did, for 2.10's `sweep_deferred`, 5.4's
+    /// `sweep_error` and 2.9's `cache_swept`. One place, so the three cannot
+    /// disagree about the attempt they are all describing.
+    fn record_sweep(&self, attempt: Attempt, swept: Option<cache::Swept>) {
+        let mut state = self.state();
+        state.sweep = attempt;
+        if state.cache_root_id.is_none() && attempt == Attempt::Ran {
+            // The write this attempt has just made mints the id when the cache had
+            // none, so this is the value `index.json` now carries.
+            if let Ok(index) = cache::load(&self.effective.cache_dir, unix_seconds()) {
+                if !index.root_id.is_empty() {
+                    state.cache_root_id = Some(index.root_id);
+                }
+            }
+        }
+        if let Some(swept) = swept {
+            Self::announce(
+                &mut state,
+                &self.bus,
+                Event::CacheSwept {
+                    // 2.9's `<removed>` is every file this sweep unlinked, across
+                    // 5.5's steps 3, 4 and 5; the log line keeps the three
+                    // apart, and the event is the one number a subscriber wants.
+                    removed: swept.removed + swept.reclaimed + swept.orphans,
+                    reclaimed_bytes: swept.freed_bytes,
+                    hidden: swept.hidden,
+                },
+            );
+        }
+    }
+
+    /// 7.3 step 4's daemon half, after the worker has exited: the index entry for
+    /// what the worker reported (7.2 makes the daemon the writer of
+    /// `cache/index.json`), then the sweep. Both run after every rotation,
+    /// including a failed one (5.5).
+    fn finish_rotation(&self, reported: Option<&Reported>) {
+        if let Some(reported) = reported {
+            let protected = {
+                let state = self.state();
+                protected_set(&state)
+            };
+            let now = unix_seconds();
+            match cache::record(&self.effective.cache_dir, reported, &protected, now) {
+                // The sweep writes the file; an entry recorded here is already in
+                // it, and 5.5 step 6 writes it again on every sweep anyway.
+                Ok(_) => {}
+                Err(message) => eprintln!("whirld: index entry not written: {message}"),
+            }
+        }
+        self.sweep();
     }
 
     pub fn resolve_id(&self, id: &str) -> Option<Resolved> {
@@ -775,15 +957,17 @@ impl Daemon {
                 set_at: Some(current.at.clone()),
                 display_mode: Some(config.display.mode.as_str().to_string()),
             }),
-            cache: cache_usage(&self.effective.cache_dir).map(|(files, bytes)| CacheFacts {
-                // 2.1: the root id lives in `index.json`, which does not exist
-                // until the cache card lands.
-                root_id: None,
-                files,
-                bytes,
-                over_cap_bytes: u64::from(bytes > config.cache.max_bytes),
-                over_cap_files: u64::from(files > config.cache.max_files),
-            }),
+            cache: cache::survey(&self.effective.cache_dir)
+                .ok()
+                .map(|survey| CacheFacts {
+                    // 2.1: the identity and the totals both come from the cache's
+                    // own files, and this daemon is the writer of both (7.2).
+                    root_id: state.cache_root_id.clone(),
+                    files: survey.files,
+                    bytes: survey.bytes,
+                    over_cap_bytes: u64::from(survey.bytes > config.cache.max_bytes),
+                    over_cap_files: u64::from(survey.files > config.cache.max_files),
+                }),
         };
         self.write(File::Current, file.encode());
     }
@@ -1084,27 +1268,37 @@ fn rss_kb() -> Option<u64> {
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
-/// The files and bytes under the cache root, measured (`cache_files` and
-/// `cache_bytes` in 2.10). `DirEntry::metadata` does not follow a symlink, so the
-/// walk cannot be pulled out of the tree it was given, and an unreadable
-/// directory yields `None`, which `status` reports as `-` rather than as zero.
-fn cache_usage(root: &Path) -> Option<(u64, u64)> {
-    let mut files = 0u64;
-    let mut bytes = 0u64;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(&directory).ok()? {
-            let entry = entry.ok()?;
-            let metadata = entry.metadata().ok()?;
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else if metadata.is_file() {
-                files += 1;
-                bytes += metadata.len();
-            }
+/// 5.3's protected set, resolved from the state this daemon holds. Two keys per
+/// rule, a digest and a path, because either can be the only one available: an
+/// index entry carries the digest, a `Favorite` carries both, and a file the
+/// daemon died before recording carries only a path.
+///
+/// 5.3's escalation is here too: while `favorites.json` is quarantined
+/// (`favorites_degraded: 1`, 6.4) the pin set cannot be read, so the whole cache
+/// is protected.
+fn protected_set(state: &State) -> Protected {
+    let mut protected = Protected {
+        degraded: state.favorites_degraded,
+        ..Protected::default()
+    };
+    if let Some(current) = &state.current {
+        protected.anchor_digest = Some(current.digest.clone());
+        if let Some(path) = &current.path {
+            protected.anchor_paths.insert(path.clone());
         }
     }
-    Some((files, bytes))
+    for favorite in state.favorites.values() {
+        // 5.3: "every `favorites.json` entry with a materialised `cached_path`
+        // and digest". Storing both means a hand-edited file can make the two
+        // disagree, and the union still protects what either names.
+        if let Some(digest) = &favorite.digest {
+            protected.pinned_digests.insert(digest.clone());
+        }
+        if let Some(path) = &favorite.path {
+            protected.pinned_paths.insert(path.clone());
+        }
+    }
+    protected
 }
 
 /// Where a favorite's bytes are. There is no cache in this build, so a pin is
@@ -1118,7 +1312,7 @@ pub fn favorite_state(path: Option<&str>) -> FavoriteState {
 mod tests {
     use super::*;
     use crate::lock::{Attempt, Mode};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use whirl_core::config::Backend;
 
     /// 2.10's `next_in_s` row, one assertion per state it names, with `now`
@@ -1201,6 +1395,12 @@ mod tests {
     /// supplied by `attempt`: the two values of 2.10's row are otherwise not both
     /// reachable on a machine whose filesystems all support `flock`.
     fn daemon(dir: &Path, attempt: Attempt) -> Daemon {
+        daemon_with(dir, attempt, Config::default())
+    }
+
+    /// The same, with the config of the test's choosing: the caps of 5.1 and the
+    /// graces of 5.3 are the inputs every eviction decision is made from.
+    fn daemon_with(dir: &Path, attempt: Attempt, config: Config) -> Daemon {
         let state_dir = dir.join("state");
         let effective = Effective {
             config_path: dir.join("config.json"),
@@ -1208,7 +1408,7 @@ mod tests {
             state_dir: state_dir.clone(),
             cache_dir: dir.join("cache"),
             backend: Backend::Noop,
-            config: Config::default(),
+            config,
         };
         let worker = crate::worker::Worker::new(
             PathBuf::from("whirl-worker"),
@@ -1241,6 +1441,139 @@ mod tests {
 
         drop(flock);
         drop(exclusive);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One `key: value` of a `status` response, as a client reads it (2.4).
+    fn kv(response: &Response, key: &str) -> String {
+        response
+            .lines()
+            .iter()
+            .find_map(|line| line.strip_prefix(&format!("{key}: ")).map(str::to_string))
+            .unwrap_or_else(|| panic!("{key} is in the 2.10 key set: {:?}", response.lines()))
+    }
+
+    /// Indexed cache files under a scratch cache root: a file with no index entry
+    /// is 5.5 step 3's orphan and is not what these tests are about, so each file
+    /// gets the entry that makes it an entry step 5 may evict. `last_used` runs
+    /// oldest first, which is the order step 5 evicts in.
+    fn plant_images(cache_dir: &Path, digests: &[String]) {
+        let mut index = whirl_core::state::IndexFile {
+            seq: 0,
+            written_at: "2026-01-01T00:00:00Z".to_string(),
+            root_id: "test-root".to_string(),
+            entries: BTreeMap::new(),
+            dangling: Vec::new(),
+        };
+        for (position, digest) in digests.iter().enumerate() {
+            let path = whirl_core::state::content_path(cache_dir, digest, "jpg");
+            std::fs::create_dir_all(path.parent().expect("a digest directory"))
+                .expect("the parents");
+            std::fs::write(&path, vec![b'x'; 100]).expect("a cache file");
+            index.entries.insert(
+                digest.clone(),
+                whirl_core::state::CacheIndexEntry {
+                    ext: "jpg".to_string(),
+                    bytes: 100,
+                    first_seen: "2026-01-01T00:00:00Z".to_string(),
+                    last_used: format!("2026-01-0{}T00:00:00Z", position + 1),
+                    source: "test".to_string(),
+                    kind: Kind::Local,
+                    origin: None,
+                    origin_key: "test:1".to_string(),
+                    width: None,
+                    height: None,
+                    pinned: false,
+                },
+            );
+        }
+        cache::write(cache_dir, &index).expect("the planted index");
+    }
+
+    /// 2.10's `sweep_deferred` and 5.4's `sweep_error` are two readings of one
+    /// attempt, so a cache over its cap reports the sweep that did not run rather
+    /// than a bound that held: the same daemon is put in each of the states
+    /// `Attempt` can be in before a sweep finishes, and then allowed to sweep for
+    /// real through `Daemon::sweep` (5.5 step 1's lock included).
+    ///
+    /// A `status` that reported `cache_over_cap: 0` for a cache it never
+    /// corrected, or `sweep_deferred: 1` for a sweep that ran and failed, fails
+    /// one of these assertions; the two keys are read from one attempt, so they
+    /// cannot disagree about it.
+    #[test]
+    fn status_reports_a_sweep_that_did_not_run_and_then_the_bound_it_enforced() {
+        let root = std::env::temp_dir().join(format!("whirl-sweep-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let mut config = Config::default();
+        config.cache.max_files = 2;
+        // 5.3 protects "any cache file created within `cache.grace_seconds`", and
+        // every file this test writes was created seconds ago: 0 is the smallest
+        // window that lets the cap bind at all, and 4.3 puts no floor on it.
+        config.cache.grace_seconds = 0;
+        let daemon = daemon_with(&root, Attempt::Acquired, config);
+
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("the cache root");
+        let digests: Vec<String> = ['1', '2', '3']
+            .iter()
+            .map(|byte| byte.to_string().repeat(64))
+            .collect();
+        plant_images(&cache_dir, &digests);
+
+        // Nothing has swept yet, and the cache is over a cap: 5.4's four causes
+        // are exhaustive, so this is `sweep_error` rather than an exemption.
+        let before = daemon.status();
+        assert_eq!(kv(&before, "cache_files"), "3");
+        assert_eq!(
+            kv(&before, "cache_over_cap"),
+            "1",
+            "three files against a cap of two"
+        );
+        assert_eq!(kv(&before, "cache_over_reason"), "sweep_error");
+        assert_eq!(
+            kv(&before, "sweep_deferred"),
+            "0",
+            "1 is 5.5 step 1's case and nothing else"
+        );
+
+        // 5.5 step 1: someone else held `rotate.lock`.
+        daemon.state().sweep = cache::Attempt::Deferred;
+        let deferred = daemon.status();
+        assert_eq!(kv(&deferred, "sweep_deferred"), "1");
+        assert_eq!(kv(&deferred, "cache_over_reason"), "sweep_error");
+
+        // 5.5's other way to not finish: it ran and failed (8.1's disk-full case).
+        daemon.state().sweep = cache::Attempt::Failed;
+        let failed = daemon.status();
+        assert_eq!(
+            kv(&failed, "sweep_deferred"),
+            "0",
+            "a failed sweep is a different fact (2.10)"
+        );
+        assert_eq!(kv(&failed, "cache_over_reason"), "sweep_error");
+
+        // And the sweep that does run, through the real rotation lock.
+        daemon.sweep();
+        let after = daemon.status();
+        assert_eq!(
+            kv(&after, "cache_files"),
+            "2",
+            "5.5 step 5 evicted down to `cache.max_files`"
+        );
+        assert_eq!(kv(&after, "cache_over_cap"), "0");
+        assert_eq!(kv(&after, "cache_over_reason"), "-");
+        assert_eq!(kv(&after, "sweep_deferred"), "0");
+        assert!(
+            !whirl_core::state::content_path(&cache_dir, &digests[0], "jpg").exists(),
+            "the oldest `last_used` went"
+        );
+        assert!(
+            whirl_core::state::content_path(&cache_dir, &digests[2], "jpg").exists(),
+            "the newest is still there"
+        );
+
+        drop(daemon);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

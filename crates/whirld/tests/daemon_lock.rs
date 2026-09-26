@@ -149,7 +149,7 @@ fn a_second_daemon_refuses_to_start_and_names_the_holder_pid() {
     assert_eq!(
         output.status.code(),
         Some(1),
-        "a daemon that refuses to start exits 1 (2.11 item 7: 1 is \"the daemon refused\"): {stderr}"
+        "a daemon that refuses to start exits 1 (section 8 item 7, docs/architecture.md:1750 as a line hint: 1 is \"the daemon refused\"): {stderr}"
     );
     assert!(
         stderr.contains(&format!("pid {}", first.id())),
