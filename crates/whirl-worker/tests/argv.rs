@@ -281,3 +281,57 @@ fn help_prints_the_argv_contract_and_exits_zero() {
     assert!(text.contains("--verb <rotate|set|check>"), "{text}");
     assert!(text.contains("--run"), "{text}");
 }
+
+/// 4.3's cache root, as a process: `WHIRL_CACHE_DIR` names the directory a
+/// `set <digest>` looks in. The value is read **verbatim**, relative included,
+/// which is the rule the daemon applies to the same name
+/// (`env_path`, crates/whirld/src/plan.rs); 1.2's "a relative value is treated
+/// as unset" is about the four XDG variables, not about this one.
+///
+/// A worker that dropped the value the daemon honoured would fall through
+/// `cache.root` (null in this config) to the platform default and answer
+/// `not_found` for a digest whose file is sitting under the directory the
+/// operator named. The relative form is the one that fails that way, which is
+/// why the test uses it: the absolute form was honoured even before the two
+/// processes agreed. What a relative value costs is visible in the answer - the
+/// path in the `set:` line is relative, because the root it came from is - and
+/// that is a property of the operator's override rather than of this resolution.
+#[test]
+fn set_finds_a_digest_under_whirl_cache_dir() {
+    const DIGEST: &str = "264e1a838572fcf30c2e019ed8760ea0c8134f318097718fcfac1390af19cd37";
+    assert_eq!(DIGEST.len(), 64, "a content digest is 64 hex characters");
+
+    let dir = scratch("cache-dir");
+    let config = write_config(&dir);
+    // `sha256/<first two characters>/<next two>/<digest>.<ext>`, the two-level
+    // fan-out of state-and-cache section 2 and the shape `Cache::find` probes.
+    let cached = Path::new("cache")
+        .join("sha256")
+        .join(&DIGEST[0..2])
+        .join(&DIGEST[2..4])
+        .join(format!("{DIGEST}.png"));
+    let file = dir.join(&cached);
+    std::fs::create_dir_all(file.parent().expect("a parent")).expect("the cache tree");
+    std::fs::write(&file, b"a file the cache already holds").expect("a cache file");
+
+    let output = Command::new(worker())
+        .arg("--config")
+        .arg(&config)
+        .args(["--verb", "set", "--target", DIGEST, "--run", "3"])
+        .env("WHIRL_BACKEND", "noop")
+        .env("WHIRL_CACHE_DIR", "cache")
+        .current_dir(&dir)
+        .output()
+        .expect("the worker runs");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains(&cached.display().to_string()),
+        "the set line names the file under the environment's directory: {}",
+        stdout(&output)
+    );
+}

@@ -7,7 +7,8 @@
 //! the daemon's whole environment) and what lets the Linux adapters see the
 //! session signals they need.
 
-use std::io::Read;
+use std::ffi::OsString;
+use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,6 +17,19 @@ use whirl_core::protocol::{self, ErrorCode, SetRecord, Via};
 
 /// The variables the worker always gets (docs/architecture.md 1.6).
 const ALWAYS: [&str; 2] = ["PATH", "HOME"];
+
+/// The two path knobs of docs/architecture.md 4.3's environment layer that the
+/// worker resolves for itself, passed through with the daemon's own values when
+/// the daemon's environment has them (1.6 says so; the list is 1.6's).
+///
+/// They are here because 4.3 puts the environment ahead of the config file for
+/// the cache root and the state directory, and the worker resolves both on its
+/// own (`whirl_worker::pipeline::Cache::resolve` and `state_directory()`). A
+/// scrub that dropped them left the daemon reporting the directory the
+/// environment named while the worker fell through to the compiled default and
+/// wrote somewhere else: two processes, two directories, one rotation. Each name
+/// is passed only when set, which is the rule the API key below already follows.
+const PASSED_THROUGH: [&str; 2] = ["WHIRL_CACHE_DIR", "WHIRL_STATE_DIR"];
 
 /// The nine Linux-only variables: the four decisive session signals (five
 /// names, because sway and i3 share a row) plus the four a session bus or a
@@ -31,6 +45,18 @@ const LINUX_ONLY: [&str; 9] = [
     "WAYLAND_DISPLAY",
     "DISPLAY",
 ];
+
+/// The names the scrub lets through, in one place so the spawn, its test and
+/// 1.6's list cannot drift: `ALWAYS`, then 4.3's two path knobs, each one only
+/// when the lookup finds it. The daemon's own environment is the lookup in
+/// production; a test supplies its own table and asks the same question.
+fn forwarded(lookup: &dyn Fn(&str) -> Option<OsString>) -> Vec<(String, OsString)> {
+    ALWAYS
+        .iter()
+        .chain(PASSED_THROUGH.iter())
+        .filter_map(|name| lookup(name).map(|value| (name.to_string(), value)))
+        .collect()
+}
 
 /// The worker's verb (1.6). `prev` is not one: `prev`'s job is a `set` of a
 /// candidate the daemon already knows, so it spawns `--verb set --target`.
@@ -76,6 +102,30 @@ const POLL: Duration = Duration::from_millis(5);
 
 /// How long the worker gets after `SIGTERM` before `SIGKILL` (1.7.1).
 const TERM_GRACE: Duration = Duration::from_secs(5);
+
+/// How many times the spawn is attempted when the kernel refuses it with
+/// `ETXTBSY`: the first, plus nine retries.
+///
+/// `ETXTBSY` means the kernel refused **before anything ran**. Linux refuses to
+/// `execve` a file that any process holds open for writing (`deny_write_access`
+/// on the exec target), so no worker existed, no `rotate.lock` was taken and
+/// nothing was written: re-attempting is free. The alternative is a
+/// `worker_failed` report (2.7) about a process that never started.
+///
+/// The condition is transient **by construction**, not by luck: *any* open-for-
+/// write descriptor on the file being exec'd causes it, and the holder is always
+/// someone who is about to be done with it. Under `cargo test` it is a forked
+/// child of a sibling thread that inherited the descriptor `Scripts::script`
+/// wrote with (`fork` duplicates the descriptor into the child, which can
+/// outlive the write in the parent). In an install it is the process replacing
+/// the binary, which holds it open for write only while it copies.
+const SPAWN_ATTEMPTS: usize = 10;
+
+/// The sleep between two spawn attempts: nine of them is 450 ms of waiting in
+/// the worst case, and it is only ever reached on a real `ETXTBSY`. Every other
+/// errno (a missing program, a directory, a permission denial) returns on the
+/// first attempt with today's message and today's immediacy.
+const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(50);
 
 pub struct Worker {
     program: PathBuf,
@@ -125,10 +175,8 @@ impl Worker {
         }
         command.arg("--run").arg(run.to_string());
         command.env_clear();
-        for name in ALWAYS {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
+        for (name, value) in forwarded(&|name| std::env::var_os(name)) {
+            command.env(name, value);
         }
         // The daemon resolved the backend, so the worker is told rather than
         // asked to re-resolve it (docs/development.md section 7).
@@ -147,15 +195,36 @@ impl Worker {
             }
         }
 
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| WorkerError::Failed {
-                code: ErrorCode::WorkerFailed,
-                message: format!("cannot spawn {}: {error}", self.program.display()),
-            })?;
+        // `ETXTBSY` is the kernel refusing before anything ran, so a retry costs
+        // nothing and a report would be about a worker that never existed. Every
+        // other refusal is today's first-attempt failure.
+        let mut attempt = 1;
+        let mut child = loop {
+            match command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
+                    if attempt >= SPAWN_ATTEMPTS {
+                        return Err(WorkerError::Failed {
+                            code: ErrorCode::WorkerFailed,
+                            message: format!("cannot spawn {}: {error}", self.program.display()),
+                        });
+                    }
+                    attempt += 1;
+                    std::thread::sleep(SPAWN_RETRY_PAUSE);
+                }
+                Err(error) => {
+                    return Err(WorkerError::Failed {
+                        code: ErrorCode::WorkerFailed,
+                        message: format!("cannot spawn {}: {error}", self.program.display()),
+                    });
+                }
+            }
+        };
 
         let deadline_at = Instant::now() + deadline;
         let status = loop {
@@ -258,17 +327,34 @@ fn failure_from(stderr: &str) -> WorkerError {
 /// `SIGTERM`, five seconds, then `SIGKILL` (1.7.1).
 ///
 /// `Child::kill` is `SIGKILL` on Unix and the standard library has no signal
-/// API, so the polite half goes through `kill(1)`, which exists on every Unix
-/// this build targets. A missing `kill` falls straight through to `SIGKILL`.
+/// API, so the polite half is handed to the `kill` utility below. What this
+/// module may not assume is that a `kill` program is installed, and the history
+/// is kept here because the failure mode was silence:
+///
+/// `kill(1)` is `procps`' on Debian, `procps` is priority `important` rather
+/// than `required`, and the slim images this project builds and reviews in
+/// (`rust:1.85-slim`, `rust:1.94-slim-bookworm`, both arm64) have no `kill`
+/// anywhere on `PATH`. `Command::new("kill")` there failed with `ENOENT` (code
+/// 2) before any signal existed, and because that error was discarded, the
+/// grace below ran its whole five seconds against a worker that was never told
+/// anything before the run ended in `SIGKILL` alone. That is 1.7.1's grace with
+/// the polite half missing, and it is what
+/// `a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace` reported
+/// as "no SIGTERM trap ran in 30s" in a container, identically on base
+/// `7e22e1a` and on `origin/development`, with the run taking exactly
+/// `DEADLINE` plus `TERM_GRACE` (8.01s) because nothing had been signalled.
+///
+/// It was not a PID 1 story, and measuring said so: under `cargo test` in that
+/// image PID 1 is `cargo`, which forks the test binary, which forks the worker,
+/// so the worker is a grandchild with an ordinary PID (probe: worker PID 33 and
+/// the script's own `$$` 33, while PID 1 held `sh`). Nothing in this path turns
+/// on PID 1's default dispositions; all of it turns on whether a `kill` program
+/// exists, which is why the answer is a second route rather than a test that
+/// stops asking for one.
 fn terminate(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = kill(child.id(), "-TERM");
     }
     let grace = Instant::now() + TERM_GRACE;
     while Instant::now() < grace {
@@ -280,6 +366,52 @@ fn terminate(child: &mut std::process::Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// The `kill` utility: how this build sends one signal to one pid, because the
+/// standard library exposes no signal API beyond `Child::kill`, which is
+/// `SIGKILL`, and this workspace has no third-party dependencies to borrow one
+/// from.
+///
+/// Two routes, cheapest first. `kill(1)` is a single `exec` and is what macOS
+/// and any Linux with `procps` installed provide; where there is no such binary
+/// (`terminate` above names the images and the `ENOENT`) the shell's own `kill`
+/// builtin does the same job. POSIX requires `sh` to have that builtin, every
+/// Unix this build targets ships a `sh`, and this project already runs scripts
+/// through `sh` in its own tests, so the fallback costs one fork on the
+/// platforms that need it and nothing at all anywhere else.
+///
+/// The option and the pid go to the shell as positional arguments rather than
+/// interpolated into its command string, so neither can be read as syntax even
+/// if a later caller passes something this one did not.
+///
+/// `None` means neither route could be started at all. That is the one case
+/// that would put 1.7.1 back where the history above found it, and neither
+/// caller treats it as fatal: `terminate` does not depend on the polite half
+/// succeeding, because `SIGKILL` is still there, and the test's probe is a
+/// best-effort question with its own assertion to fail on.
+#[cfg(unix)]
+fn kill(pid: u32, option: &str) -> Option<std::process::ExitStatus> {
+    let pid = pid.to_string();
+    let direct = Command::new("kill")
+        .arg(option)
+        .arg(&pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match direct {
+        Ok(status) => Some(status),
+        Err(_) => Command::new("sh")
+            .arg("-c")
+            .arg("kill \"$1\" \"$2\"")
+            .arg("sh")
+            .arg(option)
+            .arg(&pid)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok(),
+    }
 }
 
 #[cfg(test)]
@@ -391,10 +523,10 @@ mod tests {
 
     /// 1.6's environment rule, as a set equality rather than a membership test:
     /// the child sees the two names that are always set, the two the daemon
-    /// adds, the API key when the daemon has one, the nine Linux session
-    /// variables on Linux when they are set, and nothing else. The shell sets
-    /// `PWD`, `SHLVL` and `_` for itself, which is why they are named here
-    /// instead of silently tolerated.
+    /// adds, 4.3's two path knobs when the daemon's own environment has them, the
+    /// API key when the daemon has one, the nine Linux session variables on Linux
+    /// when they are set, and nothing else. The shell sets `PWD`, `SHLVL` and `_`
+    /// for itself, which is why they are named here instead of silently tolerated.
     ///
     /// An implementation that forgot `env_clear()` fails on the extra names: the
     /// test process's own environment has at least `CARGO_*` in it under
@@ -424,6 +556,11 @@ mod tests {
         let mut expected: Vec<String> = ALWAYS.iter().map(|name| name.to_string()).collect();
         expected.push("WHIRL_CONFIG".to_string());
         expected.push("WHIRL_BACKEND".to_string());
+        for name in PASSED_THROUGH {
+            if std::env::var_os(name).is_some() {
+                expected.push(name.to_string());
+            }
+        }
         if std::env::var_os("WHIRL_WALLHAVEN_API_KEY").is_some() {
             expected.push("WHIRL_WALLHAVEN_API_KEY".to_string());
         }
@@ -461,6 +598,50 @@ mod tests {
                 names.join(" ")
             );
         }
+    }
+
+    /// The pure half of the same rule, so the spawn and the list cannot drift:
+    /// `PASSED_THROUGH` reaches the worker when the daemon's own environment has
+    /// it, and is absent - not empty - when it does not. The lookup is the
+    /// parameter here rather than the process environment, because a test that
+    /// mutated its own environment would be racing every other test in this
+    /// binary.
+    #[test]
+    fn the_4_3_path_knobs_are_passed_through_only_when_the_daemon_has_them() {
+        fn names(environment: Vec<(String, OsString)>) -> Vec<String> {
+            environment.into_iter().map(|(name, _)| name).collect()
+        }
+
+        let scratch = |name: &str| match name {
+            "PATH" | "HOME" | "WHIRL_CACHE_DIR" | "WHIRL_STATE_DIR" => {
+                Some(OsString::from(format!("/{name}")))
+            }
+            _ => None,
+        };
+        assert_eq!(
+            names(forwarded(&scratch)),
+            ["PATH", "HOME", "WHIRL_CACHE_DIR", "WHIRL_STATE_DIR"],
+            "1.6's list, and the two knobs carry the daemon's own values"
+        );
+        assert_eq!(
+            forwarded(&scratch)
+                .into_iter()
+                .filter(|(name, _)| name == "WHIRL_CACHE_DIR")
+                .map(|(_, value)| value)
+                .collect::<Vec<OsString>>(),
+            [OsString::from("/WHIRL_CACHE_DIR")],
+            "the value the worker is given is the daemon's, not a re-resolution"
+        );
+
+        let bare = |name: &str| match name {
+            "PATH" | "HOME" => Some(OsString::from("/x")),
+            _ => None,
+        };
+        assert_eq!(
+            names(forwarded(&bare)),
+            ["PATH", "HOME"],
+            "an unset knob is not passed through as an empty value"
+        );
     }
 
     /// How closely the test can pin the *early* side of the deadline: how much
@@ -646,13 +827,10 @@ mod tests {
         );
 
         let pid: u32 = scripts.text("pid.txt").trim().parse().expect("a pid");
-        let probe = Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("kill -0");
+        // Through the same `kill` utility the daemon just used, so this probe
+        // is not itself a reason for the test to fail on an image with no
+        // `kill(1)` binary (see `terminate`).
+        let probe = kill(pid, "-0").expect("kill -0");
         assert!(
             !probe.success(),
             "the worker was killed and reaped, so {pid} is gone"
@@ -784,6 +962,69 @@ mod tests {
                 assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"))
             }
             other => panic!("the worker's stdin must be the null device: {other:?}"),
+        }
+    }
+
+    /// How long the writer of `a_spawn_that_finds_the_script_busy_is_retried`
+    /// holds the script open for write.
+    ///
+    /// It is held before the run and released 100 ms into it, which is what makes
+    /// the first spawn attempt find the writer still there: without the retry
+    /// this test is red on Linux, and red with the CI's own message. It is also
+    /// short enough that a release thread descheduled for hundreds of
+    /// milliseconds still lands inside `SPAWN_ATTEMPTS`'s 450 ms budget, and long
+    /// enough that a pass cannot come from the release winning the race to the
+    /// first spawn.
+    const WRITER_HELD: Duration = Duration::from_millis(100);
+
+    /// A spawn the kernel refuses with `ETXTBSY` is re-attempted, and the retry
+    /// really runs the worker: the assertion is the parsed `Outcome::Set` and its
+    /// fields, not "the spawn did not return an error".
+    ///
+    /// The rule being exercised is Linux's: `execve` refuses a file that any
+    /// process holds open for writing (`deny_write_access` on the exec target)
+    /// with `ETXTBSY`. In the CI failure that produced this test the holder was a
+    /// child forked from a *sibling* thread while `Scripts::script`'s writable
+    /// descriptor was still open, because `fork` duplicates the descriptor into
+    /// the child and the child can keep it past the write in the parent. That
+    /// interleaving cannot be constructed deterministically from a test, so the
+    /// writer here stands in for it: the same kernel rule, the same refusal, the
+    /// same release.
+    ///
+    /// Darwin does not enforce the rule at all, so on macOS this test is vacuous
+    /// (the first spawn simply succeeds); only Linux makes it bite.
+    #[test]
+    fn a_spawn_that_finds_the_script_busy_is_retried() {
+        let scripts = Scripts::new("busy");
+        let digest = "c".repeat(64);
+        let program = scripts.script(
+            "busy.sh",
+            &format!(
+                "#!/bin/sh\nprintf 'set: {digest} pictures:0123456789abcdef /tmp/candidate.jpg\\n'\n"
+            ),
+        );
+
+        // Held before the run, so the first attempt cannot miss it.
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .expect("a writable handle on the script");
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(WRITER_HELD);
+            drop(writer);
+        });
+
+        let outcome = worker(program).run(Verb::Rotate, None, 1, generous());
+        releasing.join().expect("the writer thread");
+
+        match outcome {
+            Ok(Outcome::Set(record)) => {
+                assert_eq!(record.digest, digest);
+                assert_eq!(record.origin_key, "pictures:0123456789abcdef");
+                assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"));
+                assert_eq!(record.via, Via::Source);
+            }
+            other => panic!("a script that is busy for 100 ms is not a failed spawn: {other:?}"),
         }
     }
 }

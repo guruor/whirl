@@ -337,6 +337,116 @@ fn cannot_lock(path: &Path, error: &std::io::Error) -> String {
     format!("cannot take the daemon lock at {}: {error}", path.display())
 }
 
+// ---------------------------------------------------------------------------
+// The rotation lock
+// ---------------------------------------------------------------------------
+
+/// The rotation lock, relative to the state directory: 7.2's ownership table
+/// gives `state/locks/rotate.lock` two writers, "a worker, for the run; the
+/// daemon, for a sweep", and two readers, "both".
+pub const ROTATE_FILE: &str = "locks/rotate.lock";
+
+/// The rotation lock while one process holds it.
+///
+/// It is the same primitive as [`DaemonLock`] and for the same reason: 7.2 calls
+/// `rotate.lock` "the same primitive", and what the primitive buys is the release
+/// the kernel performs when the holder exits, `SIGKILL` included [L 3].
+///
+/// The difference is what a refusal means. A daemon that cannot take
+/// `daemon.lock` does not run (1.5 step 1); the process that cannot take
+/// `rotate.lock` is told "someone else is rotating" and does something else --
+/// a worker exits `busy` (7.3 step 2), and a sweep records `sweep_deferred: 1`
+/// and leaves the work for the next rotation (5.5 step 1). So this type has no
+/// refusal message: [`take_rotate`] answers `Ok(None)` for a lock held by
+/// someone else.
+#[derive(Debug)]
+pub struct RotateLock {
+    path: PathBuf,
+    /// Under `flock` the descriptor whose close releases the lock; under 8.7's
+    /// fallback nothing, because the file's existence is the lock.
+    file: Option<File>,
+    mode: Mode,
+}
+
+impl Drop for RotateLock {
+    fn drop(&mut self) {
+        // 8.7's file *is* the lock, so it has to go when the lock goes.
+        if self.mode == Mode::ExclFile {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        self.file.take();
+    }
+}
+
+/// Take `state/locks/rotate.lock`, non-blocking (5.5 step 1, 7.3 step 2).
+///
+/// `Ok(None)` is "someone else holds it", which is not an error for either
+/// caller: the worker exits `busy`, the sweep defers. Creating the `locks`
+/// directory is this function's job for the same reason it is the daemon
+/// lock's: it may be the first thing to touch the state directory.
+pub fn take_rotate(state_dir: &Path) -> Result<Option<RotateLock>, String> {
+    take_rotate_with(state_dir, flock_attempt)
+}
+
+/// The same, with the capability probe supplied: 8.7's `ENOTSUP` direction is
+/// one no filesystem on this machine can produce, and under it "the file exists"
+/// means "someone else holds the lock" rather than "we do".
+fn take_rotate_with(
+    state_dir: &Path,
+    probe: impl Fn(&File) -> Result<Attempt, std::io::Error>,
+) -> Result<Option<RotateLock>, String> {
+    create_private_dir(state_dir)?;
+    create_private_dir(&state_dir.join(LOCK_DIR))?;
+    let path = state_dir.join(ROTATE_FILE);
+
+    match open_exclusive(&path) {
+        Ok(file) => {
+            let attempt = probe(&file).map_err(|error| {
+                format!(
+                    "cannot take the rotation lock at {}: {error}",
+                    path.display()
+                )
+            })?;
+            match select(attempt) {
+                Some(mode) => Ok(Some(RotateLock {
+                    path,
+                    file: Some(file),
+                    mode,
+                })),
+                // A descriptor this process created exclusively cannot be held
+                // by anyone else, so an OS that says otherwise is not a state to
+                // sweep in.
+                None => Err(format!(
+                    "{} was created exclusively and still reads as held: not sweeping on that answer",
+                    path.display()
+                )),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = open_existing(&path)?;
+            let attempt = probe(&file).map_err(|error| {
+                format!(
+                    "cannot take the rotation lock at {}: {error}",
+                    path.display()
+                )
+            })?;
+            match select(attempt) {
+                Some(Mode::Flock) => Ok(Some(RotateLock {
+                    path,
+                    file: Some(file),
+                    mode: Mode::Flock,
+                })),
+                // 8.8: under the fallback the file's existence is the lock, so a
+                // file this process did not create is a holder this process does
+                // not remove. 8.8's one exception, the worker the daemon has
+                // just reaped, is the worker's half of 7.2 and lands with it.
+                Some(Mode::ExclFile) | None => Ok(None),
+            }
+        }
+        Err(error) => Err(format!("cannot create {}: {error}", path.display())),
+    }
+}
+
 /// 8.7: "Cache root on a filesystem that does not support `flock`: the lock
 /// file's `flock` returns `ENOTSUP`", and 4.2's `cache.root` comment makes it a
 /// check: "config check refuses a root whose filesystem does not support flock,
@@ -430,6 +540,65 @@ mod tests {
         assert_eq!(select(Attempt::Held), None);
         assert_eq!(Mode::Flock.as_str(), "flock");
         assert_eq!(Mode::ExclFile.as_str(), "excl_file");
+    }
+
+    /// 5.5 step 1 and 7.3 step 2 are the same primitive with two readers: the
+    /// second `take_rotate` on one state directory answers `Ok(None)` -- "someone
+    /// else holds it", which is a deferral for the sweep and `busy` for a worker
+    /// -- and the same call answers `Ok(Some(..))` once the holder drops, because
+    /// 7.2's primitive is the one the kernel releases [L 3].
+    ///
+    /// A `take_rotate` that leaked the lock to a second taker, or that kept
+    /// refusing after the holder was gone, fails one of the two directions.
+    #[test]
+    fn the_rotation_lock_defers_to_a_second_holder_and_is_free_after_the_drop() {
+        let dir = scratch("rotate");
+        let holder = take_rotate(&dir)
+            .expect("a take that cannot fail")
+            .expect("the lock is free to begin with");
+        assert!(
+            take_rotate(&dir)
+                .expect("a take that cannot fail")
+                .is_none(),
+            "5.5 step 1: a lock already held is a deferral, not a wait"
+        );
+
+        drop(holder);
+        assert!(
+            take_rotate(&dir)
+                .expect("a take that cannot fail")
+                .is_some(),
+            "7.2: the release is the kernel's when the holder drops"
+        );
+        assert!(
+            dir.join(ROTATE_FILE).is_file(),
+            "the lock file is where 7.2's table puts it: {ROTATE_FILE}"
+        );
+    }
+
+    /// 8.7's fallback direction, which no filesystem on this machine produces:
+    /// there the file's *existence* is the lock, so a file this process did not
+    /// create is a holder, and `take_rotate` defers to it rather than taking it
+    /// over. That is 8.8's refusal, and it is what makes a `sweep_deferred: 1`
+    /// reachable on such a filesystem.
+    #[test]
+    fn a_lock_file_this_process_did_not_create_is_a_holder_under_the_fallback() {
+        let dir = scratch("rotate-fallback");
+        create_private_dir(&dir).expect("the state directory");
+        create_private_dir(&dir.join(LOCK_DIR)).expect("locks/");
+        std::fs::write(dir.join(ROTATE_FILE), "pid 4711 start 1790000000\n")
+            .expect("a planted lock file");
+
+        let deferred =
+            take_rotate_with(&dir, |_| Ok(Attempt::Unsupported)).expect("a take that cannot fail");
+        assert!(
+            deferred.is_none(),
+            "8.8: the file's existence is the holder"
+        );
+        assert!(
+            dir.join(ROTATE_FILE).is_file(),
+            "and a lock this process did not create is not removed"
+        );
     }
 
     /// 1.5 step 1 and 7.2: the lock is real, and the second daemon refuses rather

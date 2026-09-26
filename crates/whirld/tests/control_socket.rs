@@ -327,6 +327,148 @@ fn a_manual_set_runs_the_worker_through_the_noop_backend() {
     );
 }
 
+/// 4.3's cache root, end to end, in the case the defect reported: no
+/// `cache.root` in the config and `WHIRL_CACHE_DIR` in the daemon's environment.
+/// `spawn_daemon` puts every daemon in this file under `<dir>/cache`, so the
+/// environment is what names the root here and the config's `root` is null.
+///
+/// Two things are asserted, not one: the answer (`status`'s `cache_dir:`) and
+/// the filesystem the answer names. The daemon creates its cache root as it
+/// starts and probes it (8.4's `tmp/<run>-probe.part`, written and removed), so
+/// `tmp/` existing is the daemon having really opened the directory it reported,
+/// rather than a string it can print without touching.
+#[test]
+fn the_cache_dir_is_whirl_cache_dir_when_the_config_sets_no_root() {
+    let daemon = start("the_cache_dir_is_whirl_cache_dir_when_the_config_sets_no_root");
+    let config =
+        std::fs::read_to_string(config_path(&daemon)).expect("the config the daemon wrote");
+    assert!(
+        config.contains("\"root\": null"),
+        "the default config this test relies on sets no cache root: {config}"
+    );
+
+    let lines = daemon.ask("status");
+    let environment = daemon.dir.join("cache");
+    assert_eq!(
+        value(&lines, "cache_dir"),
+        environment.display().to_string(),
+        "4.3: the environment beats the compiled default"
+    );
+    assert!(
+        environment.join("tmp").is_dir(),
+        "the daemon created and probed the root it reported"
+    );
+    assert_eq!(
+        value(&lines, "cache_writable"),
+        "1",
+        "the root it probed is writable: {lines:?}"
+    );
+}
+
+/// The same knob with the config file also set: `cache.root` names a second
+/// path inside this test's tree, and `WHIRL_CACHE_DIR` still wins. The file's
+/// root is asserted absent rather than merely unused, because a daemon that read
+/// it would have created it: this is the arm of 4.3 the defect put in doubt
+/// (the compiled default winning over the file, and both losing to the
+/// environment).
+#[test]
+fn whirl_cache_dir_beats_a_cache_root_the_config_file_sets() {
+    let daemon = start_prepared(
+        "whirl_cache_dir_beats_a_cache_root_the_config_file_sets",
+        |dir| {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(
+                    "{{\n  \"cache\": {{ \"root\": \"{}\" }},\n  \"sources\": []\n}}\n",
+                    dir.join("from_the_file").display()
+                ),
+            )
+            .expect("a config that sets cache.root");
+        },
+    );
+
+    let lines = daemon.ask("status");
+    let environment = daemon.dir.join("cache");
+    assert_eq!(
+        value(&lines, "cache_dir"),
+        environment.display().to_string(),
+        "4.3: the environment beats the config file"
+    );
+    assert!(environment.join("tmp").is_dir());
+    assert!(
+        !daemon.dir.join("from_the_file").exists(),
+        "the file's root is not the one the daemon opened"
+    );
+}
+
+/// 4.3's whole environment layer, one daemon, all five names of the list. The
+/// config file is written to disagree with every one of them, so a name the
+/// daemon ignored would show up as the file's value in the answer: this is the
+/// class of defect the cache root was one instance of.
+///
+/// What each name is checked against, and why that is the check: `WHIRL_CONFIG`
+/// against the file the daemon says it read (`config path`), which is what makes
+/// every decoy below reachable at all; `WHIRL_SOCKET` against the socket this
+/// test is talking to, with the file's socket asserted unbound, because a daemon
+/// that preferred the file would be listening where this test cannot see it;
+/// `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` against `status`'s two directories,
+/// with the file's cache root asserted uncreated; `WHIRL_BACKEND` against the
+/// plan `config check` prints, where the file says `native` and the environment
+/// says `noop`.
+#[test]
+fn every_environment_name_in_4_3_beats_the_config_file() {
+    let daemon = start_prepared(
+        "every_environment_name_in_4_3_beats_the_config_file",
+        |dir| {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(
+                    "{{\n  \"socket\": \"{}\",\n  \"cache\": {{ \"root\": \"{}\" }},\n  \
+                 \"backend\": \"native\",\n  \"sources\": []\n}}\n",
+                    dir.join("decoy.sock").display(),
+                    dir.join("decoy-cache").display()
+                ),
+            )
+            .expect("a config that disagrees with the environment");
+        },
+    );
+
+    let config = daemon.ask("config path");
+    assert_eq!(
+        value(&config, "config"),
+        config_path(&daemon).display().to_string(),
+        "WHIRL_CONFIG: the daemon read the file the environment named"
+    );
+
+    let lines = daemon.ask("status");
+    assert!(
+        !daemon.dir.join("decoy.sock").exists(),
+        "WHIRL_SOCKET wins over `socket`: this daemon bound the environment's path"
+    );
+    assert_eq!(
+        value(&lines, "state_dir"),
+        daemon.dir.join("state").display().to_string(),
+        "WHIRL_STATE_DIR wins over the platform default"
+    );
+    assert_eq!(
+        value(&lines, "cache_dir"),
+        daemon.dir.join("cache").display().to_string(),
+        "WHIRL_CACHE_DIR wins over `cache.root`"
+    );
+    assert!(
+        !daemon.dir.join("decoy-cache").exists(),
+        "the file's cache root is not the one the daemon opened"
+    );
+
+    let check = daemon.ask("config check");
+    assert!(
+        check
+            .iter()
+            .any(|line| line.starts_with("plan: ") && line.contains("backend=noop")),
+        "WHIRL_BACKEND=noop wins over `backend: native`: {check:?}"
+    );
+}
+
 #[test]
 fn pause_and_resume_flip_the_flag_and_move_the_sequence() {
     let daemon = start("pause_and_resume_flip_the_flag_and_move_the_sequence");
@@ -1024,8 +1166,9 @@ fn status_has_exactly_the_documented_keys_in_the_documented_order() {
     assert!(value(&lines, "pid").parse::<u32>().is_ok());
     assert_eq!(
         value(&lines, "seq"),
-        "0",
-        "a fresh daemon has seen no event"
+        "1",
+        "a fresh daemon has seen exactly one event: 5.5's first trigger, the \
+         startup sweep's `cache_swept` (2.9)"
     );
     assert_eq!(value(&lines, "interval_s"), "1800");
     assert_eq!(value(&lines, "history_entries"), "50");
@@ -1141,9 +1284,15 @@ fn subscribe_streams_one_event_per_state_change() {
     writer.flush().expect("a flush");
     assert_eq!(
         read_line(&mut reader),
-        "subscribed: 0",
-        "`subscribed:` carries the daemon's current seq (2.9), and nothing has \
-         happened yet"
+        "subscribed: 1",
+        "`subscribed:` carries the daemon's current seq (2.9); the one event so \
+         far is the startup sweep's `cache_swept`, which no client was connected \
+         for"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        "gap: 1",
+        "the client asked from 0 and the daemon is at 1 (2.9)"
     );
 
     // A rotation announces exactly two events: the start, whose field is the
@@ -1172,13 +1321,19 @@ fn subscribe_streams_one_event_per_state_change() {
     let path = fields.next().expect("a path");
     assert_eq!(
         read_line(&mut reader),
-        "event: 1 rotate_start 1",
+        "event: 2 rotate_start 1",
         "the start is announced first, with the slot the worker was given (2.9)"
     );
     assert_eq!(
         read_line(&mut reader),
-        format!("event: 2 rotate_ok {digest} {origin_key} {via} {path}"),
+        format!("event: 3 rotate_ok {digest} {origin_key} {via} {path}"),
         "then the outcome: 2.6's `set:` record, field for field, after `rotate_ok`"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        "event: 4 cache_swept 0 0 0",
+        "and 5.5's second trigger, the sweep at the end of the rotation, is the \
+         next event and the last one it produces (2.9)"
     );
 
     // Any other request inside the stream is refused there, and the stream
@@ -1193,9 +1348,9 @@ fn subscribe_streams_one_event_per_state_change() {
     // `pause` and `resume` are one event each, and 2.9 gives both an empty field
     // list: a trailing space or a field here fails on the string.
     assert_eq!(daemon.ask("pause").last().map(String::as_str), Some("OK"));
-    assert_eq!(read_line(&mut reader), "event: 3 paused");
+    assert_eq!(read_line(&mut reader), "event: 5 paused");
     assert_eq!(daemon.ask("resume").last().map(String::as_str), Some("OK"));
-    assert_eq!(read_line(&mut reader), "event: 4 resumed");
+    assert_eq!(read_line(&mut reader), "event: 6 resumed");
 
     writeln!(writer, "close").expect("the request");
     writer.flush().expect("a flush");
@@ -1249,7 +1404,16 @@ fn a_failed_rotation_is_visible_on_both_planes() {
     assert!(read_line(&mut reader).starts_with("OK whirl "));
     writeln!(writer, "subscribe 0").expect("the request");
     writer.flush().expect("a flush");
-    assert_eq!(read_line(&mut reader), "subscribed: 0");
+    assert_eq!(
+        read_line(&mut reader),
+        "subscribed: 1",
+        "the startup sweep's `cache_swept` is the event a client can no longer see (2.9)"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        "gap: 1",
+        "asked from 0, and the daemon is at 1 (2.9)"
+    );
 
     let failure = daemon.ask("next");
     assert_eq!(failure[1], "queued", "the worker was started (2.6)");
@@ -1269,13 +1433,19 @@ fn a_failed_rotation_is_visible_on_both_planes() {
 
     assert_eq!(
         read_line(&mut reader),
-        "event: 1 rotate_start 1",
+        "event: 2 rotate_start 1",
         "the start is announced even though the rotation then fails (2.9)"
     );
     assert_eq!(
         read_line(&mut reader),
-        format!("event: 2 rotate_failed {code} {message}"),
+        format!("event: 3 rotate_failed {code} {message}"),
         "and the outcome carries the same code and the same message the client got"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        "event: 4 cache_swept 0 0 0",
+        "5.5's second trigger runs after a failed rotation too, and it is the last \
+         event the attempt produces (2.9)"
     );
 
     let status = daemon.ask("status");
@@ -1321,11 +1491,12 @@ fn subscribe_reports_the_gap_for_a_resume_point() {
     assert!(read_line(&mut reader).starts_with("OK whirl "));
     writeln!(writer, "subscribe 1").expect("the request");
     writer.flush().expect("a flush");
-    assert_eq!(read_line(&mut reader), "subscribed: 2");
+    assert_eq!(read_line(&mut reader), "subscribed: 3");
     assert_eq!(
         read_line(&mut reader),
-        "gap: 1",
-        "two events have happened and the client asked from 1 (2.9)"
+        "gap: 2",
+        "the startup sweep, the pause and the resume have happened, and the client \
+         asked from 1 (2.9)"
     );
     writeln!(writer, "close").expect("the request");
     writer.flush().expect("a flush");
@@ -1409,7 +1580,12 @@ fn the_state_files_are_written_and_read_back_across_a_restart() {
     assert_eq!(value(&after, "history_lost"), "0");
     assert_eq!(value(&after, "favorites_degraded"), "0");
     assert_eq!(value(&after, "state_corrupt"), "-");
-    assert_eq!(value(&after, "seq"), "0", "seq is per daemon run (2.9)");
+    assert_eq!(
+        value(&after, "seq"),
+        "1",
+        "seq is per daemon run (2.9), and this run's one event is its own startup \
+         sweep"
+    );
 }
 
 /// 6.4 step 3: a corrupt `favorites.json` degrades pin state, keeps the bytes in
@@ -1630,9 +1806,10 @@ fn the_framing_rules_and_the_surviving_connection_hold() {
     );
 
     // And every one of those refusals was a request, not a state change: the
-    // daemon still answers, and its sequence is still zero.
+    // daemon still answers, and the only event on its sequence is the startup
+    // sweep's.
     let lines = daemon.ask("status");
-    assert_eq!(value(&lines, "seq"), "0");
+    assert_eq!(value(&lines, "seq"), "1");
     assert_eq!(value(&lines, "rotating"), "0");
     assert_eq!(value(&lines, "state_corrupt"), "-");
 }
