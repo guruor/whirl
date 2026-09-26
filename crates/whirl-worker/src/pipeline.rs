@@ -1381,9 +1381,12 @@ impl Run<'_> {
             home: paths::home(),
             recent: self.window.keys(),
         };
-        Ok(entry
+        let enumerated = entry
             .source
             .enumerate(&ctx)
+            .map_err(|error| error.to_string())?;
+        Ok(enumerated
+            .candidates
             .into_iter()
             .map(|candidate| Seeking {
                 source: entry.config.id.clone(),
@@ -1589,29 +1592,31 @@ pub fn check(
                 // 4.3: "The worker runs the semantic check ... and prints
                 // `enabled=0 reason=<...>`", naming the offending key.
                 Err(error) => println!("{}", disabled_record(source, error.to_string())),
-                Ok(()) => {
-                    let candidates = entry
-                        .source
-                        .enumerate(&EnumContext {
-                            run: 0,
-                            home: paths::home(),
-                            recent: window.keys(),
-                        })
-                        .into_iter()
-                        .map(|candidate| Seeking {
-                            source: entry.config.id.clone(),
-                            candidate,
-                        })
-                        .collect();
-                    let filtered = filter_pipeline(config, platform, window, candidates);
-                    println!(
-                        "{}",
-                        filtered
-                            .counters
-                            .record(source, source.weight > 0, None)
-                            .line()
-                    );
-                }
+                Ok(()) => match entry.source.enumerate(&EnumContext {
+                    run: 0,
+                    home: paths::home(),
+                    recent: window.keys(),
+                }) {
+                    Err(error) => println!("{}", disabled_record(source, error.to_string())),
+                    Ok(enumerated) => {
+                        let candidates = enumerated
+                            .candidates
+                            .into_iter()
+                            .map(|candidate| Seeking {
+                                source: entry.config.id.clone(),
+                                candidate,
+                            })
+                            .collect();
+                        let filtered = filter_pipeline(config, platform, window, candidates);
+                        println!(
+                            "{}",
+                            filtered
+                                .counters
+                                .record(source, source.weight > 0, None)
+                                .line()
+                        );
+                    }
+                },
             },
         }
     }
@@ -1642,7 +1647,7 @@ mod tests {
     use std::io::Cursor;
     use std::rc::Rc;
     use whirl_core::config::{Config, ConfigError};
-    use whirl_core::source::{Capability, FilterSet, Source};
+    use whirl_core::source::{Capability, Enumerated, FilterSet, Source, SourceError};
 
     // -- the two things a test owns: a source and a byte source -------------
 
@@ -1683,9 +1688,9 @@ mod tests {
             }
         }
 
-        fn enumerate(&self, ctx: &EnumContext) -> Vec<Candidate> {
+        fn enumerate(&self, ctx: &EnumContext) -> Result<Enumerated, SourceError> {
             *self.seen_recent.borrow_mut() = ctx.recent.clone();
-            self.candidates.clone()
+            Ok(Enumerated::of(self.candidates.clone()))
         }
 
         fn capabilities(&self) -> FilterSet {

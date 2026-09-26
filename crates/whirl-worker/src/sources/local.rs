@@ -72,7 +72,9 @@ use std::path::{Component, Path, PathBuf};
 
 use whirl_core::config::{ConfigError, SourceConfig, paths};
 use whirl_core::protocol::Sha256;
-use whirl_core::source::{Candidate, Capability, EnumContext, FilterSet, Source};
+use whirl_core::source::{
+    Candidate, Capability, EnumContext, Enumerated, FilterSet, Source, SourceError,
+};
 
 use crate::pipeline::sniff;
 
@@ -162,10 +164,12 @@ impl Local {
     /// worker's, appearing as `source: <id> ... enabled=0 reason=<...>` in
     /// `status`, `sources` and `config check`.
     ///
-    /// This method is the only place a source has to say "I cannot be asked at
-    /// all": the trait's `enumerate` returns candidates and not a result, so a
-    /// source that cannot work has to be refused here or it is indistinguishable
-    /// from a source that honestly found nothing. The cost is one `stat` per
+    /// This method is where a fact about the config or the environment is a
+    /// refusal: the trait's `enumerate` carries a named [`SourceError`] of its
+    /// own for a listing that could not be made, so the two answer different
+    /// questions and neither can stand in for the other. *This* one says the
+    /// source cannot be asked at all; `enumerate`'s error says the asking was
+    /// tried and failed. The cost is one `stat` per
     /// configured path per rotation, which is the cost 2.2's own table charges
     /// the source, and the rule that `validate` does no I/O is read as a rule
     /// about writes and about the config's own syntax: the fact that a folder is
@@ -345,7 +349,7 @@ impl Source for Local {
     /// fixed order. 2.2's `paths` is "one or more directories", so this is the
     /// union of every path that can be walked; a path that cannot is a warning
     /// (see [`Local::refuse`]) and the rest is enumerated regardless.
-    fn enumerate(&self, ctx: &EnumContext) -> Vec<Candidate> {
+    fn enumerate(&self, ctx: &EnumContext) -> Result<Enumerated, SourceError> {
         let mut out: Vec<Candidate> = Vec::new();
         let mut skipped = Skipped::default();
         for (index, configured) in self.paths.iter().enumerate() {
@@ -365,7 +369,7 @@ impl Source for Local {
         }
         skipped.report(&self.id);
         out.sort_by(|left, right| left.origin.cmp(&right.origin));
-        out
+        Ok(Enumerated::of(out))
     }
 
     /// The two capabilities 2.5 gives `local`, and the same list
@@ -611,11 +615,15 @@ mod tests {
 
     /// One enumeration of the table's first source.
     fn enumerate(sources: &Sources, recent: &[&str]) -> Vec<Candidate> {
-        sources.entries()[0].source.enumerate(&EnumContext {
-            run: 1,
-            home: Some(std::env::temp_dir()),
-            recent: recent.iter().map(|key| key.to_string()).collect(),
-        })
+        sources.entries()[0]
+            .source
+            .enumerate(&EnumContext {
+                run: 1,
+                home: Some(std::env::temp_dir()),
+                recent: recent.iter().map(|key| key.to_string()).collect(),
+            })
+            .expect("the local source lists a filesystem and always answers")
+            .candidates
     }
 
     fn origins(candidates: &[Candidate]) -> Vec<String> {
@@ -853,11 +861,15 @@ mod tests {
             ids(&second),
             "a restart is a second enumeration of the same tree"
         );
-        let later_run = sources.entries()[0].source.enumerate(&EnumContext {
-            run: 4096,
-            home: Some(std::env::temp_dir()),
-            recent: Vec::new(),
-        });
+        let later_run = sources.entries()[0]
+            .source
+            .enumerate(&EnumContext {
+                run: 4096,
+                home: Some(std::env::temp_dir()),
+                recent: Vec::new(),
+            })
+            .expect("the local source always answers")
+            .candidates;
         assert_eq!(
             ids(&first),
             ids(&later_run),
@@ -1071,11 +1083,15 @@ mod tests {
         plant(&file, 2560, 1440);
 
         let sources = sources_of(&[Path::new("~/walls")], "");
-        let candidates = sources.entries()[0].source.enumerate(&EnumContext {
-            run: 1,
-            home: Some(home.clone()),
-            recent: Vec::new(),
-        });
+        let candidates = sources.entries()[0]
+            .source
+            .enumerate(&EnumContext {
+                run: 1,
+                home: Some(home.clone()),
+                recent: Vec::new(),
+            })
+            .expect("the local source always answers")
+            .candidates;
         assert_eq!(
             origins(&candidates),
             vec![file.display().to_string()],
