@@ -871,6 +871,16 @@ favorites.
 `decision:` reset is a first-class pair of verbs rather than advice, because R1
 makes it trivial and a user should not have to remember a path.
 
+`decision:` **`whirl reset` is not in the v0.1 surface, and the table below is
+the design for a verb no v0.1 build has.** `docs/spec/features.md` 1.1 ships a
+closed verb set ("v0.1 ships this verb set and no more") and holds no `reset`;
+section 9 of this document adds no verb to it ("no new verb is needed and none is
+added"); and `docs/architecture.md` 2.5 and 2.5.1, the protocol grammar and the
+CLI verb mapping, close over the same set. The CLI answers `whirl reset` with its
+unknown-command error and the protocol has no request for it, so until the verb
+lands the raw form below is the whole of what a user can do, and the mentions of
+it in 1.4, 6.4 and 8.2 read as this design rather than as a command that exists.
+
 | Verb | Effect | Cache | History | Favorites |
 |---|---|---|---|---|
 | `whirl reset --state` | Quarantine-then-replace the three state files with fresh empty ones | untouched | cleared | cleared |
