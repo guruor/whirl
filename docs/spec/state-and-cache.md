@@ -905,6 +905,11 @@ and it only happens when a daemon dies.
 
 ### 7.2 Ownership table, and the locks
 
+`Readers` names the processes that open the file. A `whirl` verb that shows a
+file's contents is not one of them: it asks the daemon, which is already named on
+the row. `whirl status` reports `cache/index.json`'s `root_id` (2.1), and the
+process that opens the file for it is the daemon.
+
 | Path | Writer | Readers |
 |---|---|---|
 | `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path |
@@ -914,7 +919,7 @@ and it only happens when a daemon dies.
 | `log` | daemon | humans |
 | `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup |
 | `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both |
-| `cache/index.json` | daemon | daemon; the worker, for the recent window of 4.1; `whirl status` |
+| `cache/index.json` | daemon | daemon; the worker, for the recent window of 4.1 |
 | `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only |
 | `cache/tmp/**` | the worker run that created it | nobody |
 
