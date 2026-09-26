@@ -96,7 +96,7 @@ crates/
 docs/
   architecture.md           process model, protocol, platform verdict, resident rules
   development.md            this file
-  README.md                 index and status of every document
+  README.md                 index and status of the design documents
   spec/                     features, state and cache layout
   research/                 per-platform findings, with the real-hardware checklists
   decisions/                ADRs: NNNN-title.md, template in 0000-template.md
