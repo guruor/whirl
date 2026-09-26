@@ -47,9 +47,15 @@
 //! (docs/architecture.md 2.5). It is a pure function of the path string alone,
 //! so it cannot move under a restart, under a re-ordering of the enumeration, or
 //! under a change to the file's bytes, and it moves exactly when 2.5 says it
-//! must, which is when the path changes. `id = sha256(origin)` rather than two
-//! hashes of the same path, because a candidate whose id and origin disagreed
-//! would be a cache entry the dedupe window can no longer recognise.
+//! must, which is when the path changes. The inputs it does *not* have are worth
+//! naming, because each one is a way to get this wrong: not the run's slot
+//! counter (`EnumContext::run`), not the candidate's position in the walk, not
+//! the file's size, mtime or bytes, and not the source's `id`, which is already
+//! the prefix the pipeline gives the `origin_key` (`format!("{}:{}", source,
+//! candidate.id)`, crates/whirl-worker/src/pipeline.rs) and would otherwise
+//! appear twice in it. `id = sha256(origin)` rather than two hashes of the same
+//! path, because a candidate whose id and origin disagreed would be a cache
+//! entry the dedupe window can no longer recognise.
 //!
 //! Normalisation is lexical: `~` is expanded against `HOME` (2.2: "`~` is
 //! expanded"), `.` components and repeated separators are dropped, and `..` is
@@ -598,6 +604,27 @@ mod tests {
             .collect()
     }
 
+    fn ids(candidates: &[Candidate]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect()
+    }
+
+    /// The id of the candidate at one path, or a panic naming what the
+    /// enumeration returned: a rename changes which candidate is which, so a
+    /// test that looked a candidate up by position would pass for the wrong
+    /// reason.
+    fn id_of(candidates: &[Candidate], path: &Path) -> String {
+        let origin = path.display().to_string();
+        candidates
+            .iter()
+            .find(|candidate| candidate.origin == origin)
+            .unwrap_or_else(|| panic!("no candidate for {origin} in {:?}", ids(candidates)))
+            .id
+            .clone()
+    }
+
     #[test]
     fn the_local_kind_is_in_the_dispatch_table_and_wallhaven_is_not() {
         let dir = scratch("dispatch");
@@ -713,6 +740,161 @@ mod tests {
             candidate.id,
             digest_of(&candidate.origin),
             "the id and the origin cannot disagree"
+        );
+    }
+
+    /// The identity rule frozen against an external tool: these are the digests
+    /// `printf %s <path> | shasum -a 256` printed, so the rule under test is
+    /// "hex sha256 of the path string" and not "whatever this function computes".
+    /// If someone folds the source's `id` in, or hashes the bytes instead, or
+    /// switches to another encoding, this fails on a string and not on a machine.
+    #[test]
+    fn the_identity_rule_is_the_sha256_of_the_path() {
+        assert_eq!(
+            digest_of("/walls/one.png"),
+            "d4a5e565d5b01bad165d63acae1bf0516764ffcd73343f23640c4a923e901f93"
+        );
+        assert_eq!(
+            digest_of("/walls/nested/two.png"),
+            "65e718c5c979fc5110f85cb6b0d56fea90a563642c3e466da73639dbc3e88b55"
+        );
+        assert_eq!(
+            digest_of("/Users/a/Pictures/Wallpapers/aurora.jpg"),
+            "a078510443d68578500b264842feff18bb0bd73d4bfefb00902cd5d55b33f1a0"
+        );
+        assert_eq!(digest_of("").len(), 64, "it is always a full hex sha256");
+    }
+
+    /// An id is the hash of the path and of nothing else. `Sha256` hashes a
+    /// file's *bytes* for the cache and the dedupe, so the failure this guards
+    /// is an id that became content-addressed: the same picture renamed would
+    /// then be a dedupe miss (2.5's own reason for the rule), and a re-encoded
+    /// file would be a second candidate.
+    #[test]
+    fn the_id_is_not_the_digest_of_the_file() {
+        let dir = scratch("not-content");
+        let file = dir.join("walls").join("one.png");
+        plant(&file, 2560, 1440);
+        let mut hasher = Sha256::new();
+        hasher.update(&fs::read(&file).expect("the fixture's bytes"));
+        let bytes = hasher.hex();
+
+        let candidates = enumerate(&table(&dir, ""), &[]);
+        assert_eq!(candidates.len(), 1);
+        assert_ne!(
+            candidates[0].id, bytes,
+            "the content digest is the cache's identity (3.3), not the candidate's"
+        );
+        assert_eq!(candidates[0].id, digest_of(&candidates[0].origin));
+    }
+
+    /// Two enumerations of the same directory yield the same ids, and the run
+    /// number does not enter them: `EnumContext::run` is the daemon's own slot
+    /// counter (1.6), so a source that folded it in would re-identify every file
+    /// of every rotation, and the cache would fill with the same picture.
+    #[test]
+    fn two_enumerations_yield_the_same_ids_whatever_the_run_number() {
+        let dir = scratch("stability");
+        let one = dir.join("walls").join("one.png");
+        let two = dir.join("walls").join("nested").join("two.png");
+        plant(&one, 2560, 1440);
+        plant(&two, 2000, 1200);
+        let sources = table(&dir, "");
+
+        let first = enumerate(&sources, &[]);
+        let second = enumerate(&sources, &[]);
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            ids(&first),
+            ids(&second),
+            "a restart is a second enumeration of the same tree"
+        );
+        let later_run = sources.entries()[0].source.enumerate(&EnumContext {
+            run: 4096,
+            home: Some(std::env::temp_dir()),
+            recent: Vec::new(),
+        });
+        assert_eq!(
+            ids(&first),
+            ids(&later_run),
+            "the run counter is not identity"
+        );
+        assert_eq!(id_of(&first, &one), digest_of(&one.display().to_string()));
+    }
+
+    /// The enumeration's order is not identity. A file appearing before the
+    /// others in the sorted walk moves every position and no id, which is what
+    /// makes the cache survive a file being added.
+    #[test]
+    fn the_id_does_not_depend_on_the_enumeration_order() {
+        let dir = scratch("order");
+        let walls = dir.join("walls");
+        let late = walls.join("zulu.png");
+        plant(&late, 2560, 1440);
+        plant(&walls.join("mike.png"), 2000, 1200);
+        let sources = table(&dir, "");
+
+        let before = enumerate(&sources, &[]);
+        assert_eq!(origins(&before), {
+            let mut expected = vec![
+                walls.join("mike.png").display().to_string(),
+                walls.join("zulu.png").display().to_string(),
+            ];
+            expected.sort();
+            expected
+        });
+
+        // A file that sorts first, so every position moves by one.
+        let early = walls.join("alpha.png");
+        plant(&early, 3000, 2000);
+        let after = enumerate(&sources, &[]);
+        assert_eq!(after.len(), 3);
+        assert_eq!(id_of(&after, &late), id_of(&before, &late));
+        assert_eq!(
+            id_of(&after, &walls.join("mike.png")),
+            digest_of(&walls.join("mike.png").display().to_string())
+        );
+    }
+
+    /// The id changes when the path changes and only then: a rewrite of the
+    /// same path is the same candidate (its bytes are the cache's business), and
+    /// a rename is a new one, which is 2.5's stated purpose for the rule.
+    #[test]
+    fn the_id_follows_the_path_and_not_the_bytes() {
+        let dir = scratch("path-not-bytes");
+        let walls = dir.join("walls");
+        let first = walls.join("one.png");
+        plant(&first, 2560, 1440);
+        let before = enumerate(&table(&dir, ""), &[]);
+
+        // Same path, different bytes and different dimensions.
+        plant(&first, 1920, 1080);
+        let rewritten = enumerate(&table(&dir, ""), &[]);
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(
+            id_of(&rewritten, &first),
+            id_of(&before, &first),
+            "unread or changed content is not a new candidate"
+        );
+        assert_eq!(
+            rewritten[0].width,
+            Some(1920),
+            "and the candidate carries the new metadata"
+        );
+
+        // The same bytes at a new path.
+        let renamed = walls.join("two.png");
+        fs::rename(&first, &renamed).expect("the rename");
+        let after = enumerate(&table(&dir, ""), &[]);
+        assert_eq!(after.len(), 1);
+        assert_ne!(
+            id_of(&after, &renamed),
+            id_of(&before, &first),
+            "2.5: a renamed file is a new candidate rather than a silent dedupe miss"
+        );
+        assert_eq!(
+            id_of(&after, &renamed),
+            digest_of(&renamed.display().to_string())
         );
     }
 }
