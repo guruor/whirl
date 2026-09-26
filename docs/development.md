@@ -730,10 +730,15 @@ a platform backend. If `whirld` approaches a megabyte, someone linked one.
   membership: **99 USD per membership year** (Apple, "Membership Details",
   retrieved 2026-09-25). Sandboxing is the one thing not to do: adding
   `com.apple.security.app-sandbox` broke the wallpaper setter in the research
-  probe with `Trace/BPT trap: 5` (`docs/research/macos.md` 8). Decision: **v0.1
-  ships signed and notarized for the tarball and `.pkg`**, because the whole point
-  of a wallpaper rotator is that it runs at login without a dialog; ad-hoc signing
-  is enough for contributors building locally.
+  probe with `Trace/BPT trap: 5` (`docs/research/macos.md` 8). Decision:
+  **v0.1.0 ships unsigned, on all three platforms**, so the release notes must
+  carry the macOS first-run step: the download is unsigned, and the notes say what
+  the user does about the Gatekeeper prompt. Developer ID signing plus
+  notarization is the route when the artifact is handed to people who did not
+  build it, it needs the 99 USD/year membership above, and it is its own card
+  when that happens
+  (`docs/decisions/0001-macos-artifacts-ship-unsigned-in-v0.1.0.md`). Ad-hoc
+  signing is enough for contributors building locally.
 - **Windows: the research documents no signing requirement and no cost.** The
   verification levels in `docs/research/windows.md` cover the COM interface, the
   monitor model and the hosting model, and never reach distribution. So the honest

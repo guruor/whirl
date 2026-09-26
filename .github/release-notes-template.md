@@ -48,7 +48,8 @@ them. A release waits for the rows, not for a green pipeline.
 ### macOS
 
 - checklist: `docs/research/macos.md`, including the unverified list
-- signed and notarized: <yes | no, and for a tarball that is not, what the user has to do>
+- signed and notarized: <yes | no>. For an unsigned tarball, the first-run
+  Gatekeeper step the user has to take: <what the user has to do>
 - run by <name> on <machine, macOS version> on <YYYY-MM-DD>: <result, and every
   item that failed or was not run>
 
