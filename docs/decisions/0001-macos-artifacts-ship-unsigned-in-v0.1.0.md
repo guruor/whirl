@@ -22,19 +22,19 @@ artifacts, and one of them contradicted itself:
   what ships: "What ships today is what `.github/workflows/release.yml` builds:
   three unsigned archives from `cargo build --workspace --release`."
 - `.github/workflows/release.yml` has no signing and no notarization step, and the
-  notes it assembles require none.
+  notes it assembles asked for no signing either: the `### macOS` row wanted "what
+  the user has to do" for an unsigned tarball, without naming the step.
 
 The facts the decision rests on are in `docs/research/macos.md` 8:
 
 - **Signing is not what makes it run; notarization is what distribution needs.**
   A binary you built yourself, or one installed by a package manager, runs without
-  a Gatekeeper prompt, and that is what `docs/development.md` section 5 already
-  said before its contradictory decision sentence. What a Developer ID artifact
-  distributed over the internet needs is notarization: "Beginning in macOS 10.15,
-  all software built after June 1, 2019, and distributed with Developer ID must be
-  notarized" [4]. Skipping notarization costs exactly one thing: "A Gatekeeper
-  prompt on first run is the cost of skipping this, and there is no entitlement
-  that avoids it."
+  a Gatekeeper prompt (`docs/development.md` section 5, three bullets above the
+  sentence this ADR replaces). What a Developer ID artifact distributed over the
+  internet needs is notarization: "Beginning in macOS 10.15, all software built
+  after June 1, 2019, and distributed with Developer ID must be notarized" [4].
+  Skipping notarization costs exactly one thing: "A Gatekeeper prompt on first run
+  is the cost of skipping this, and there is no entitlement that avoids it."
 - **The sandbox is not a way out of that prompt.** Building the write probe with
   `com.apple.security.app-sandbox` and signing it ad-hoc "kills it at launch,
   before a line of my code runs": `Trace/BPT trap: 5` (exit 133), with AMFI
