@@ -250,3 +250,24 @@ After the fix, in the same emulated container, `cargo test --workspace`:
     test a_failed_rotation_is_visible_on_both_planes ... ok
     test subscribe_streams_one_event_per_state_change ... ok
     cargo test exit=0
+
+## 5. What the gate should say now
+
+`scripts/ci.sh` had not landed in the repository when this was written, so this
+card has no gate file to change and, with the cause fixed, no exclusion to add:
+the mode runs the two tests and passes. Two things the gate's text must not
+inherit from the design it comes from:
+
+1. `design.md` and the proposed `ci.sh` record "under emulation `cargo test
+   --workspace` is red on two tests ... That is why the pin is not the
+   default". The measurement was right; the cause is now fixed, so the amd64
+   mode must not carry an exclusion, a skip or a known-red label for these two
+   tests. It is green, and a red there is a real finding again.
+2. Pin **one platform manifest digest per mode**, not the index digest together
+   with `--platform`. Measured on this machine: once the store holds the arm64
+   image for the index, `docker run --platform linux/amd64
+   rust:1.94.0-bookworm@sha256:<index>` is refused with `docker: cannot
+   overwrite digest sha256:<index>`, so the gate's second mode cannot start
+   after its first one has run. The three digests are in section 1: index
+   `sha256:36546847...`, `linux/amd64` `sha256:4673f78d...`, `linux/arm64`
+   `sha256:94aaa0b4...`.
