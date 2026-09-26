@@ -85,6 +85,15 @@ impl Daemon {
         }
         panic!("the daemon closed the connection without a terminator: {lines:?}");
     }
+
+    /// The daemon's log, which `spawn_daemon_at` sends to `<dir>/daemon.log`.
+    /// This build logs to stderr, as its own `main.rs` says ("the log file of
+    /// `[D 6 §7.2]` arrives with the daemon that has somewhere to put it"), and
+    /// the worker's diagnostics are the other half of that surface: this is
+    /// where a test reads anything the response body does not carry.
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("daemon.log")).expect("the daemon's log")
+    }
 }
 
 /// A short, stable digest of a test's name. `sun_path` is 104 bytes on macOS
@@ -664,6 +673,145 @@ fn config_check_reports_the_sources_and_the_plan() {
         config_check_lines().as_slice(),
         "2.5's `config check` row, 2.6's `source:` and `plan:` records, in order"
     );
+}
+
+/// A file a source dropped before candidacy reaches the operator, on the one
+/// surface that exists for it.
+///
+/// Neither doc puts this count in the `config check` record. features.md 2.2's
+/// `min_width` row decides the case ("a file whose header cannot be read is
+/// excluded and **logged** at debug, because a file we cannot measure is a file
+/// we cannot promise will display"), and features.md 2.5's filter reporting,
+/// which is what `config check` exists for, is "the candidates found and the
+/// candidates removed per stage". 2.6 fixes the `source:` record's fields, and
+/// `config_check_reports_the_sources_and_the_plan` asserts that body byte for
+/// byte, so this count has no column in the record to go in. What the daemon
+/// has to do is forward the worker's stderr, and it did not: it read that pipe
+/// into a `String` and consulted it only when the worker had exited non-zero,
+/// so a file dropped for a reason was reported nowhere at all, and a user's own
+/// collection looked smaller than it is.
+///
+/// The fixture is dropped with no permission involved, and it is the case
+/// `crates/whirl-worker/src/pipeline.rs`'s `HEIC_WINDOW` is about: an
+/// `ftyp(heic)` whose `meta` box declares 200000 bytes, in a file whose length
+/// makes that declaration true. `sniff_heic` can only walk inside a `meta` box
+/// the box walk pushed, and that walk stops at the first box whose declared
+/// size runs past the read, so this file is not measured although its `ispe`
+/// box starts at 58.
+///
+/// The response body is asserted against `config_check_lines()` beside the log
+/// line, so this test also fails if the fix admits the file or counts it
+/// anywhere in the record: the only thing that moves is where the worker's own
+/// line ends up.
+#[test]
+fn a_file_dropped_before_candidacy_reaches_the_daemons_log() {
+    let daemon = start_prepared(
+        "a_file_dropped_before_candidacy_reaches_the_daemons_log",
+        |dir| {
+            write_local_config(dir);
+            std::fs::write(
+                dir.join("walls").join("bigmeta.heic"),
+                overrunning_meta_heic(),
+            )
+            .expect("the fixture the box walk cannot measure");
+        },
+    );
+
+    let lines = daemon.ask("config check");
+    assert_eq!(
+        body(&lines),
+        config_check_lines().as_slice(),
+        "the dropped file is no candidate, is counted at no stage and is not a \
+         reason (2.5, 2.6): the fix adds a log line and nothing to the record"
+    );
+
+    let log = daemon.log();
+    let line = log
+        .lines()
+        .find(|line| line.contains("warning: source pictures:"))
+        .unwrap_or_else(|| panic!("no skip line in the daemon's log: {log}"));
+    assert!(
+        line.ends_with(
+            "warning: source pictures: entries skipped: 1 unreadable, 0 symlink, 0 revisited"
+        ),
+        "the worker's own line, unaltered: {line}"
+    );
+    assert!(
+        line.starts_with("whirld: worker check run "),
+        "prefixed with this daemon's own name, so a reader cannot take it for \
+         another program's line (the number is the slot this check took, which \
+         2.5 makes a counter rather than a constant): {line}"
+    );
+    assert!(
+        !log.contains("source archive"),
+        "the source that skipped nothing is not mentioned: {log}"
+    );
+}
+
+/// One ISO box: the 32-bit size, the type, then the payload.
+fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+    bytes.extend_from_slice(kind);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// The same box with a size field the caller chooses, because the size is a
+/// field of the file and not a fact about the payload
+/// (`crates/whirl-worker/src/pipeline.rs::boxes`).
+fn boxed_declaring(kind: &[u8; 4], declared: u32, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = declared.to_be_bytes().to_vec();
+    bytes.extend_from_slice(kind);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// A HEIC whose dimensions the box walk cannot reach: `ftyp` says `heic`, and
+/// the `meta` box that carries the tables declares 200000 bytes, so the walk
+/// stops at it and `sniff_heic` never enters it.
+///
+/// The offsets are load-bearing and are asserted by
+/// `a_file_dropped_before_candidacy_reaches_the_daemons_log`'s own log line: the
+/// `ispe` box starts at 58 and its two 32-bit dimensions at 70, both inside the
+/// 1024-byte window `pipeline::head_window` reads first, so the file is dropped
+/// for the `meta` box's declared size alone and not for depth. It is built here
+/// rather than read off a machine, so the case does not depend on what is
+/// installed.
+fn overrunning_meta_heic() -> Vec<u8> {
+    const DECLARED: u32 = 200_000;
+
+    let ispe = {
+        let mut payload = vec![0u8; 4]; // the FullBox version and flags
+        payload.extend_from_slice(&6016u32.to_be_bytes());
+        payload.extend_from_slice(&6016u32.to_be_bytes());
+        boxed(b"ispe", &payload)
+    };
+    let ipco = boxed(b"ipco", &ispe);
+    let iprp = boxed(b"iprp", &ipco);
+    let pitm = boxed(b"pitm", &[0, 0, 0, 0, 0, 2]);
+    let mut meta = vec![0u8; 4]; // `meta` is a FullBox too
+    meta.extend_from_slice(&pitm);
+    meta.extend_from_slice(&iprp);
+
+    let mut file = boxed(b"ftyp", b"heic\x00\x00\x00\x00");
+    file.extend_from_slice(&boxed_declaring(b"meta", DECLARED, &meta));
+    // Everything up to the end of the `ispe` box: ftyp, meta's own header and
+    // FullBox word, pitm, iprp, ipco, ispe.
+    assert_eq!(file.len(), 16 + 8 + 4 + 14 + 8 + 8 + 20);
+    // The declaration is true: `meta` starts at 16 and the file ends where the
+    // declared size says it does, so a reader holding the whole file parses the
+    // `ispe` at 58. Only the read window is too small for it.
+    file.resize(16 + DECLARED as usize, 0);
+    assert_eq!(be32(&file[16..20]), DECLARED, "meta's own size field");
+    assert_eq!(&file[58..62], 20u32.to_be_bytes(), "ispe's own size field");
+    assert_eq!(&file[62..66], b"ispe", "the box the walk never reaches");
+    assert_eq!(be32(&file[70..74]), 6016, "the width inside it");
+    file
+}
+
+/// The 32-bit big-endian reading `pipeline`'s box walk uses.
+fn be32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 /// `config path` with `WHIRL_CONFIG` unset: the documented platform default
