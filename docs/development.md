@@ -308,7 +308,7 @@ proves:
 | `guards` | zero third-party dependencies, and the release binaries fit the caps in `docs/architecture.md` R2 |
 | `artifacts` | the release build produces the three binaries |
 | `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
-| `linux` | the ubuntu jobs again, in the gate's container, so a Linux-only failure surfaces here rather than in CI |
+| `linux` | CI's `clippy`, `test` and `artifacts` jobs as they run on `ubuntu-latest`, plus `guards`, again in the gate's container, so a Linux-only failure surfaces here rather than in CI. `fmt` is not repeated there: rustfmt's output does not depend on the operating system, and `local` has already run it |
 | `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails three tests that pass on real x86_64 (card t_62920980). Opt-in: it is not in `local` or `all` |
 
 **What `all` leaves unproven**, so that the answer is here rather than inferred:

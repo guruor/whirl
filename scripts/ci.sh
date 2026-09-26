@@ -25,7 +25,7 @@
 #   ./scripts/ci.sh artifacts    cargo build --workspace --release
 #   ./scripts/ci.sh windows      cross-check the #[cfg(windows)] code (compile only)
 #   ./scripts/ci.sh local        fmt clippy test artifacts, on this machine
-#   ./scripts/ci.sh linux        the ubuntu jobs in the gate's container, this machine's arch
+#   ./scripts/ci.sh linux        clippy, test, artifacts and guards again, in the gate's container (this machine's arch)
 #   ./scripts/ci.sh linux-amd64  the same, pinned to the runners' x86_64, emulated on Apple silicon
 #   ./scripts/ci.sh all          local, windows, msrv, then linux
 #
