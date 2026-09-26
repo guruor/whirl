@@ -256,10 +256,11 @@ After the fix, in the same emulated container, `cargo test --workspace`:
 `scripts/ci.sh` had not landed in the repository when this was written, so this
 card has no gate file to change. With the cause fixed there is no exclusion to
 add for the two tests this card rules on: the mode runs them and they pass
-(section 6). The mode as a whole is not green, because a third emulation red
-arrived with `development` after this card's base, so the gate has to carry that
-one instead. Two things the gate's text must not inherit from the design it
-comes from:
+(section 6). The mode was not green as a whole when this was written, because a
+third emulation red arrived with `development` after this card's base; that red
+is closed too (section 6), so the amd64 mode carries no exclusion, skip or
+known-red label for any test. Two things the gate's text must not inherit from
+the design it comes from:
 
 1. `design.md` and the proposed `ci.sh` record "under emulation `cargo test
    --workspace` is red on two tests ... That is why the pin is not the
@@ -276,14 +277,19 @@ comes from:
    `sha256:36546847...`, `linux/amd64` `sha256:4673f78d...`, `linux/arm64`
    `sha256:94aaa0b4...`.
 
-## 6. Re-verification on the merged tree, and the third red it turned up
+## 6. Re-verification on the merged tree, the third red it turned up, and its resolution
 
 `development` moved 37 commits while this was being written, so the branch
 merges it (`git merge origin/development`, no conflicts) and every measurement
-above is repeated on the merged tree.
+above is repeated on the merged tree, `da555be`. The runs quoted below are from
+that tree unless they say otherwise. The claims about the present state were
+re-taken at this head, `0cd385c` (this branch with `development` at `399da9c`
+merged in, and the doc-only commit this section's correction arrives in changes
+nothing but this file); the third-red bullet also records what closed that red.
 
-* The two tests this document rules on are green under emulation. In the
-  emulated container, `cargo test --workspace --no-fail-fast`:
+* The two tests this document rules on are green under emulation, then and now.
+  In the emulated container, `cargo test --workspace --no-fail-fast` at
+  `da555be`:
 
       test result: ok. 0 passed ... test result: ok. 4 passed ... test result: ok. 47 passed
       test result: ok. 21 passed ... test result: ok. 7 passed
@@ -293,23 +299,42 @@ above is repeated on the merged tree.
       test a_failed_rotation_is_visible_on_both_planes ... ok
       test subscribe_streams_one_event_per_state_change ... ok
 
-* Natively the same merged tree is green: `cargo test --workspace` exit 0 on
-  macOS, `cargo fmt --all -- --check` clean, `cargo clippy --workspace
-  --all-targets -- -D warnings` clean.
-* Line numbers moved with the merge: the `read_line` helper whose empty read
-  panics is at `control_socket.rs:1081` now (911 in section 1's run), and the two
-  tests are at 1230 and 1349 (1059 and 1160 then).
-* The emulated mode is **not** green as a whole.
+  The one red there is the third red below, in `whirld`'s own unit binary. The
+  same command at this head, `0cd385c`:
+
+      test result: ok. 0 passed ... test result: ok. 4 passed ... test result: ok. 47 passed
+      test result: ok. 21 passed ... test result: ok. 7 passed
+      test result: ok. 54 passed; 0 failed   <- the binary the third red was in
+      test result: ok. 22 passed; 0 failed   <- control_socket
+      test result: ok. 3 passed ... test result: ok. 0 passed
+      test a_failed_rotation_is_visible_on_both_planes ... ok
+      test subscribe_streams_one_event_per_state_change ... ok
+      cargo test exit=0
+
+  That binary holds 53 tests at `da555be` and 54 at this head; the one added test
+  is the kernel-free half of the third red's fix below.
+
+* Natively the same merged tree is green, and re-checked at this head: `cargo
+  test --workspace` exit 0 on macOS arm64 (0, 4, 47, 21, 7, 54, 22, 3 and 0
+  passed, the emulated run's own counts), `cargo fmt --all -- --check` clean,
+  `cargo clippy --workspace --all-targets -- -D warnings` clean.
+* Line numbers moved with the merge, and did not move after it: the `read_line`
+  helper whose empty read panics is at `control_socket.rs:1081` (911 in section
+  1's run at `7e22e1a`), and the two tests are at 1230 and 1349 (1059 and 1160 at
+  `7e22e1a`). Checked at this head, and still those. Section 3's `ci.yml`
+  references were checked too and still hold: 73-77 is the `test` job's header
+  with the three-OS list, and 92 is its only test step.
+* The emulated mode was **not** green as a whole at `da555be`.
   `worker::tests::a_spawn_that_finds_the_script_busy_is_retried`, added to
   `development` by `2deceea` ("worker: retry a spawn the kernel refused with
-  ETXTBSY") after this card's base, fails there deterministically: 3 runs of
+  ETXTBSY") after this card's base, failed there deterministically: 3 runs of
   that test alone, 3 failures, each in 0.14 s. It is not the mechanism in
   section 4 and not reachable from this branch's diff, which touches `socket.rs`
   and this directory.
 
   The test holds a script open for write and expects `execve` to be refused with
   `ETXTBSY` until the handle closes, so that the daemon's 10 x 50 ms retry rides
-  it out. In the translated guest the call is not refused at all; the child
+  it out. In the translated guest the refusal never reaches the caller: the child
   starts, exits 127, and writes nothing to stdout or stderr, which is why the
   daemon reports its fallback `the worker exited non-zero with no message`.
   Standalone probe (`rustc -O`, hold the file open, spawn it, print the result):
@@ -320,9 +345,40 @@ above is repeated on the merged tree.
 
   So on real x86_64 Linux the rule bites and the test's premise holds; in the
   translated guest it does not, and the retry the test exists to exercise never
-  fires. That is a test whose premise the emulation does not satisfy, not a
-  second `EINTR`; a follow-up card owns it.
+  fires there. That is a test whose premise the emulation does not satisfy, not a
+  second `EINTR`.
 
-One reproduction detail: plain `cargo test --workspace` stops at the first red
-binary, so on the merged tree the emulated run reports the third red and never
-reaches `control_socket`. Use `--no-fail-fast` to see the whole map.
+  **Resolved by `c7e7a12`**, the merge of pull request #29: its commit
+  `dec136e` ("worker: the busy-spawn test asks the guest instead of assuming
+  ETXTBSY") rewrote the test, and it landed on `development` after this section
+  was written. The test no longer assumes the answer: it asks the guest first,
+  in `why_the_busy_exec_is_not_refused`, which attempts the exec
+  and, on a guest that cannot report the refusal through `Command::spawn`, prints
+  the reason and returns without asserting. The retry itself is pinned by a
+  second test that needs no kernel,
+  `a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds`, which hands the
+  retry loop `errno 26` directly and asserts on the attempt counts, so the
+  behaviour is covered on every platform. At this head the emulated run of the
+  test prints the skip and passes, in 0.02 s:
+
+      note: this guest cannot report an exec failure through Command::spawn (the emulated amd64 translation loses glibc's posix_spawnp errno), so the refusal never reaches the caller; the retry is not exercised end to end here, and a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds covers it
+      test worker::tests::a_spawn_that_finds_the_script_busy_is_retried ... ok
+
+  The skip is not a hole where the kernel does answer. On `linux/arm64` (a real
+  kernel, no translation) the same test takes the asserting path: no note, and
+  0.11 s against the emulated run's 0.02 s. A copy of this tree with the retry
+  disabled (`SPAWN_ATTEMPTS` 10 -> 1) fails there, so the premise is doing its
+  work and the test is not vacuous:
+
+      thread 'worker::tests::a_spawn_that_finds_the_script_busy_is_retried' (244) panicked at crates/whirld/src/worker.rs:1151:22:
+      a script that is busy for 100 ms is not a failed spawn: Err(Failed { code: WorkerFailed, message: "cannot spawn /tmp/whirl-worker-test-busy-243/busy.sh: Text file busy (os error 26)" })
+
+  On macOS the test takes the other skip branch, because that kernel does not
+  enforce the rule at all (the probe above), so the asserting run is a Linux one
+  and the emulated guest is not one.
+
+One reproduction detail, unchanged: plain `cargo test --workspace` stops at the
+first red binary, which is why every run in this section passes
+`--no-fail-fast`. On the merged tree at `da555be` that meant the emulated run
+reported the third red and never reached `control_socket`; at this head there is
+no red to stop at.
