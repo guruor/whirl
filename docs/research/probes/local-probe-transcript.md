@@ -79,7 +79,7 @@ boundary that elapsed while the first run was still going.
 ```
 gui/501/com.whirl.research.probeC = {
 	active count = 1
-	path = /Users/govind.rajpurohit/Workspace/Personal/whirl/.worktrees/t_b9e349e6/docs/research/probes/com.whirl.research.probeC.plist
+	path = <checkout>/docs/research/probes/com.whirl.research.probeC.plist
 	type = LaunchAgent
 	state = running
 	program = /bin/sh
@@ -89,6 +89,9 @@ gui/501/com.whirl.research.probeC = {
 	minimum runtime = 10
 	exit timeout = 5
 ```
+
+(One field is elided: launchd printed the absolute path of a scratch checkout of
+this repository.)
 
 ## E: KeepAlive true, body exits 0 immediately
 

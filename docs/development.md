@@ -321,9 +321,9 @@ rather than a gate.
 Every job in `.github/workflows/ci.yml` calls one mode, `secrets` excepted
 (section 4), which makes the sentence above a fact about this tree rather than a
 rule to aspire to: `grep -n scripts/ci.sh .github/workflows/ci.yml` prints one
-`run: bash scripts/ci.sh <mode>` per job. It became a fact when card t_438e03b0
-(pull request #30, merged as `92fed1e`) pointed every job at the script and
-installed the pinned `cargo-nextest` on the runners.
+`run: bash scripts/ci.sh <mode>` per job. It became a fact when pull request #30,
+merged as `92fed1e`, pointed every job at the script and installed the pinned
+`cargo-nextest` on the runners.
 
 The `test` mode is the one to read, because it was the exception until that
 merge: it runs `cargo nextest run --workspace --no-tests=fail` and then
@@ -362,7 +362,7 @@ proves:
 | `artifacts` | the release build produces the three binaries |
 | `windows` | the `#[cfg(windows)]` code compiles. Compile-only: it runs nothing |
 | `linux` | CI's `clippy`, `test` and `artifacts` jobs as they run on `ubuntu-latest`, plus `guards`, again in the gate's container, as the invoking user rather than root (`--user "$(id -u):$(id -g)"`, below), so a Linux-only failure surfaces here rather than in CI. `fmt` is not repeated there: rustfmt's output does not depend on the operating system, and `local` has already run it |
-| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails one test that passes on real x86_64: the emulator's `posix_spawn` reports success for an exec it refused, which no change here can fix (t_26eefd55; the measurement is in `scripts/ci.sh` above `LINUX_PLATFORM`). Opt-in: it is not in `local` or `all` |
+| `linux-amd64` | the same, pinned to the runners' x86_64. Emulated on Apple silicon, so slow, and it fails one test that passes on real x86_64: the emulator's `posix_spawn` reports success for an exec it refused, which no change here can fix (`24f30ce`; the measurement is in `scripts/ci.sh` above `LINUX_PLATFORM`). Opt-in: it is not in `local` or `all` |
 
 **What `all` leaves unproven**, so that the answer is here rather than inferred:
 
@@ -376,8 +376,8 @@ proves:
   and it fails one test that passes on real x86_64. That one is the emulator's:
   the translated `posix_spawn` reports success, with a pid, for a program it
   could not exec, so the daemon's "no worker existed" path is unreachable there
-  and whirl has nothing to fix (t_26eefd55, and the block above
-  `LINUX_PLATFORM` in `scripts/ci.sh` is the measurement). Run the mode by hand
+  and whirl has nothing to fix (the block above `LINUX_PLATFORM` in
+  `scripts/ci.sh` is the measurement). Run the mode by hand
   when a change touches something an architecture decides.
 
 `WHIRL_BACKEND=noop` is not a contributor's business any more: the script sets it
@@ -444,8 +444,8 @@ is not root) and it is what makes the mode worth running: one test in
 `crates/whirl-worker/src/sources/local.rs` plants a file with mode `0o000` and
 asserts that reading it fails, because a fixture a privileged uid can read proves
 nothing. A root container therefore could not be green on a clean tree, and
-`linux` exited 100 with that one failure while the host suite was green (card
-t_207186c7).
+`linux` exited 100 with that one failure while the host suite was green (pull
+request #59, merged as `f41d11e`).
 Nothing in the run wants a privileged uid: `CARGO_HOME` and `RUSTUP_HOME` are
 mode `0777` in the `rust` image, and the one path that needed handing over is the
 target volume, which Docker creates root-owned.
@@ -536,8 +536,8 @@ that calls it, in the same pull request. Every job in this workflow calls one
 mode, so there is no second copy of a command to keep in step. The `test` job
 inlined `cargo test --workspace` when this rule was written, and it was the one
 exception the rule had to name; it now runs `bash scripts/ci.sh test` like the
-rest (card t_438e03b0, pull request #30, merged as `92fed1e`), so there is no
-exception left to name.
+rest (pull request #30, merged as `92fed1e`), so there is no exception left to
+name.
 
 **The other CI gate with no mode is a deliberate exclusion, not a gap:** `secrets`
 (gitleaks) installs a release binary and scans the commits a change adds, and a
