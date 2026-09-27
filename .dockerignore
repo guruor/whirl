@@ -3,4 +3,5 @@
 # ones, and sending them would cost seconds on every build.
 target/
 .git/
+# agent worktrees
 .worktrees/

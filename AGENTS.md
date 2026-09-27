@@ -16,17 +16,18 @@ named.
   in that class.
 - Take a backup of the old value outside the repository before you change the
   machine, and re-run the validator that covers the change.
-- The record goes where the work is tracked: the card's handoff, and the pull
-  request or commit body when the change is part of one. A change whose only record
-  is the session that made it is not recorded, because the next reader gets the
-  machine and not the session.
+- The record goes where the work is tracked: the pull request or commit body when
+  the change is part of one, and a comment on the pull request or issue that tracks
+  it when it is not. A change whose only record is the session that made it is not
+  recorded, because the next reader gets the machine and not the session.
 - Being right is not the same as being recorded. A change made at the user's
   request, with a backup taken and the validator re-run, still has to say so where a
   later reader can find it without a session database.
 - This repository holds one instance of the rule already: the real-wallpaper
   procedure ends with the store line and the image the desktop was left on going
-  into the handoff (`docs/development.md`, "When a check needs a real set"). The
-  rest of the machine gets the same treatment or the change is not finished.
+  into the pull request or commit body (`docs/development.md`, "When a check needs a
+  real set"). The rest of the machine gets the same treatment or the change is not
+  finished.
 
 ## 2. A person's own data never enters the repository
 
@@ -47,18 +48,21 @@ named.
 - Implement what the task asks. No drive-by refactors, no unrequested files, no
   reformatting outside the change: that is already a rule in CONTRIBUTING.md,
   "Branches, commits, scope".
-- If the task is ambiguous, or its acceptance test is missing, say so on the card
-  and stop rather than choosing for the author.
-- A change that has to reach outside the worktree is still inside the task: keep it
-  to what the task names, and record it under rule 1.
+- If the task is ambiguous, or its acceptance test is missing, say so in the pull
+  request and stop rather than choosing for the author.
+- A change that has to reach outside the worktree is still inside the change: keep
+  it to what the task names, and record it under rule 1.
 
 ## 4. A second party, and evidence over claims
 
 - Nothing lands on `development` unreviewed by someone who did not write it. A claim
-  in a card, a handoff, a commit message or a pull request body is input rather than
+  in a commit message, a pull request body or a comment is input rather than
   evidence; evidence is the command and its output, pasted (CONTRIBUTING.md, "The
   rules that are not negotiable"; `docs/development.md` section 6, "The review
   rule").
+- Provenance in a comment is the measurement and the command that produced it,
+  pasted, not a pointer to whatever tracked the work: a reader with the repository
+  and not the session can only check what was printed.
 - Do not review your own work. When you are the only party, open the pull request
   and say what you could not check.
 - Say what you could not verify as unverified: `docs/reviews/` holds reports written
