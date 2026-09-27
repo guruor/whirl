@@ -604,6 +604,9 @@ jobs:
           # through the same rules: one file per commit, named by the commit, in a
           # directory outside the checkout, and the scanner in `dir` mode over it.
           # A finding then names the commit it came from.
+          # The messages come from the commits themselves rather than from the
+          # event payload, so no text an author wrote reaches this script as
+          # code: each message is written to a file, never passed as an argument.
           if [ -z "${SCAN_BASE:-}" ]; then
             echo "::error::no base commit reached this step, so the messages cannot be scoped to this change."
             exit 1
@@ -663,27 +666,36 @@ jobs:
               line = finding.get("StartLine") or 0
               rule = finding.get("RuleID") or "(unknown rule)"
               commit = (finding.get("Commit") or "")[:12]
+              in_message = False
               if not commit:
                   # The message dump is one file per commit, named by the commit.
                   name = pathlib.Path(file).name
                   if re.fullmatch(r"[0-9a-f]{40}\.txt", name):
                       commit = name[:12]
+                      in_message = True
               where = f"commit {commit}" if commit else "this change"
-              if rule in own:
-                  print(
+              if in_message:
+                  # A finding in a message has no file in the checkout to point at:
+                  # its file is one commit's message, named by the commit.
+                  header = f"::error::gitleaks rule {rule} matched the message of {where}"
+              else:
+                  header = (
                       f"::error file={file},line={line}::gitleaks rule {rule} matched "
-                      f"{file}:{line} in {where}. A reference to the machinery that produced the "
-                      "change does not belong in a public artifact: cite the commit, the pull "
-                      "request or the measurement instead, and if the location is one this project "
-                      "documents on purpose, add it to that rule's allowlist with a reason."
+                      f"{file}:{line} in {where}"
+                  )
+              if rule in own:
+                  advice = (
+                      "A reference to the machinery that produced the change does not belong in "
+                      "a public artifact: cite the commit, the pull request or the measurement "
+                      "instead, and if the location is one this project documents on purpose, add "
+                      "it to that rule's allowlist with a reason."
                   )
               else:
-                  print(
-                      f"::error file={file},line={line}::gitleaks rule {rule} matched "
-                      f"{file}:{line} in {where}. A credential in the history is a credential in "
-                      "every clone: rotate it, then remove it with an exemption only if it is not "
-                      "a secret."
+                  advice = (
+                      "A credential in the history is a credential in every clone: rotate it, "
+                      "then remove it with an exemption only if it is not a secret."
                   )
+              print(f"{header}. {advice}")
           print(f"gitleaks: {len(findings)} finding(s), listed above by rule and file.")
           sys.exit(1)
           PY
