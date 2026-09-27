@@ -1306,8 +1306,10 @@ Against this card's criteria:
   credentials. The only files added are this document and the probe scripts and
   their README under `docs/spec/probes/`, which exist to produce `[L 5]`, `[L 6]`
   and `[L 8]` and are not part of the product.
-- **The review gate.** This document is completed with `kanban_request_review`,
-  not `kanban_complete`, per the orchestrator's note on the card.
+- **The review gate.** This document goes through the project's review gate rather
+  than a self-check: a second party read it at `1261786`, and the round-2 review
+  covers the pack at `cedf839` (`docs/reviews/research-spec-review.md`,
+  `docs/reviews/research-spec-review-round2.md`).
 
 ## 11. Evidence
 

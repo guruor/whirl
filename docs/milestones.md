@@ -46,10 +46,9 @@ rows are in pull-request order, which is not merge order.
 
 Eleven pull requests were opened in this window. One of them, #2, was closed unmerged at
 2026-09-25 13:04:19Z, and it is not numbered here for that reason: this file numbers only merged pull
-requests. #3 carries its change: the same card (`t_bbf70dcb`) and the same title ("Secrets: a gitleaks
-gate in CI, and a parser fixture no scanner objects to"), opened at 13:04:24Z on its own head branch
-(`whirl/t_bbf70dcb-secrets-gitleaks-gate`, where #2's branch was the longer
-`whirl/t_bbf70dcb-secrets-gitleaks-in-ci-and-the-parser-fi`), and it is row 3 of the table above,
+requests. #3 carries its change: the same content and the same title ("Secrets: a gitleaks gate in
+CI, and a parser fixture no scanner objects to"), opened at 13:04:24Z on its own head branch (a
+shorter slug of that title; #2's branch was the longer one), and it is row 3 of the table above,
 merged at 13:11:57Z.
 
 ### M1's exit criteria, as met

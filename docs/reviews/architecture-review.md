@@ -1,7 +1,7 @@
-# Review: architecture and development guide (cards t_ef74be0b, t_598fa55e)
+# Review: architecture and development guide
 
-Reviewer: p-amy. Date: 2026-09-25. Worktree: `wt/t_cb0dcdee` at `9d2d735` (fast-forwarded
-from `cedf839` per the orchestrator note). The decisive test was done first and blind: a
+Independent review, 2026-09-25, against `9d2d735`, the merge that carries the
+reviewed documents. The decisive test was done first and blind: a
 client was written against `docs/architecture.md` section 2 alone, without opening
 `prototype/whd/whd.rs` or `prototype/whctl.rs`, and only compared against the prototype
 afterwards. Nothing in this review fixed any reviewed file; the wallpaper was not touched;
@@ -256,7 +256,7 @@ block-until-state-changes/no-polling rule, which lives in features.md's verb tab
 
 ## Per-acceptance-criterion checklists
 
-### Card t_ef74be0b (architecture)
+### `docs/architecture.md`
 
 | Acceptance criterion | Verdict |
 |---|---|
@@ -271,7 +271,7 @@ block-until-state-changes/no-polling rule, which lives in features.md's verb tab
 | No TBD / unresolved placeholders | PASS. |
 | Spec disagreements stated with accurate quotes | FAIL. Four rows quote sentences that no longer exist after the round-1 spec fixes (defect 1). |
 
-### Card t_598fa55e (development guide)
+### `docs/development.md`
 
 | Acceptance criterion | Verdict |
 |---|---|
