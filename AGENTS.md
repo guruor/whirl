@@ -14,6 +14,8 @@ named.
   commit is: which file, the value it had, the value it now has, and why. A config
   file, a state directory, a supervisor unit, the desktop and a shell file are all
   in that class.
+- Take a backup of the old value outside the repository before you change the
+  machine, and re-run the validator that covers the change.
 - The record goes where the work is tracked: the card's handoff, and the pull
   request or commit body when the change is part of one. A change whose only record
   is the session that made it is not recorded, because the next reader gets the
@@ -94,7 +96,9 @@ named.
 - `cargo --version` must print the channel `rust-toolchain.toml` pins before a fmt
   or clippy result means anything: a toolchain manager that exports
   `RUSTUP_TOOLCHAIN` overrides that file, and a clippy newer than the pin then fails
-  the gate on lint that the pin accepts.
+  the gate on lint that the pin accepts. To make the pin win for one command, unset
+  `RUSTUP_TOOLCHAIN` and put rustup's own `bin` directory (`$HOME/.cargo/bin`)
+  first on `PATH` (`docs/development.md` section 2, "The toolchain").
 - No test may set a real wallpaper: the gate exports `WHIRL_BACKEND=noop` for the
   whole of `test`, and nothing may undo it (`docs/development.md` section 7,
   "Rotating without touching your own wallpaper").
