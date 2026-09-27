@@ -16,5 +16,5 @@ title = "whirl"
 useDefault = true
 
 [[allowlists]]
-description = "Build output and per-card worktrees are throwaway directories. Both are gitignored, so a scan of a pull request's own commits cannot see them; this entry is here so that the day one is force-added, its contents are excluded by a stated rule rather than by luck."
+description = "Build output and agent worktrees are throwaway directories. Both are gitignored, so a scan of a pull request's own commits cannot see them; this entry is here so that the day one is force-added, its contents are excluded by a stated rule rather than by luck."
 paths = ['^target/', '^\.worktrees/']
