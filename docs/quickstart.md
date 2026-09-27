@@ -3,8 +3,8 @@
 whirl rotates your desktop wallpaper through a folder of pictures you already have: a small daemon,
 a config file, no window. Everything below was run in this order on macOS on 2026-09-27, with one
 scratch home standing in for yours. The scratch home did not contain the three installs of section
-1 either, so those were sent to a scratch prefix with `--root`; see the paragraph under the install
-block.
+1: those ran unpinned and replaced this machine's own three binaries. Add `--root <dir>` (the
+paragraph under the install block) so a replayer's run does not.
 
 ## 1. Install it
 

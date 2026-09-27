@@ -1230,17 +1230,22 @@ the three `command -v` lines below it will print nothing either; add the directo
 yourself, or install with `--root` into one that is already there. This document
 does not edit your shell configuration.
 
-`--root <dir>` is also the only pin that survives a machine that is not yours.
-`cargo install --path` spells no destination, so nothing on the command line
-constrains where the binary lands, and `--root` is what decides it. A `cargo` on
-`PATH` that is a version manager's shim can re-export `CARGO_HOME` over the value
-the caller exported, which makes `CARGO_HOME=<dir> cargo install --path …` look
-isolated when it is not: on macOS mise's shim does exactly that, and a run of the
-three installs above that exported a scratch `CARGO_HOME` still replaced this
-machine's own three binaries. Every run whose writes have to stay off the machine
-running it, an acceptance or smoke run in particular, adds `--root <dir>` to all
-three lines; the offline example under "Do I have to publish this to crates.io to
-install it?" below already uses that shape with `/tmp/whirl-prefix`.
+`--root <dir>` is also the only pin you can spell on the command line, and the
+one to rely on for a machine that is not yours. `cargo install --path` spells no
+destination, so nothing on the command line constrains where the binary lands,
+and `--root` is what decides it. A `cargo` on `PATH` that is a version manager's
+shim can re-export `CARGO_HOME` over the value the caller exported, which makes
+`CARGO_HOME=<dir> cargo install --path …` look isolated when it is not: on macOS
+mise's shim does exactly that, and a run of the three installs above that
+exported a scratch `CARGO_HOME` still replaced this machine's own three binaries.
+The environment has a second pin: `CARGO_INSTALL_ROOT=<dir>` decides the
+destination with no `--root` at all, and takes the binary and cargo's
+`.crates.toml` and `.crates2.json` under it. It is not one of the three variables
+mise exports, so that shim does not overwrite it, though a version manager is
+free to. Every run whose writes have to stay off the machine running it, an
+acceptance or smoke run in particular, adds `--root <dir>` to all three lines;
+the offline example under "Do I have to publish this to crates.io to install it?"
+below already uses that shape with `/tmp/whirl-prefix`.
 
 **From a release archive.** Once a tag has been cut, the archive is the three
 binaries and nothing else (section 5, "What a release artifact is, per platform"),
