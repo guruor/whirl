@@ -19,7 +19,7 @@ prototype/**/wallpaper_downloads/
 # macOS
 .DS_Store
 
-# kanban per-card worktrees (created by the dispatcher inside this repo)
+# per-task worktrees, created inside this repo
 .worktrees/
 
 # editors

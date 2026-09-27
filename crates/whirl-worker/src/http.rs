@@ -365,7 +365,7 @@ mod tests {
     ///
     /// Both routes spawn through [`invocation`], so this one test is the rule for
     /// the listing and for the image alike; the live half of it is acceptance 2 of
-    /// `t_3ebd4de8`, a `ps` on a real rotate.
+    /// `999ea4f5`, a `ps` on a real rotate.
     #[test]
     fn argv_is_config_dash_and_nothing_else() {
         let command = invocation();

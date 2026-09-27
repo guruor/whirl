@@ -58,7 +58,7 @@ unsafe extern "C" {
 /// bound socket accepts a connection the moment `bind` returns. A client that
 /// connected in that window read `0700`: `control_socket`'s
 /// `the_socket_is_0600_in_a_0700_directory` saw `448` where it asserts `384`,
-/// once in eleven whole-workspace runs (t_6c776148).
+/// once in eleven whole-workspace runs (cbefc4c).
 const SOCKET_UMASK: u32 = 0o177;
 
 /// The process umask, so the socket cannot be bound group- or world-connectable
@@ -87,7 +87,7 @@ fn set_umask(mask: u32) -> u32 {
 /// in a test binary may call it: `cargo test` runs a binary's unit tests on
 /// parallel threads, so the mask would be in force while the state, statefile
 /// and cache tests create their scratch files, and those fail with
-/// `PermissionDenied` (t_6c776148).
+/// `PermissionDenied` (cbefc4c).
 fn with_socket_umask<T>(body: impl FnOnce() -> T) -> T {
     let previous = set_umask(SOCKET_UMASK);
     let value = body();
@@ -349,7 +349,7 @@ enum ReadOutcome {
 /// `Worker::run` forks `whirl-worker` closed a subscriber's connection, which is
 /// what `control_socket`'s `subscribe_streams_one_event_per_state_change` and
 /// `a_failed_rotation_is_visible_on_both_planes` saw as "the daemon closed the
-/// connection early" (t_62920980).
+/// connection early" (580dffb).
 fn read_request_line(reader: &mut impl BufRead) -> io::Result<ReadOutcome> {
     let mut buffer: Vec<u8> = Vec::new();
     loop {
@@ -735,7 +735,7 @@ mod tests {
     use super::*;
 
     /// A reader whose first `read` is interrupted, as a socket read with
-    /// `SO_RCVTIMEO` is when a signal reaches the thread (t_62920980), and which
+    /// `SO_RCVTIMEO` is when a signal reaches the thread (580dffb), and which
     /// then serves one line.
     struct InterruptedOnce {
         line: &'static [u8],
@@ -792,13 +792,13 @@ mod tests {
 }
 
 /// The mask's own test. It is named `socket_mode_tests` rather than the
-/// file-wide `tests` because t_62920980 adds a `mod tests` to this file in the
-/// same window and two modules cannot share a name.
+/// file-wide `tests` because the interrupted-read change (580dffb) adds a second
+/// `mod tests` to this file in the same window, and two modules cannot share a name.
 #[cfg(test)]
 mod socket_mode_tests {
     use super::*;
 
-    /// The mode of 2.1 is a property of the mask (t_6c776148): a `bind` creates
+    /// The mode of 2.1 is a property of the mask (cbefc4c): a `bind` creates
     /// the socket as `0777 & ~umask`, so this arithmetic is what the daemon
     /// relies on, and the `0o077` this card replaced -- which leaves the owner's
     /// execute bit -- fails here instead of in the whole-workspace run, where it
