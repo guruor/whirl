@@ -11,8 +11,8 @@
 # refuses to run on a contributor's machine, so there is no honest mode to write
 # (docs/development.md section 4).
 #
-# `test` was the one exception to the identity until card t_438e03b0 (pull
-# request #30) landed, so it is the mode to read first: it is `cargo nextest run
+# `test` was the one exception to the identity until pull request #30, merged
+# as `92fed1e`, landed, so it is the mode to read first: it is `cargo nextest run
 # --workspace --no-tests=fail` then `cargo test --workspace --doc`, and the
 # `test` job now runs this mode instead of inlining `cargo test --workspace`.
 # Those are two harnesses, not two spellings of one: nextest runs one process per
@@ -76,7 +76,7 @@ GATE_IMAGE_BASE="whirl-gate:${GATE_TOOLCHAIN}-${GATE_NEXTEST}"
 # sources::local plants a file with mode 0o000 and asserts the read fails, so
 # "the fixture has to be unreadable for this test to mean anything"). As root
 # that read succeeds and the assertion fails, which is how `linux` and `all`
-# came to exit 100 on a clean tree (t_207186c7). `--user` takes the uid and gid
+# came to exit 100 on a clean tree (0809f2f). `--user` takes the uid and gid
 # from the machine the gate is running on, which is exactly the difference
 # between this container and CI that the mode exists to close.
 #
@@ -130,7 +130,7 @@ LINUX_PLATFORM="linux/amd64"
 # macos-latest and msrv all report it ok).
 #
 # The failure is the translator's, not whirl's, and there is nothing to fix on
-# this side (t_26eefd55). The daemon spawns through std's `Command`, and std on
+# this side (24f30ce). The daemon spawns through std's `Command`, and std on
 # linux-gnu reaches the kernel through glibc's `posix_spawn`, which returns the
 # child's exec error in memory a `CLONE_VM|CLONE_VFORK` child shares with its
 # parent (glibc 2.36, spawni.c). Rosetta's clone child is not in the parent's
@@ -150,15 +150,15 @@ LINUX_PLATFORM="linux/amd64"
 # spawn path on every real target, with `unsafe`, to satisfy an emulator.
 #
 # This list used to name two control_socket tests, and those are fixed rather
-# than relabelled: t_62920980 found the EINTR the translation delivered to a read
+# than relabelled: 580dffb found the EINTR the translation delivered to a read
 # parked in read_request_line, and development's retry makes both pass here. A
 # third name was on the list while this file was written,
 # whirld::bin/whirld worker::tests::a_spawn_that_finds_the_script_busy_is_retried,
-# which passes since dec136e (t_43827dc5) made it ask the guest for the kernel's
+# which passes since dec136e made it ask the guest for the kernel's
 # refusal instead of assuming emulation reports it. The one above is the only red
 # this mode has, and it is the emulator's: nothing is filtered out and nothing is
 # skipped, the run is the whole suite, and the mode prints the name, the
-# measurement and the card on every run, so a red is understood rather than
+# measurement and the reason on every run, so a red is understood rather than
 # ignored.
 
 usage() {
@@ -181,7 +181,7 @@ test_suite() {
   # package-scoped build never produces it (a `cargo test -p whirld` run fails
   # for that reason, unrelated to the code under test). A test cannot inherit
   # another test's open descriptors either, which is the cross-test half of the
-  # ETXTBSY class (t_7e9836df), and each test gets the timeout in
+  # ETXTBSY class (b5f4a9e), and each test gets the timeout in
   # .config/nextest.toml instead of the runner's.
   # --no-tests=fail is the guard against a run that reports success having run
   # nothing, which is how a wrong package name hides: `-p whirl-worker` runs
@@ -343,8 +343,8 @@ amd64_note() {
   printf '        which passes on real x86_64 (CI run 36272882168), in this image without --platform and\n' >&2
   printf '        natively here. That one is the translator and not whirl: the emulated posix_spawn reports\n' >&2
   printf '        success, with a pid, for a program it could not exec, so there is nothing here to fix and\n' >&2
-  printf '        the mode keeps it red (t_26eefd55; the block above LINUX_PLATFORM is the measurement). The\n' >&2
-  printf '        two control_socket names this note used to print were fixed by t_62920980, not relabelled.\n' >&2
+  printf '        the mode keeps it red (the block above LINUX_PLATFORM is the measurement). The two\n' >&2
+  printf '        control_socket names this note used to print were fixed, not relabelled.\n' >&2
   printf '        Nothing is skipped or filtered: the run is the whole suite, and it exits non-zero on the\n' >&2
   printf '        one above, which is why this mode is opt-in and not part of local or all.\n' >&2
 }

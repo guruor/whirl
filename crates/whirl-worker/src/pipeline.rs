@@ -590,7 +590,7 @@ impl Transport for Paths {
 /// testable: a test drives it with a [`crate::http::Bytes`] of its own and no
 /// socket, or with a path in its own scratch directory and no URL at all.
 ///
-/// This is the whole of the defect `t_3ebd4de8` was written for: before it, the
+/// This is the whole of the defect `999ea4f5` was written for: before it, the
 /// only transport in the binary was [`Paths`], and a wallhaven rotation handed
 /// `fs::File::open` an `https://` URL and reported `offline` with the errno of a
 /// file that never existed.
@@ -2206,7 +2206,7 @@ mod tests {
     /// The defect this closes was precisely that the choice did not exist: the
     /// only transport in the binary was [`Paths`], so a `wallhaven` candidate's
     /// `https://` URL reached `fs::File::open` and the rotation reported the errno
-    /// of a file that never existed (`t_3ebd4de8`). Neither direction can pass by
+    /// of a file that never existed (`999ea4f5`). Neither direction can pass by
     /// accident here — the URL is not a file on this machine, and the path is
     /// something the recorded client has never heard of — so a transport that
     /// picked one route for both would fail on one of the two halves.
@@ -2656,8 +2656,8 @@ mod tests {
     /// in it is why that is a quoting job and not string concatenation: written
     /// raw, the config parser stops at `unknown escape '\U'`. On the Windows
     /// runner the temporary directory is `C:\Users\...`, which is how eleven
-    /// pipeline tests failed there and nowhere else (run 36157542930 on
-    /// t_ddb890aa). This pins the escaping on the platform the test runs on.
+    /// pipeline tests failed there and nowhere else (run 36157542930; fixed in
+    /// `d24ddfc7`). This pins the escaping on the platform the test runs on.
     #[test]
     fn the_fixture_config_escapes_a_path_with_a_backslash_in_it() {
         // Absolute where the test runs and carrying a backslash either way:
@@ -3726,7 +3726,7 @@ mod tests {
             // would reject, but a fractional delta of 0.0158 that it keeps.
             // Without this candidate `(ratio - target).abs() > tolerance` and
             // `((ratio - target) / target).abs() > tolerance` agree on every
-            // other entry, so the mutation survives (t_ddb890aa, run 3).
+            // other entry, so the mutation survives (66b1fd7a, run 3).
             seeking("in-the-band", "e.png", 1600, 886, 100),
         ];
 

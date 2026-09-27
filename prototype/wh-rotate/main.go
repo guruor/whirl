@@ -42,8 +42,33 @@ type Config struct {
 	LogFile   string   `json:"log_file"`
 }
 
-func defaultConfig() Config {
+// cacheRoot is one directory for every default below: this user's cache
+// directory under HOME, and the same path `example-config.json` names, so a
+// key deleted from that file keeps the meaning the compiled default gives it.
+func cacheRoot() string {
 	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cache", "wh-rotate")
+}
+
+// expandHome turns a leading `~` into the user's home directory, the rule the
+// worker's own config grammar states for a local directory ("`~` is
+// expanded", features.md 2.2). A config file is checked in and copied between
+// machines, so a path in one cannot be a literal home directory.
+func expandHome(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
+}
+
+func defaultConfig() Config {
 	return Config{
 		Sources: []Source{{
 			Kind:   "wallhaven",
@@ -52,10 +77,10 @@ func defaultConfig() Config {
 		}},
 		MinWidth:  2560,
 		MinHeight: 1440,
-		CacheDir:  filepath.Join(home, "Pictures", "Wallhaven"),
+		CacheDir:  filepath.Join(cacheRoot(), "wh-cache"),
 		Keep:      40,
 		AllSpaces: true,
-		LogFile:   filepath.Join(home, "Library", "Logs", "wh-rotate.log"),
+		LogFile:   filepath.Join(cacheRoot(), "wh-rotate.log"),
 	}
 }
 
@@ -81,6 +106,15 @@ func loadConfig() (Config, error) {
 	cfg := defaultConfig()
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return Config{}, fmt.Errorf("bad config %s: %w", p, err)
+	}
+	// `~` is expanded, once, for every path the file can carry: the example
+	// config is one file for every machine, so no path in it can be a literal
+	// home directory. An absolute path is returned unchanged, and the two
+	// compiled defaults above are already absolute.
+	cfg.CacheDir = expandHome(cfg.CacheDir)
+	cfg.LogFile = expandHome(cfg.LogFile)
+	for i := range cfg.Sources {
+		cfg.Sources[i].Dir = expandHome(cfg.Sources[i].Dir)
 	}
 	return cfg, nil
 }

@@ -648,7 +648,7 @@ mod tests {
     /// before the pid file is written, so a child that is slow to start survives
     /// the signal whenever the two orderings can still be reconciled.
     ///
-    /// It is not enough on its own, and `t_b2545ae0` is where that became plain.
+    /// It is not enough on its own, and `9d2402eb` is where that became plain.
     /// The child's arming - fork, exec, trap, pid file - took 0.57 s to 2.83 s
     /// across 28 runs under the card's 12-spinner load, so this deadline sits
     /// barely above the worst run rather than the order of magnitude above it the
@@ -813,8 +813,8 @@ mod tests {
     /// between the commands it is executing, so the marker lags the true
     /// `SIGTERM` by however long the command in flight takes to return plus
     /// however long the shell and the watching thread waited for a core. Both of
-    /// those are the machine's, and `t_b2545ae0` measured them at the card's load
-    /// (12 busy loops on 8 cores) in the same runs, which is where the script
+    /// those are the machine's, and `9d2402eb` measured them under load (12 busy
+    /// loops on 8 cores) in the same runs, which is where the script
     /// below got its shape:
     ///
     /// - a shell blocked in the `wait` builtin, which is what the script does
@@ -1014,7 +1014,7 @@ mod tests {
     /// the signal is the daemon failing to deliver it politely, which is a
     /// failure, while a child that had no trap to trap with is the machine, which
     /// is a re-run (`ARMED_ATTEMPTS`). Read as one shape, the second is
-    /// `t_b2545ae0`'s second window.
+    /// `9d2402eb`'s second window.
     #[test]
     fn a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace() {
         let scripts = Scripts::new("escalate");
