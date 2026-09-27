@@ -567,7 +567,8 @@ before it is used as a range.
 - **Verified on this machine:** `actionlint` (1.7.11) reports no problems for this
   file and for `.github/workflows/release.yml`, and a real YAML parse finds 7 jobs
   and the three triggers here, and the 2 jobs of the release workflow with its one
-  trigger. Both commands are in the handoff note.
+  trigger. Both commands and their output are in the pull request that added
+  this list (pull request #5, "What I ran, and what it said").
 - **Verified when this guide was written, and now superseded:** `gh run list -R
   guruor/whirl` returned an empty list, so no CI run had executed. **The first run
   is pull request #1's:** run `36126085459`, green, twelve jobs. A run named by its
@@ -601,9 +602,10 @@ before it is used as a range.
   deleted, and both are verified gone: `gh release view v0.0.1-rc.test` fails with
   `release not found`, `gh release list` is empty and `git ls-remote --tags origin`
   prints nothing. Two things about that proof are stated rather than implied: the
-  tag was pushed at the commit that carries the workflow, on the card's branch,
-  because the workflow reaches `main` only through the promotion that card opens,
-  and a tag on `main` today would run nothing; and the rendered notes carry the
+  tag was pushed at the commit that carries the workflow, on the branch of the
+  pull request that added the workflow (pull request #5), because the workflow
+  reaches `main` only through the promotion that pull request opens, and a tag on
+  `main` today would run nothing; and the rendered notes carry the
   template's "on `main`" line, which a tag at a branch head does not satisfy, which
   is a second reason the throwaway tag was deleted rather than kept.
 - **The release notes gate was exercised outside CI, against the step's own
@@ -612,7 +614,8 @@ before it is used as a range.
   required section (fails), a final release with no notes file (fails), a final
   release with a filled notes file (publishes), a final release with a placeholder
   left (fails, naming it), and a tag that is not release-shaped (fails). The probe,
-  its output and the case list are in the card's handoff note.
+  its output and the case list are in the pull request that added this bullet
+  (pull request #5, "What I ran, and what it said").
 - **One annotation on both runs, recorded because it is not a failure:** `Node.js
   20 is deprecated. The following actions target Node.js 20 but are being forced to
   run on Node.js 24: actions/checkout@11d5960a, actions/upload-artifact@ea165f8d`.
@@ -631,7 +634,7 @@ does not repeat the value anywhere else:
 | the MSRV | `rust-version` in the workspace manifest, plus the `msrv` job | the four steps above, in one commit |
 | the pinned action versions, and the gitleaks version and its digest | `.github/workflows/ci.yml` and `.github/workflows/release.yml` | Dependabot or a deliberate pull request. An action added from now on is pinned to a full commit SHA, never to a tag or a branch: a tag can be moved under the repository between two runs |
 | the two vendor prices and their URLs | the Sources list at the end of this document, each with its retrieval date | re-fetch, and correct the date, before repeating the number as a fact |
-| the platform facts | `docs/research/*`, each with its own retrieval date and provenance | a research card, not an edit here |
+| the platform facts | `docs/research/*`, each with its own retrieval date and provenance | a research note, not an edit here |
 
 A price or a version quoted in this document without its retrieval date is a bug:
 the number is the vendor's to change and ours to re-check.
@@ -811,7 +814,7 @@ a platform backend. If `whirld` approaches a megabyte, someone linked one.
   carry the macOS first-run step: the download is unsigned, and the notes say what
   the user does about the Gatekeeper prompt. Developer ID signing plus
   notarization is the route when the artifact is handed to people who did not
-  build it, it needs the 99 USD/year membership above, and it is its own card
+  build it, it needs the 99 USD/year membership above, and it is its own change
   when that happens
   (`docs/decisions/0001-macos-artifacts-ship-unsigned-in-v0.1.0.md`). Ad-hoc
   signing is enough for contributors building locally.
@@ -829,8 +832,8 @@ a platform backend. If `whirld` approaches a megabyte, someone linked one.
   v0.1: **ship unsigned, and put the SmartScreen first-run warning in the release
   notes**, including the "More info, Run anyway" step. Buying trust that a
   reputation system still has to grant, at a recurring cost, is not worth it
-  before there are users. Revisit it as a research card if download warnings
-  become a support load, not before.
+  before there are users. Revisit it with a note under `docs/research/` if
+  download warnings become a support load, not before.
 - **Linux: nothing to sign, and no package format to invent.** What the research
   decides is the runtime side, not the packaging side. GNOME and KDE need no
   extra package beyond the session itself; sway needs `swaybg`, which the
@@ -1571,7 +1574,7 @@ clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics
 # 4. Put it back, and read the proof of it. This is the last action of the run:
 scripts/desktop-restore.sh /tmp/desktop-snapshot.txt
 
-# 5. What the desktop was left on, and the store line for the handoff. The store
+# 5. What the desktop was left on, and the store line for the record. The store
 #    line for the Space node is the proof; --holds takes the path the snapshot
 #    recorded, so it needs no uuid:
 python3 docs/research/probes/wallpaper_store.py current --holds "$(sed -n 's/^path=//p' /tmp/desktop-snapshot.txt)"
@@ -1582,7 +1585,9 @@ Step 4 prints `restored : file:///System/Library/Desktop%20Pictures/Mac%20Yellow
 and the `LastSet` it moved, for example
 `2026-09-26 07:23:09.851069 -> 2026-09-26 07:23:17.739266 (UTC)`. Step 5 prints the
 image you snapshotted, with that same new `LastSet`. Those two lines are the proof,
-and they are what goes in the handoff.
+and they are what goes in the record: the pull request or commit body when the run
+is part of one, and a comment on the pull request or issue that tracks it when it
+is not.
 
 Four rules, all of them consequences of a write reaching the frontmost Space only:
 
@@ -1600,7 +1605,7 @@ Four rules, all of them consequences of a write reaching the frontmost Space onl
   the file is gone). `desktop-restore.sh` refuses when the frontmost Space is not
   the one the snapshot named, or when the write does not show up in the store.
   Neither refusal writes anything.
-- **Say which image the desktop was left on** in the handoff, with the store line.
+- **Say which image the desktop was left on** in the record, with the store line.
   "The wallpaper is fine" is not evidence.
 
 ### Running the pieces by hand
