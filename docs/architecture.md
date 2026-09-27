@@ -809,9 +809,9 @@ are checked against them, and the third column below says where each name comes 
 | `display_mode_effective` | `all` | `features 1.3` | what the platform actually gets; features.md 1.3 names this key for the `per-display` fallback |
 | `display_mode_reason` | `-` | here | why, when they differ: `unverified_platform`, `impossible_on_this_desktop`, `out_of_scope_on_this_desktop`, `no_displays` 3.7 |
 | `anchor_digest` | `d435840ce84fbb8d...` | `[D 6 §9]` | what whirl believes is on screen; `-` before the first verified rotation 1.7.3 |
-| `anchor_path` | `/Users/govind.rajpurohit/Library/Caches/whirl/sha256/d4/35/d43584...jpg` | `[D 6 §9]` | the path the platform was given, as the daemon records it: the cache file for an image whirl stored, or the path a `set path` named 2.6; `-` for a `reference`-mode set, which stores nothing and so leaves the file the user's own 6.1, and `-` before the first verified rotation 1.7.3 |
+| `anchor_path` | `/Users/<user>/Library/Caches/whirl/sha256/d4/35/d43584...jpg` | `[D 6 §9]` | the path the platform was given, as the daemon records it: the cache file for an image whirl stored, or the path a `set path` named 2.6; `-` for a `reference`-mode set, which stores nothing and so leaves the file the user's own 6.1, and `-` before the first verified rotation 1.7.3 |
 | `anchor_verified` | `1` | here | 1 once a rotation's readback agreed with the set; 0 while unverified 1.7.3 |
-| `cache_dir` | `/Users/govind.rajpurohit/Library/Caches/whirl` | `[D 6 §9]` | which cache this daemon owns 3.1 |
+| `cache_dir` | `/Users/<user>/Library/Caches/whirl` | `[D 6 §9]` | which cache this daemon owns 3.1 |
 | `cache_root_id` | `9d1f0c2e-5b6a-4d7e-8f11-0c2b4a6d9e01` | `[D 6 §9]` | the cache root's identity file, so `status` can tell two daemons apart 3.1 |
 | `cache_files` | `312` | `[D 6 §9]` | files in the cache root |
 | `cache_bytes` | `180224512` | `[D 6 §9]` | their total size |
@@ -822,7 +822,7 @@ are checked against them, and the third column below says where each name comes 
 | `cache_writable` | `1` | `[D 6 §9]` | 0 when the daemon has had to continue without a writable cache 8.4 |
 | `sweep_deferred` | `0` | `[D 6 §9]` | 1 when the sweep could not take the rotation lock because another holder had it, which is the only trigger `[D 6 §5.5]` step 1 gives this key; a sweep that ran and failed is a different fact and reports `cache_over_reason: sweep_error` instead |
 | `lock_mode` | `flock` | `[D 6 §9]` | `flock` \| `excl_file`: the primitive actually holding `state/locks/daemon.lock`, which 1.5 step 1 takes at startup and holds for the daemon's lifetime, with `excl_file` where the filesystem cannot `flock` 8.7. Windows's `LockFileEx` reports `flock`, because it is that platform's own exclusive lock rather than a weaker one. There is no third value: a daemon that cannot take the lock does not run 1.5 step 1, and a lock file left behind by a daemon that is gone is classified and refused at that same step, before there is a socket for `status` to answer on `[D 6 §8.8]` |
-| `state_dir` | `/Users/govind.ra...` | `[D 6 §9]` | where the state files are 1.1 |
+| `state_dir` | `/Users/<user>/Library/Application Support/whirl` | `[D 6 §9]` | where the state files are 1.1 |
 | `state_corrupt` | `-` | `[D 6 §9]` | the state file that failed to parse, if any 6.4 |
 | `state_quarantined` | `-` | `[D 6 §9]` | the path it was moved to before defaults were written 6.4 |
 | `state_schema_newer` | `0` | `[D 6 §9]` | 1 when the file's schema is newer than this binary 6.4; the file's name and both schema numbers go to the log, not to this key, because the key is a typed flag like its neighbours and no client branches on the detail |
@@ -847,6 +847,12 @@ whose digest begins `d435840c` lives at `sha256/d4/35/<digest>.<ext>`. Every `sh
 three transcripts below recomputes that way from its own digest, and the two in transcript B start
 with `26`, so they read `sha256/26/b8/`. `-->` is the client, `<--` is the daemon. The status block
 in A is generated from the same list as the table in 2.10, so the two cannot drift.
+
+Home paths in the table above and in the transcripts below stand under `/Users/<user>/`, the account
+the capture ran under: every reader has their own home, and no value here turns on which account it
+was. The account is what `<user>` replaces, so a path keeps the absolute shape the daemon was given,
+and a digest recomputed from a path needs that account put back first, the same caveat as for any
+other value captured on one machine.
 
 **A. A normal session: version negotiation, a rotation, pins, history, plan.**
 
@@ -891,7 +897,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- anchor_digest: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f
 <-- anchor_path: sha256/d4/35/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
 <-- anchor_verified: 1
-<-- cache_dir: /Users/govind.rajpurohit/Library/Caches/whirl
+<-- cache_dir: /Users/<user>/Library/Caches/whirl
 <-- cache_root_id: 9d1f0c2e-5b6a-4d7e-8f11-0c2b4a6d9e01
 <-- cache_files: 312
 <-- cache_bytes: 180224512
@@ -902,7 +908,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- cache_writable: 1
 <-- sweep_deferred: 0
 <-- lock_mode: flock
-<-- state_dir: /Users/govind.rajpurohit/Library/Application Support/whirl
+<-- state_dir: /Users/<user>/Library/Application Support/whirl
 <-- state_corrupt: -
 <-- state_quarantined: -
 <-- state_schema_newer: 0
@@ -928,7 +934,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 --> history 3
 <-- count: 3
 <-- entry: 2026-09-25T07:41:12Z source wallhaven space:ab12cd d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f sha256/d4/35/d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f.jpg
-<-- entry: 2026-09-25T07:11:09Z source local pictures:401df7171a5e52d88b2f7f9e9d201308f9600e7034916d7865c883f33ec64dcd 3b29b61764d0a17238f7a51d2585eccf538171d638f210e810f4e8eab970387a /Users/govind.rajpurohit/Pictures/Wallpapers/valley.jpg
+<-- entry: 2026-09-25T07:11:09Z source local pictures:401df7171a5e52d88b2f7f9e9d201308f9600e7034916d7865c883f33ec64dcd 3b29b61764d0a17238f7a51d2585eccf538171d638f210e810f4e8eab970387a /Users/<user>/Pictures/Wallpapers/valley.jpg
 <-- entry: 2026-09-25T06:58:02Z startup external external:d25a845d3a284ed719022916037cde61995e9d3c31b96253e87c0c2d3032e35d - /System/Library/Desktop Pictures/Mac Yellow.heic
 <-- OK
 --> favorites
@@ -941,13 +947,13 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 --> favorite space:ab12cd
 <-- favorited: d435840ce84fbb8d633f0d1f81ad0b620fff857597bca6ab238b51e164e1da9f space:ab12cd
 <-- OK
---> set path /Users/govind.rajpurohit/Pictures/Wallpapers/valley.jpg
+--> set path /Users/<user>/Pictures/Wallpapers/valley.jpg
 <-- queued
-<-- set: 3b29b61764d0a17238f7a51d2585eccf538171d638f210e810f4e8eab970387a pictures:401df7171a5e52d88b2f7f9e9d201308f9600e7034916d7865c883f33ec64dcd manual /Users/govind.rajpurohit/Pictures/Wallpapers/valley.jpg
+<-- set: 3b29b61764d0a17238f7a51d2585eccf538171d638f210e810f4e8eab970387a pictures:401df7171a5e52d88b2f7f9e9d201308f9600e7034916d7865c883f33ec64dcd manual /Users/<user>/Pictures/Wallpapers/valley.jpg
 <-- OK
 --> set id 3b29b61764d0a17238f7a51d2585eccf538171d638f210e810f4e8eab970387a
 <-- queued
-<-- set: 3b29b61764d0a17238f7a51d2585eccf538171d638f210e810f4e8eab970387a pictures:401df7171a5e52d88b2f7f9e9d201308f9600e7034916d7865c883f33ec64dcd manual /Users/govind.rajpurohit/Pictures/Wallpapers/valley.jpg
+<-- set: 3b29b61764d0a17238f7a51d2585eccf538171d638f210e810f4e8eab970387a pictures:401df7171a5e52d88b2f7f9e9d201308f9600e7034916d7865c883f33ec64dcd manual /Users/<user>/Pictures/Wallpapers/valley.jpg
 <-- OK
 --> prev
 <-- queued
@@ -963,7 +969,7 @@ $ nc -U ~/Library/Application\ Support/whirl/whirl.sock
 <-- source: space wallhaven weight=3 enabled=1 last=ok reason=-
 <-- OK
 --> config path
-<-- config: /Users/govind.rajpurohit/Library/Application Support/whirl/config.json
+<-- config: /Users/<user>/Library/Application Support/whirl/config.json
 <-- OK
 --> config check
 <-- queued
