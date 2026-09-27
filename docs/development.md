@@ -525,8 +525,9 @@ change that *removes* a value cannot trip it, and a value already in history nee
 no exemption. It installs the release binary with the version and the sha256 both
 pinned in the workflow, and it fails when the scan reads no commits, because a
 scan that checked nothing and a scan that found nothing print the same `no leaks
-found`. The scanner's own rules stay on; `.gitleaks.toml` only adds exemptions,
-each with a reason that the job prints on every run.
+found`. The scanner's own rules stay on; `.gitleaks.toml` adds rules of this
+project's own as well as exemptions, and each exemption carries a reason that
+the job prints on every run.
 
 The rule that keeps it honest: **every command a contributor is expected to run
 before opening a pull request is a mode of `scripts/ci.sh` (section 3), and each
