@@ -24,7 +24,9 @@ name: ci
 # exemptions, which it prints so that one is never silent. The job proves its own
 # rules can fail as well: a step in it plants one sample of every shape the rules
 # forbid, so a rule that stops matching the real thing, or an exemption the
-# scanner does not read, is a red job rather than a green one.
+# scanner does not read, is a red job rather than a green one. It plants one
+# sentence the rules must not touch as well, so a rule that starts reporting
+# ordinary prose is red too.
 #
 # Triggers (docs/development.md section 6): `development` integrates, `main`
 # releases. So this workflow runs for a push to either branch, and for a pull
@@ -301,6 +303,22 @@ jobs:
           # gitleaks does not read would let a documented path fail every pull request.
           ALLOWED = ("private-home-directory-path", ("~/", ".config/whirl/config.json"))
 
+          # The other direction of one of those rules: an ordinary sentence from a
+          # technical register, carrying a token of the handle's shape that is prose
+          # rather than a handle, which the rule's allowlist has to drop. Measured
+          # before that entry existed: a commit message about a test statistic failed
+          # the job, and the advice the failure printed was nonsense for it. Built from
+          # parts for the same reason the samples are.
+          PROSE_RULE = "agent-role-handle"
+          PROSE_TOKENS = [("p-", "value"), ("p-", "state")]
+          PROSE = (
+              "the "
+              + "".join(PROSE_TOKENS[0])
+              + " of the test was 0.04, and the "
+              + "".join(PROSE_TOKENS[1])
+              + " changed with the load"
+          )
+
           problems = []
           notes = []
 
@@ -366,6 +384,16 @@ jobs:
               fail(f"the allowlist sample names {allowed_rule}, which is not a rule")
           elif not matchers[allowed_rule].search(allowed_sample):
               fail(f"the allowlist sample {allowed_sample} does not match {allowed_rule}, so it proves nothing")
+          if PROSE_RULE not in matchers:
+              fail(f"the prose fixture names {PROSE_RULE}, which is not a rule")
+          else:
+              for parts in PROSE_TOKENS:
+                  token = "".join(parts)
+                  if not matchers[PROSE_RULE].search(token):
+                      fail(
+                          f"the prose token {token} does not match {PROSE_RULE}, so the fixture "
+                          "proves nothing about the words that rule's allowlist exempts"
+                      )
 
           if problems:
               for problem in problems:
@@ -410,14 +438,21 @@ jobs:
           (fixture / "allowed.txt").write_text(allowed_sample + "\n")
           allowed_head = commit("a location this project documents")
 
+          # An ordinary sentence, as file content and as the message of the same
+          # commit: the message is half the check, and that is where the false
+          # positive was measured.
+          (fixture / "allowed.txt").unlink()
+          (fixture / "prose.txt").write_text(PROSE + "\n")
+          prose_head = commit(PROSE)
+
           # And a commit with nothing planted at all.
           (fixture / "planted.txt").unlink()
-          (fixture / "allowed.txt").unlink()
+          (fixture / "prose.txt").unlink()
           (fixture / "clean.txt").write_text("a line with no reference in it\na second one\n")
           clean_head = commit("clean again")
 
           print(f"fixture: {fixture}")
-          print(f"  {clean_base[:7]} clean start, {planted_head[:7]} planted, {allowed_head[:7]} documented, {clean_head[:7]} clean again")
+          print(f"  {clean_base[:7]} clean start, {planted_head[:7]} planted, {allowed_head[:7]} documented, {prose_head[:7]} prose, {clean_head[:7]} clean again")
 
 
           def rule_ids(report):
@@ -466,8 +501,10 @@ jobs:
 
           messages = work / "messages"
           clean_messages = work / "clean-messages"
+          prose_messages = work / "prose-messages"
           dump_message(messages, planted_head)
           dump_message(clean_messages, clean_head)
+          dump_message(prose_messages, prose_head)
 
           # --- what the check must catch, and what it must not -------------------------
 
@@ -501,9 +538,24 @@ jobs:
           else:
               print(f"  {allowed_rule}: dropped {allowed_sample}, which the allowlist exempts")
 
+          prose = scan_range(allowed_head, prose_head, work / "prose.json")
+          if prose:
+              for finding in prose:
+                  fail(
+                      f"an ordinary sentence ({PROSE}) was reported by {finding['RuleID']} in "
+                      + finding["File"] + f":{finding['StartLine']}, so that rule fires on prose "
+                      f"rather than on a handle"
+                  )
+          else:
+              print(
+                  f"  {PROSE_RULE}: dropped an ordinary sentence about a test statistic and a "
+                  "governor, which that rule's allowlist exempts"
+              )
+
           for label, findings in (
-              ("a commit with nothing planted", scan_range(allowed_head, clean_head, work / "clean.json")),
+              ("a commit with nothing planted", scan_range(prose_head, clean_head, work / "clean.json")),
               ("a message with nothing planted", scan_messages(str(clean_messages), work / "clean-messages.json")),
+              ("a message of ordinary prose", scan_messages(str(prose_messages), work / "prose-messages.json")),
           ):
               if findings:
                   for finding in findings:
@@ -524,7 +576,8 @@ jobs:
 
           print(
               f"self-test: {len(SAMPLES)} rule(s) fired on a planted sample, in the added lines and in a "
-              "commit message; the allowlist kept a documented location; two clean inputs reported nothing"
+              "commit message; the allowlist kept a documented location and dropped an ordinary sentence "
+              "that carries a token of a handle's shape; two clean inputs reported nothing"
           )
           PY
 
@@ -699,3 +752,37 @@ jobs:
           print(f"gitleaks: {len(findings)} finding(s), listed above by rule and file.")
           sys.exit(1)
           PY
+
+  artifacts:
+    name: artifacts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [clippy, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the release build
+        run: bash scripts/ci.sh artifacts
+        shell: bash
+      - name: Collect the binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          for name in whirld whirl whirl-worker; do
+            for suffix in "" ".exe"; do
+              if [ -f "target/release/$name$suffix" ]; then
+                cp "target/release/$name$suffix" dist/
+              fi
+            done
+          done
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: whirl-${{ runner.os }}-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error

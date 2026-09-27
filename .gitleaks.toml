@@ -55,6 +55,11 @@ id = "agent-role-handle"
 description = "A handle of the runtime that dispatched the work: a one-letter namespace prefix, a hyphen and a lowercase word, which is the form these handles take everywhere. A review record, a document, a comment and a commit name the project and the change, never the handle of the agent that wrote them."
 regex = '''\bp-[a-z][a-z0-9]{1,11}\b'''
 
+[[rules.allowlists]]
+description = "The words an ordinary technical register puts after that prefix, where the token is prose rather than a handle: the value of a statistic, the state of a governor, and the hacking, wave, type, norm, series and adic words of the same register. A sentence or a commit message about one of those is not a reference to the machinery that ran the work, and the advice this job prints for a handle is nonsense for it: measured before this entry existed, a commit message about a test statistic failed the job. A word after the prefix that is not on this list is still judged by the shape, the self-test plants one of these sentences so that dropping the entry is a red job rather than a quiet one, and the one hit the entry can hide is a handle whose word is on the list."
+regextarget = "match"
+regexes = ['''^p-(?:adic|hacking|norms?|series|states?|types?|values?|waves?)$''']
+
 [[allowlists]]
 description = "Build output and agent worktrees are throwaway directories. Both are gitignored, so a scan of a pull request's own commits cannot see them; this entry is here so that the day one is force-added, its contents are excluded by a stated rule rather than by luck."
 paths = ['^target/', '^\.worktrees/']
