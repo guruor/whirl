@@ -5,7 +5,7 @@
     <key>Label</key><string>com.whirl.research.probeG2</string>
     <key>ProgramArguments</key>
     <array><string>/bin/sh</string><string>-c</string>
-    <string>printf 'G2 fire %s\n' "$(date +%s.%N)" >> "/Users/govind.rajpurohit/whirl-probe-g2.log"</string></array>
+    <string>printf 'G2 fire %s\n' "$(date +%s.%N)" >> "$HOME/whirl-probe-g2.log"</string></array>
     <key>StartCalendarInterval</key><dict><key>Minute</key><integer>53</integer></dict>
     <key>StandardOutPath</key><string>/tmp/whirl-probe-g2.out</string>
     <key>StandardErrorPath</key><string>/tmp/whirl-probe-g2.err</string>
