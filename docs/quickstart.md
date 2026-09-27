@@ -2,7 +2,9 @@
 
 whirl rotates your desktop wallpaper through a folder of pictures you already have: a small daemon,
 a config file, no window. Everything below was run in this order on macOS on 2026-09-27, with one
-scratch home standing in for yours.
+scratch home standing in for yours. The scratch home did not contain the three installs of section
+1: those ran unpinned and replaced this machine's own three binaries. Add `--root <dir>` (the
+paragraph under the install block) so a replayer's run does not.
 
 ## 1. Install it
 
@@ -18,8 +20,23 @@ The `cargo install` lines above need Rust on your `PATH`; if `cargo` is missing,
 <https://rustup.rs>.
 
 `development` and not `main`, which cannot set a wallpaper yet. The three binaries land in
-`$CARGO_HOME/bin` (`~/.cargo/bin`), already on your `PATH`; keep them in that one directory, because
-`whirld` looks for `whirl-worker` beside itself and not on `PATH`.
+`$CARGO_HOME/bin`, the `CARGO_HOME` your shell exported: on a stock install that is `~/.cargo/bin`
+and it is already on your `PATH`, and on this machine `CARGO_HOME` is `~/.local/share/cargo`, so they
+land in `~/.local/share/cargo/bin`. Keep the three in one directory either way, because `whirld`
+looks for `whirl-worker` beside itself and not on `PATH`.
+
+Anyone running this list on a machine that is not theirs, and any acceptance or smoke run, must add
+`--root <dir>` to all three lines: `--root` is what decides the destination, not the shell's
+environment. A `cargo` on `PATH` that is a version manager's shim can re-export `CARGO_HOME` over the
+value you exported, so `CARGO_HOME=<dir> cargo install --path …` looks isolated and is not. On macOS
+mise's shim does exactly that: a run of these three lines that exported a scratch `CARGO_HOME` still
+replaced this machine's own three binaries. The shape that holds is
+
+```sh
+cargo install --path crates/whirld --root <dir> --locked
+```
+
+which puts the binary and cargo's own metadata under `<dir>` and touches nothing else.
 
 ## 2. Point it at your pictures
 
