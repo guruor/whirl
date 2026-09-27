@@ -1,4 +1,4 @@
-// t_62920980 item 4, second probe: add the ingredient the first one missed.
+// Second probe: add the ingredient the first one missed.
 //
 // `whirld` sets SO_RCVTIMEO on every connection (IDLE_TIMEOUT=300s, and
 // STREAM_POLL=100ms on a subscribed one). A socket read with a timeout is in

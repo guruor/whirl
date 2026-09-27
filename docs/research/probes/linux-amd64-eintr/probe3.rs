@@ -1,4 +1,4 @@
-// t_62920980 item 4, third probe: name the signal.
+// Third probe: name the signal.
 //
 // The emulated guest catches one signal a native guest does not (SigCgt 0x450
 // against 0x440: bit 4, signal 5 = SIGTRAP). This runs probe2's scenario with

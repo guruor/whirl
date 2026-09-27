@@ -371,7 +371,7 @@ connection window too, but the file exists as `0700` until the `fchmod` lands, a
 connects in that interval -- a bound socket accepts as soon as `bind` returns -- reads it as `0700`.
 Measured: with the old mask and a 3 s stall inserted between the two calls, an observer of the path
 sees `0700` and then `0600`, and `whirld::control_socket`'s `the_socket_is_0600_in_a_0700_directory`
-fails with `448` against `384`; with `0o177` and the same stall it sees `0600` only (t_6c776148).
+fails with `448` against `384`; with `0o177` and the same stall it sees `0600` only (`cbefc4c`).
 The Windows pipe gets its DACL in the `CreateNamedPipe` call itself, so the equivalent interval does
 not exist there.
 
@@ -1681,7 +1681,7 @@ What that boundary does and does not buy:
 
 | Measure | Why | Basis |
 |---|---|---|
-| umask `0177` around `bind`, so the socket is created `0600` in one step, then `fchmod 0600` | measured: a socket bound without a `chmod` is `0755` at this machine's umask, so it is connectable by others between `bind` and `chmod`; `0o177` leaves no interval in which the file is anything but `0600` either | `[L 3]`, t_6c776148 |
+| umask `0177` around `bind`, so the socket is created `0600` in one step, then `fchmod 0600` | measured: a socket bound without a `chmod` is `0755` at this machine's umask, so it is connectable by others between `bind` and `chmod`; `0o177` leaves no interval in which the file is anything but `0600` either | `[L 3]`, `cbefc4c` |
 | state, cache and log directories `0700`, files `0600` | state files carry the user's wallpaper paths and rotation history | `[D 6 §1]` |
 | peer UID checked on each accepted connection (`getpeereid` on macOS, `SO_PEERCRED` on Linux; the pipe DACL on Windows) and refused otherwise | defence in depth: the mode check depends on the filesystem behaving, and the peer check does not | `decision:`, mechanism `[L 1]` shows the socket is a filesystem object |
 | stale socket unlinked only after a failed connect probe | unlinking a live daemon's socket leaves it running and unreachable, then lets a second daemon take the path | `[M 15]` |

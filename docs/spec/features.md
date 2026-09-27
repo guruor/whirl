@@ -158,14 +158,11 @@ notes, which landed after the first draft of this spec: `docs/research/macos.md`
   plain-X11 setters can address outputs individually, and Hyprland is per-monitor
   but needs a resident helper (linux.md, "The decisive column, at a glance").
 
-`evidence:` the board query this paragraph used to carry is kept as **history, not
-current state**: it ran while the cards were still in flight
-(`sqlite3 ~/.hermes/kanban/boards/whirl/kanban.db "select id,status from tasks"` and
-`git log --oneline wt/t_57b8de1e` etc. from
-`/Users/govind.rajpurohit/Workspace/Personal/whirl`) and showed `t_57b8de1e` (macOS),
-`t_a7a134e2` (Windows), `t_be6f5e61` (Linux) and `t_b9e349e6` (schedulers) as
-`running`, with no `docs/research/*.md` on any branch. All four completed and were
-merged before this revision; the notes above, not that query, are the current answer.
+`evidence:` **history, not current state**: when this paragraph was written, none of
+the four research notes was in the tree, and all four landed before this revision.
+The merges are `docs/research/macos.md` at `3e1483f`, `docs/research/windows.md` at
+`333ba3c`, `docs/research/linux.md` at `841a7c0` and `docs/research/scheduling.md` at
+`c3d161e`. The notes above, not that earlier state, are the current answer.
 
 Fallback, stated now so the spec is actionable either way:
 

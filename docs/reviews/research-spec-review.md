@@ -1,10 +1,10 @@
-# Review: the research and spec pack (review card t_09fad5a8)
+# Review: the research and spec pack
 
-Reviewer: p-amy. Reviewed set: `docs/research/macos.md` (t_57b8de1e, 80587a0+55e9b93),
-`docs/research/windows.md` (t_a7a134e2, d958b0f), `docs/research/linux.md` (t_be6f5e61,
-2ef5dfc), `docs/research/scheduling.md` (t_b9e349e6, e210a6b), `docs/spec/features.md`
-(t_58ccf6c9, 8043231), `docs/spec/state-and-cache.md` (t_4b15d270, 4987ba9), all read at
-`main` 1261786, which carries all six merges.
+Independent review, 2026-09-25. Reviewed set: `docs/research/macos.md`
+(80587a0+55e9b93), `docs/research/windows.md` (d958b0f), `docs/research/linux.md`
+(2ef5dfc), `docs/research/scheduling.md` (e210a6b), `docs/spec/features.md` (8043231),
+`docs/spec/state-and-cache.md` (4987ba9), all read at `main` `1261786`, which carries
+all six merges.
 
 Verdict: **changes required** (four defects, listed most serious first). No defect is in the
 fabricated-evidence class: every pasted output I re-ran reproduced, and every citation I opened
@@ -166,40 +166,40 @@ state-and-cache section 9; the scheduling recommendation (OS scheduler owns the 
 daemon owns the clock) is consistent with features.md F1/F9 and the hosting models in
 windows.md (per-user, interactive session) and macos.md (LaunchAgent, Aqua session).
 
-## Acceptance criteria, per card
+## Acceptance criteria, per document
 
-**t_57b8de1e (macos.md)** - every claim is a machine observation ([V1]-[V10], each with the
+**`docs/research/macos.md`** - every claim is a machine observation ([V1]-[V10], each with the
 command) or a primary source (header on this machine, Apple docs, tool source); the
 "Verified on this machine" table exists and a large subset reproduces (I re-ran [V1], [V3],
 [V4]-equivalent, [V5], [V5b], [V7] read, [V8]); unverified items are seven numbered gaps each
 with a settlement plan; the decoded plist structure is pasted, not paraphrased. Met, except
-defect 2 (V-table names probe scripts that are not committed), which sits against this card's
+defect 2 (V-table names probe scripts that are not committed), which sits against that document's
 own re-run criterion.
 
-**t_a7a134e2 (windows.md)**: central question answered explicitly with Microsoft Learn as the
+**`docs/research/windows.md`**: central question answered explicitly with Microsoft Learn as the
 primary source and maintained OSS implementations as the second source; confidence levels per
 claim; a 13-item real-Windows checklist; nothing claimed as run. Met (no Windows host exists
 here, and the doc says so), except defect 3.
 
-**t_be6f5e61 (linux.md)**: the matrix covers GNOME (Wayland/X11), KDE Plasma 6 (Wayland/X11),
+**`docs/research/linux.md`**: the matrix covers GNOME (Wayland/X11), KDE Plasma 6 (Wayland/X11),
 sway, Hyprland and generic X11; the one-shot/resident column is marked plainly; per-monitor,
 persistence, package and native-rotation columns present; confidence level per row; per-
 environment test checklists; resident-helper footprint table; v0.1 recommendation with
 deferrals. Met. Nothing was run on Linux and the doc claims nothing was.
 
-**t_b9e349e6 (scheduling.md)**: launchd claims observed on this machine with the plist and
+**`docs/research/scheduling.md`**: launchd claims observed on this machine with the plist and
 behaviour pasted (committed transcript; probe R re-run by me); the other platforms cite primary
 sources, verified verbatim; the comparison table carries a source or an explicit inference
 label on every row; the recommendation is explicit per platform with install/uninstall
 commands. Met. Nothing was left scheduled.
 
-**t_58ccf6c9 (features.md)**: every feature F0-F10 carries a cost and a v0.1 reason; the source
+**`docs/spec/features.md`**: every feature F0-F10 carries a cost and a v0.1 reason; the source
 schema is concrete (2.2/2.3 with key tables, 2.6 with the three-method interface and the
 one-line factory rule); Wallhaven endpoints named with key requirements and cited [1],
 verified live; the multi-display policy names its dependency and fallback; no resident GUI
 toolkit anywhere. Met, except defects 1 and 4.
 
-**t_4b15d270 (state-and-cache.md)**: paths and formats are per-platform and unambiguous; the
+**`docs/spec/state-and-cache.md`**: paths and formats are per-platform and unambiguous; the
 eviction rule is INV-CACHE-1/2/3, stated on configs the document itself declares legal, and
 the display-protection rule is grounded in macos.md's measured deleted-path failure; corruption
 and partial-write behaviour is specified per file including the favorites degraded mode; the

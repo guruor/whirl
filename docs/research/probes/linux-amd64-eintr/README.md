@@ -1,7 +1,7 @@
 # `linux/amd64`: the `EINTR` that closed a subscriber's connection
 
 Reproduction recipes for the two reds this document rules on, and for the ruling
-itself. They were tracked as `t_62920980`; the two tests are `control_socket`'s
+itself. The two tests are `control_socket`'s
 `a_failed_rotation_is_visible_on_both_planes` and
 `subscribe_streams_one_event_per_state_change`.
 
