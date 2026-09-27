@@ -19,7 +19,7 @@ prototype/**/wallpaper_downloads/
 # macOS
 .DS_Store
 
-# per-task worktrees, created inside this repo
+# agent worktrees, created inside this repo
 .worktrees/
 
 # editors

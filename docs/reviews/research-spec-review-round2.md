@@ -1,9 +1,9 @@
 # Review round 2: the four fixes to the research and spec pack
 
-Card t_3f247196, reviewer p-amy, 2026-09-25. Change under review: commit `0382364`
-("docs: fix the four defects from the research and spec review", card t_9fe9e5f4),
-merged to `main` as `cedf839`. Diff inspected as `git diff 9e8726d cedf839`; pre-fix
-text read from `git show 9e8726d:<path>`.
+Independent review, 2026-09-25. Change under review: commit `0382364`
+("docs: fix the four defects from the research and spec review"), merged to `main`
+as `cedf839`. Diff inspected as `git diff 9e8726d cedf839`; pre-fix text read from
+`git show 9e8726d:<path>`.
 
 **Verdict: DONE. All four defects are closed, nothing was weakened, and the pack at
 `cedf839` is fit to publish.**
@@ -42,7 +42,7 @@ The two "wait for the research" rows are closed:
 
 The board-query evidence is kept but explicitly marked "history, not current state"
 (line 160), with the note that all four cards completed and were merged. The stale
-"`card t_b9e349e6`, `running`" reference in 1.5 is gone. F7's cost cell now carries
+"`running`" reference in 1.5 is gone. F7's cost cell now carries
 the per-platform call cost. Defect 4's typo fix sits in the same file and is covered
 below.
 
@@ -77,7 +77,7 @@ built from the committed `.m` sources into `/tmp`):
   `Spaces[]` group, as in the original measurement.
 
 Wallpaper side effects, stated per the card's rules: the live image before the run
-was `/Users/govind.rajpurohit/.hermes/cache/scratch/wh-rotate/wh-cache/wh-commons-24733753.jpg`
+was the cached image `wh-commons-24733753.jpg`
 (captured independently with `wp_probe` before starting). The script wrote Mac Yellow
 then Mac Pink, then restored; the restore was verified by `wp_probe` readback twice
 (once by the script, once independently after the [V5b] runs) and the live image is
