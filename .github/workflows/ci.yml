@@ -6,13 +6,53 @@ name: ci
 # (docs/architecture.md 4.2, `backend`).
 #
 # Rule (docs/development.md, "Continuous integration"): every command a
-# contributor runs before opening a pull request appears here verbatim. If a
-# check is not in this file it is a preference, not a gate.
+# contributor runs before opening a pull request lives in `scripts/ci.sh`, which
+# is the only copy of them. Each job below calls one mode of that file, so a
+# local run and this workflow cannot drift: `bash scripts/ci.sh fmt`, `clippy`,
+# `test`, `msrv`, `guards`, `artifacts`. The one job this file still owns is
+# `secrets`: a developer cannot run gitleaks' pinned binary by hand. The one step
+# it still owns is the `guards` job's R2 dependency check: it reads a dependency
+# edge rather than running a command, and `guards` is already a mode.
+# `bash scripts/ci.sh windows` is the one check here that is not a job: it
+# compiles the #[cfg(windows)] code on a laptop, and it cannot replace
+# `test (windows-latest)`, which runs it.
+#
+# What the `secrets` job judges is every place a change publishes words, from one
+# rule set in `.gitleaks.toml`: the lines its commits add (gitleaks, the mechanism
+# already here), the messages those commits carry (gitleaks again, over a dump of
+# them, because the scanner reads added lines and nothing else), the tree the
+# checkout publishes at the head (gitleaks in `dir` mode, because the range reads
+# what a change adds and only the tree catches pre-rule text still sitting in one),
+# and the exemptions, which it prints so that one is never silent.
+#
+# The range starts after the commit the project's own rules landed at
+# (`GITLEAKS_EPOCH`, the job's env below), not at the base the event names. A
+# promotion pull request has base `main`, which is hundreds of commits behind
+# `development`, and every one of them was written before those rules existed, so
+# scanning from there judges history by a rule it never had.
+#
+# The job proves its own rules can fail as well: a step in it plants one sample of
+# every shape the rules forbid, in a commit and in a file, so a rule that stops
+# matching the real thing, or an exemption the scanner does not read, is a red job
+# rather than a green one. It plants one sentence the rules must not touch as
+# well, so a rule that starts reporting ordinary prose is red too. The resolution
+# of the range is proved the same way, on a fixture, before the scan trusts it.
+#
+# Triggers (docs/development.md section 6): `development` integrates, `main`
+# releases. So this workflow runs for a push to either branch, and for a pull
+# request whose base is either. The pull request whose base is `main` is a
+# promotion, and it runs the full matrix like any other change: the promotion is
+# the last look between `development` and the tag.
+#
+# A tag is not a trigger here. A tag runs `.github/workflows/release.yml`, which
+# is the release and needs to write to the repository; this file builds and
+# checks, and declares `contents: read` so that it cannot write.
 
 on:
   push:
-    branches: [main]
+    branches: [main, development]
   pull_request:
+    branches: [main, development]
   workflow_dispatch:
 
 concurrency:
@@ -30,11 +70,12 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain and its components
         run: rustup show
       - name: cargo fmt --all -- --check
-        run: cargo fmt --all -- --check
+        run: bash scripts/ci.sh fmt
+        shell: bash
 
   clippy:
     name: clippy (${{ matrix.os }})
@@ -44,19 +85,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain and its components
         run: rustup show
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: cargo clippy --workspace --all-targets -- -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: bash scripts/ci.sh clippy
+        shell: bash
 
   test:
     name: test (${{ matrix.os }})
@@ -66,85 +101,840 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain and its components
         run: rustup show
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install the test runner, pinned
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: cargo test --workspace
-        run: cargo test --workspace
-        env:
-          # A test that rotates must never reach a real desktop.
-          WHIRL_BACKEND: noop
+          tool: cargo-nextest@0.9.146
+      - name: the test suite, then the doctests
+        run: bash scripts/ci.sh test
+        shell: bash
 
   msrv:
     name: msrv (1.85.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.85.0 --profile minimal
-      - name: cargo +1.85.0 check --workspace --all-targets
-        run: cargo +1.85.0 check --workspace --all-targets
-      - name: cargo +1.85.0 test --workspace
-        run: cargo +1.85.0 test --workspace
-        env:
-          WHIRL_BACKEND: noop
+      - name: the declared MSRV, checked and tested
+        run: bash scripts/ci.sh msrv
+        shell: bash
 
   guards:
     name: guards (dependencies and binary size)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain
         run: rustup show
-      - name: Assert the workspace has no third-party dependencies
+      - name: no third-party dependencies, and the binary size caps
+        run: bash scripts/ci.sh guards
+        shell: bash
+      # R2 is two claims (docs/architecture.md line 1808): `whirld` does not depend
+      # on the worker's platform crate, and its binary stays under a megabyte. The
+      # second is a size cap and lives in the `guards` mode above; the first is a
+      # dependency edge in the workspace graph, so it is asserted here.
+      - name: Assert the daemon does not link the worker's platform crate
         run: |
-          cargo metadata --format-version 1 > /dev/null
           python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          # docs/architecture.md R2: "whirld does not depend on the worker's platform
+          # crate, and its binary stays under a megabyte". The size cap in
+          # `bash scripts/ci.sh guards` above measures the second half; this measures
+          # the first, so that half is checked rather than remembered. Platform code
+          # lives in whirl-worker because it is the only crate allowed to grow it
+          # (docs/development.md, "Dependencies: zero").
+          metadata = json.loads(
+              subprocess.run(
+                  ["cargo", "metadata", "--format-version", "1"],
+                  capture_output=True, text=True, check=True,
+              ).stdout
+          )
+          daemon = next(p for p in metadata["packages"] if p["name"] == "whirld")
+          normal = sorted(d["name"] for d in daemon["dependencies"] if d.get("kind") is None)
+          if normal != ["whirl-core"]:
+              sys.exit(
+                  "whirld's normal dependencies are "
+                  + ", ".join(normal)
+                  + ", not exactly whirl-core: the daemon must not link a platform backend"
+              )
+          print("whirld depends on whirl-core only, so it links no platform backend")
+          PY
+        shell: bash
+
+  secrets:
+    name: secrets (gitleaks)
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # The sha256 of gitleaks_8.30.1_linux_x64.tar.gz. It comes from the
+      # release's own gitleaks_8.30.1_checksums.txt, which is fetched too and
+      # grepped for this value, so a swapped binary and a swapped checksum file
+      # cannot both pass. No action is used for the scanner, so there is no tag
+      # to trust: the version, the URL and the digest are all pinned here.
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      # The commit the four shape rules in `.gitleaks.toml` landed at (69db553,
+      # 2026-09-27), and the boundary every scan in this job respects: history at
+      # or before it predates those rules, so reading it again judges it by a rule
+      # it never had. One named commit rather than a list of exempted shas, and
+      # the tree pass below is what keeps it honest: what the boundary skips, the
+      # tree catches if a file still carries it.
+      GITLEAKS_EPOCH: 69db553ba158121e345c774434f0bd670fe081bf
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The scan compares two commits, and the base commit is not in a
+          # shallow clone.
+          fetch-depth: 0
+      - name: Install gitleaks ${{ env.GITLEAKS_VERSION }} and verify the release digest
+        run: |
+          set -eu
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          sums="gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          curl --silent --show-error --fail --location --remote-name "$base/$tarball"
+          curl --silent --show-error --fail --location --remote-name "$base/$sums"
+          echo "$GITLEAKS_SHA256  $tarball" | sha256sum --check --strict
+          grep --fixed-strings "$GITLEAKS_SHA256  $tarball" "$sums" > /dev/null
+          tar --extract --gzip --file "$tarball" gitleaks
+          ./gitleaks version
+      - name: Print the allowlist, so an exemption is never silent
+        run: |
+          python3 - <<'PY'
+          import sys
+          import tomllib
+
+          # The fields gitleaks 8.30.1 reads on an allowlist entry. It ignores a
+          # field it does not know, so a typo here would be a silent exemption.
+          FIELDS = {
+              "description",
+              "condition",
+              "commits",
+              "paths",
+              "regexes",
+              "regextarget",
+              "stopwords",
+              "targetrules",
+          }
+
+          with open(".gitleaks.toml", "rb") as handle:
+              config = tomllib.load(handle)
+
+          entries = []
+          if "allowlist" in config:
+              entries.append(("[allowlist]", config["allowlist"]))
+          for index, entry in enumerate(config.get("allowlists", []), start=1):
+              entries.append((f"[[allowlists]] #{index}", entry))
+          for rule in config.get("rules", []):
+              if "allowlist" in rule:
+                  entries.append((f"rules.{rule.get('id', '?')}.allowlist", rule["allowlist"]))
+              for index, entry in enumerate(rule.get("allowlists", []), start=1):
+                  entries.append((f"rules.{rule.get('id', '?')}.allowlists #{index}", entry))
+
+          if not entries:
+              print("gitleaks allowlist: empty. Nothing is exempt from the shipped rules.")
+              sys.exit(0)
+
+          print(f"gitleaks allowlist: {len(entries)} exemption(s), each one a claim that a hit is not a secret:")
+          failed = False
+          for where, entry in entries:
+              if not isinstance(entry, dict):
+                  print(f"\n  {where}\n    not a table: {entry!r}")
+                  failed = True
+                  continue
+              reason = entry.get("description", "")
+              print(f"\n  {where}")
+              print(f"    reason: {reason or '(none written)'}")
+              for name in sorted(entry, key=str.lower):
+                  if name.lower() != "description":
+                      print(f"    {name}: {entry[name]}")
+              unknown = sorted(set(entry) - FIELDS)
+              if unknown:
+                  print(
+                      f"    unknown field(s) {unknown}: gitleaks ignores them, so this entry "
+                      "is not doing what it looks like it does"
+                  )
+                  failed = True
+              if not reason:
+                  failed = True
+          if failed:
+              sys.exit(
+                  "every allowlist entry needs a `description` saying why the hit is not a "
+                  "secret, and only the fields gitleaks reads"
+              )
+          print(f"\ngitleaks allowlist: {len(entries)} exemption(s), all with a reason.")
+          PY
+      - name: Prove the rules can fire, before a clean report is trusted
+        run: |
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Prove the .gitleaks.toml rules fire, before a clean report is trusted.
+
+          The `secrets` job runs this as a step, from a checkout that has the pinned
+          `gitleaks` binary next to it, which is why the check lives in the workflow and
+          not in scripts/ci.sh: a contributor cannot run that binary by hand. It also runs
+          on its own:
+
+              python3 gitleaks-selftest.py [repo-dir] [gitleaks-binary]
+
+          The fixture is a throwaway repository in the runner's temp directory. Nothing is
+          written inside the checkout, so the tree the real scan reads stays clean.
+          """
+
+          import json
+          import os
+          import pathlib
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import tomllib
+
+          repo = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+          gitleaks = pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else "./gitleaks").resolve()
+          config = repo / ".gitleaks.toml"
+
+          # One sample per rule, as two parts joined at run time. The samples are synthetic:
+          # a fake marker, a directory that does not exist, a handle nobody has. They are
+          # also split rather than written whole because this file is inside the range the
+          # scanner reads, and a self-test that trips its own rule would fail every pull
+          # request that adds it.
+          SAMPLES = {
+              "internal-work-item-reference": ("t_", "0badc0de"),
+              "private-home-directory-path": ("~/", ".fixture-state/run"),
+              "named-worktree-path": (".worktrees/", "fixture-checkout/file.txt"),
+              "agent-role-handle": ("p-", "fixture"),
+          }
+
+          # A path the allowlist is supposed to keep working: a location this project's own
+          # documentation cites, so it must not fail a scan. The sample has to match the
+          # rule, or this would pass on a rule that is simply dead, and an allowlist entry
+          # gitleaks does not read would let a documented path fail every pull request.
+          ALLOWED = ("private-home-directory-path", ("~/", ".config/whirl/config.json"))
+
+          # The other direction of one of those rules: an ordinary sentence from a
+          # technical register, carrying a token of the handle's shape that is prose
+          # rather than a handle, which the rule's allowlist has to drop. Measured
+          # before that entry existed: a commit message about a test statistic failed
+          # the job, and the advice the failure printed was nonsense for it. Built from
+          # parts for the same reason the samples are.
+          PROSE_RULE = "agent-role-handle"
+          PROSE_TOKENS = [("p-", "value"), ("p-", "state")]
+          PROSE = (
+              "the "
+              + "".join(PROSE_TOKENS[0])
+              + " of the test was 0.04, and the "
+              + "".join(PROSE_TOKENS[1])
+              + " changed with the load"
+          )
+
+          problems = []
+          notes = []
+
+
+          def fail(message):
+              problems.append(message)
+
+
+          def run(command, cwd, check=True):
+              completed = subprocess.run(
+                  command, cwd=cwd, capture_output=True, text=True, env=GIT_ENV
+              )
+              if check and completed.returncode != 0:
+                  fail(
+                      f"{' '.join(map(str, command))} exited {completed.returncode} in {cwd}: "
+                      f"{(completed.stderr or completed.stdout).strip()[:600]}"
+                  )
+              return completed
+
+
+          # Colour forced on (`color.ui = always`) makes gitleaks read no commits at all: it
+          # prints `0 commits scanned`, `no leaks found` and exits 0. The scan step pins the
+          # two keys off for the same reason, and a fixture on a machine with that config
+          # would otherwise pass this self-test while checking nothing.
+          GIT_ENV = dict(os.environ)
+          GIT_ENV.update(
+              {
+                  "GIT_CONFIG_COUNT": "2",
+                  "GIT_CONFIG_KEY_0": "color.ui",
+                  "GIT_CONFIG_VALUE_0": "false",
+                  "GIT_CONFIG_KEY_1": "color.diff",
+                  "GIT_CONFIG_VALUE_1": "false",
+              }
+          )
+
+          # --- the config and the samples must describe the same rule set ---------------
+
+          with config.open("rb") as handle:
+              parsed = tomllib.load(handle)
+
+          rules = {rule["id"]: rule for rule in parsed.get("rules", [])}
+          if not rules:
+              fail("the config defines no rules, so there is nothing to prove")
+          for rule_id in sorted(set(rules) - set(SAMPLES)):
+              fail(f"rule {rule_id} has no planted sample, so nothing here shows it fires")
+          for rule_id in sorted(set(SAMPLES) - set(rules)):
+              fail(f"a sample is planted for {rule_id}, a rule this config does not define")
+
+          matchers = {}
+          for rule_id, rule in rules.items():
+              try:
+                  matchers[rule_id] = re.compile(rule["regex"])
+              except (KeyError, re.error) as error:
+                  fail(f"rule {rule_id} has no usable `regex`: {error}")
+          for rule_id, parts in SAMPLES.items():
+              sample = "".join(parts)
+              matcher = matchers.get(rule_id)
+              if matcher is not None and not matcher.search(sample):
+                  fail(f"the planted sample for {rule_id} does not match that rule's regex")
+          allowed_rule, allowed_parts = ALLOWED
+          allowed_sample = "".join(allowed_parts)
+          if allowed_rule not in matchers:
+              fail(f"the allowlist sample names {allowed_rule}, which is not a rule")
+          elif not matchers[allowed_rule].search(allowed_sample):
+              fail(f"the allowlist sample {allowed_sample} does not match {allowed_rule}, so it proves nothing")
+          if PROSE_RULE not in matchers:
+              fail(f"the prose fixture names {PROSE_RULE}, which is not a rule")
+          else:
+              for parts in PROSE_TOKENS:
+                  token = "".join(parts)
+                  if not matchers[PROSE_RULE].search(token):
+                      fail(
+                          f"the prose token {token} does not match {PROSE_RULE}, so the fixture "
+                          "proves nothing about the words that rule's allowlist exempts"
+                      )
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              print("self-test: the planted samples and the rules do not line up")
+              sys.exit(1)
+
+          # --- a fixture repository: one commit per case -------------------------------
+
+          work = pathlib.Path(tempfile.mkdtemp(prefix="vocabulary-selftest-"))
+          fixture = work / "fixture"
+          fixture.mkdir()
+          run(["git", "init", "--quiet", "--initial-branch=main"], cwd=fixture)
+          run(["git", "config", "user.name", "self-test"], cwd=fixture)
+          run(["git", "config", "user.email", "self-test@example.invalid"], cwd=fixture)
+
+
+          def head():
+              return run(["git", "rev-parse", "HEAD"], cwd=fixture).stdout.strip()
+
+
+          def commit(message):
+              run(["git", "add", "--all"], cwd=fixture)
+              run(["git", "commit", "--quiet", "--message", message], cwd=fixture)
+              return head()
+
+
+          (fixture / "clean.txt").write_text("a line with no reference in it\n")
+          clean_base = commit("a clean start")
+
+          # The samples as file content, one per line, labelled.
+          (fixture / "planted.txt").write_text(
+              "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in SAMPLES.items())
+          )
+          # The samples as a commit message as well: a subject and a body. The message half
+          # of the check reads `git log --format='%s%n%n%b'`, so the fixture's subject
+          # carries one sample and its body the rest.
+          body = "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in list(SAMPLES.items()))
+          planted_head = commit(f"lines and a handle {''.join(SAMPLES['agent-role-handle'])}\n\n{body}")
+
+          # The documented location on its own, which must pass.
+          (fixture / "allowed.txt").write_text(allowed_sample + "\n")
+          allowed_head = commit("a location this project documents")
+
+          # An ordinary sentence, as file content and as the message of the same
+          # commit: the message is half the check, and that is where the false
+          # positive was measured.
+          (fixture / "allowed.txt").unlink()
+          (fixture / "prose.txt").write_text(PROSE + "\n")
+          prose_head = commit(PROSE)
+
+          # And a commit with nothing planted at all.
+          (fixture / "planted.txt").unlink()
+          (fixture / "prose.txt").unlink()
+          (fixture / "clean.txt").write_text("a line with no reference in it\na second one\n")
+          clean_head = commit("clean again")
+
+          print(f"fixture: {fixture}")
+          print(f"  {clean_base[:7]} clean start, {planted_head[:7]} planted, {allowed_head[:7]} documented, {prose_head[:7]} prose, {clean_head[:7]} clean again")
+
+          # The tree pass scans a directory of files rather than a range of commits, so
+          # its fixture is a directory of its own: the samples as file content, and the
+          # location the allowlist exempts beside them. It cannot be the fixture
+          # repository's working tree, which is a checkout at one commit and not the
+          # plain directory the job scans.
+          tree = work / "tree"
+          tree.mkdir()
+          (tree / "planted.txt").write_text(
+              "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in SAMPLES.items())
+          )
+          (tree / "allowed.txt").write_text(allowed_sample + "\n")
+          print(f"tree:    {tree}")
+
+
+          def rule_ids(report):
+              with report.open() as handle:
+                  findings = json.load(handle)
+              return findings
+
+
+          def scan_range(base, head_sha, report):
+              completed = run(
+                  [
+                      gitleaks, "git", "--no-banner", "--redact", "--config", config,
+                      "--log-opts", f"{base}..{head_sha}",
+                      "--report-format", "json", "--report-path", report, "--exit-code", "0",
+                  ],
+                  cwd=fixture,
+              )
+              print(f"    scanner said: {' '.join(completed.stderr.split())}")
+              return rule_ids(report)
+
+
+          # `gitleaks dir` reads a directory of files. The job uses that mode twice, for
+          # the dump of commit messages and for the tree pass, and it is the same scan
+          # both times, so it is this one function.
+          def scan_dir(directory, report):
+              completed = run(
+                  [
+                      gitleaks, "dir", "--no-banner", "--redact", "--config", config,
+                      "--report-format", "json", "--report-path", report, "--exit-code", "0",
+                      directory,
+                  ],
+                  cwd=fixture,
+              )
+              print(f"    scanner said: {' '.join(completed.stderr.split())}")
+              return rule_ids(report)
+
+
+          # The messages of one commit, read the way the job reads them: one file per
+          # commit, named by the commit, so a finding names the commit it came from.
+          def dump_message(message_dir, sha):
+              message_dir.mkdir(parents=True, exist_ok=True)
+              text = run(
+                  ["git", "log", "-1", "--format=%s%n%n%b", sha], cwd=fixture
+              ).stdout
+              if not text.strip():
+                  fail(f"the fixture's commit {sha[:7]} has no message, so the message check proves nothing")
+              (message_dir / f"{sha}.txt").write_text(text)
+
+
+          messages = work / "messages"
+          clean_messages = work / "clean-messages"
+          prose_messages = work / "prose-messages"
+          dump_message(messages, planted_head)
+          dump_message(clean_messages, clean_head)
+          dump_message(prose_messages, prose_head)
+
+          # --- what the check must catch, and what it must not -------------------------
+
+          planted_lines = scan_range(clean_base, planted_head, work / "lines.json")
+          reported = {finding["RuleID"] for finding in planted_lines}
+          for rule_id in sorted(SAMPLES):
+              if rule_id in reported:
+                  print(f"  {rule_id}: fired on its sample in the added lines")
+              else:
+                  fail(f"{rule_id} did not fire on its sample in the added lines")
+          for rule_id in sorted(reported - set(SAMPLES)):
+              notes.append(f"{rule_id} also fired in the fixture; it is not one of the rules under test")
+
+          planted_messages = scan_dir(str(messages), work / "messages.json")
+          reported = {finding["RuleID"] for finding in planted_messages}
+          for rule_id in sorted(SAMPLES):
+              if rule_id in reported:
+                  print(f"  {rule_id}: fired on its sample in a commit message")
+              else:
+                  fail(f"{rule_id} did not fire on its sample in a commit message")
+          for rule_id in sorted(reported - set(SAMPLES)):
+              notes.append(f"{rule_id} also fired on the message fixture; it is not one of the rules under test")
+
+          # The tree pass, which is the same directory mode over a plain directory of
+          # files. Every sample has to fire there too, or the pass that makes the range's
+          # boundary honest would be the one nothing shows can fail.
+          planted_tree = scan_dir(str(tree), work / "tree.json")
+          reported = {finding["RuleID"] for finding in planted_tree}
+          for rule_id in sorted(SAMPLES):
+              if rule_id in reported:
+                  print(f"  {rule_id}: fired on its sample in a file, in the tree pass")
+              else:
+                  fail(f"{rule_id} did not fire on its sample in a file, so the tree pass does not catch it")
+          for rule_id in sorted(reported - set(SAMPLES)):
+              notes.append(f"{rule_id} also fired on the tree fixture; it is not one of the rules under test")
+          # And the exemption has to keep working in that mode as well, or a path this
+          # project documents on purpose would fail every run of the tree pass.
+          documented_tree = [
+              finding for finding in planted_tree if finding["File"].endswith("allowed.txt")
+          ]
+          if documented_tree:
+              for finding in documented_tree:
+                  fail(
+                      f"the documented location {allowed_sample} was reported by {finding['RuleID']} "
+                      "in the tree pass, so the allowlist is not doing its job there"
+                  )
+          else:
+              print(f"  {allowed_rule}: dropped {allowed_sample} in the tree pass as well")
+
+          documented = scan_range(planted_head, allowed_head, work / "allowed.json")
+          if documented:
+              for finding in documented:
+                  fail(
+                      f"the documented location {allowed_sample} was reported by {finding['RuleID']} "
+                      "in " + finding["File"] + f":{finding['StartLine']}, so the allowlist is not doing its job"
+                  )
+          else:
+              print(f"  {allowed_rule}: dropped {allowed_sample}, which the allowlist exempts")
+
+          prose = scan_range(allowed_head, prose_head, work / "prose.json")
+          if prose:
+              for finding in prose:
+                  fail(
+                      f"an ordinary sentence ({PROSE}) was reported by {finding['RuleID']} in "
+                      + finding["File"] + f":{finding['StartLine']}, so that rule fires on prose "
+                      f"rather than on a handle"
+                  )
+          else:
+              print(
+                  f"  {PROSE_RULE}: dropped an ordinary sentence about a test statistic and a "
+                  "governor, which that rule's allowlist exempts"
+              )
+
+          for label, findings in (
+              ("a commit with nothing planted", scan_range(prose_head, clean_head, work / "clean.json")),
+              ("a message with nothing planted", scan_dir(str(clean_messages), work / "clean-messages.json")),
+              ("a message of ordinary prose", scan_dir(str(prose_messages), work / "prose-messages.json")),
+          ):
+              if findings:
+                  for finding in findings:
+                      fail(f"{label} was reported by {finding['RuleID']} in {finding['File']}:{finding['StartLine']}")
+              else:
+                  print(f"  {label}: reported nothing")
+
+          for note in notes:
+              print(f"::warning::{note}")
+
+          shutil.rmtree(work, ignore_errors=True)
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              print(f"self-test: {len(problems)} problem(s), listed above")
+              sys.exit(1)
+
+          print(
+              f"self-test: {len(SAMPLES)} rule(s) fired on a planted sample, in the added lines, in a "
+              "commit message and in a file; the allowlist kept a documented location and dropped an "
+              "ordinary sentence that carries a token of a handle's shape; two clean inputs reported "
+              "nothing"
+          )
+          PY
+
+      - name: Resolve the range against the epoch the rules landed at, and prove the resolution
+        env:
+          # Event payload values reach the shell as environment variables, not as
+          # text spliced into the script, and the script validates them as hex.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSHED_FROM: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+
+          # The commit the scan starts after, given the base the event names and the
+          # epoch the rules landed at (`GITLEAKS_EPOCH`, the job's env above). The
+          # base is used as given when it is at or after the epoch, and replaced by
+          # the epoch when it is an ancestor of the epoch and the epoch is an
+          # ancestor of the head: a promotion pull request names `main`'s tip, which
+          # is behind every rule in `.gitleaks.toml`, so scanning from there
+          # re-judges history those rules postdate (measured on this repository: 60
+          # findings of one of them across 24 commits, every commit older than the
+          # epoch). A branch that never met the epoch keeps the range it had,
+          # because the epoch is not in it.
+          #
+          # $1: the base the event named. $2: the head. $3: the epoch.
+          resolve_base() {
+            local base="$1" head="$2" epoch="$3"
+            if [ -n "$base" ] && [ "$base" != "$epoch" ] &&
+               git merge-base --is-ancestor "$base" "$epoch" 2>/dev/null &&
+               git merge-base --is-ancestor "$epoch" "$head" 2>/dev/null; then
+              printf '%s\n' "$epoch"
+              return 0
+            fi
+            printf '%s\n' "$base"
+          }
+
+          # The resolution is proved here, before the scan below trusts it. A
+          # boundary that quietly swallowed the range would make this job red by
+          # reading nothing, and a hard-coded sha is exactly the value that goes
+          # stale or gets mistyped, so the cases are exercised on a throwaway
+          # repository in the runner's temp directory rather than reasoned about.
+          epoch="${GITLEAKS_EPOCH:?the job env does not name the epoch the rules landed at}"
+          work=$(mktemp -d)
+          fixture="$work/fixture"
+          git init --quiet --initial-branch=main "$fixture"
+          git -C "$fixture" config user.name self-test
+          git -C "$fixture" config user.email self-test@example.invalid
+          commit() {
+            git -C "$fixture" commit --quiet --allow-empty --message "$1"
+            git -C "$fixture" rev-parse HEAD
+          }
+          before=$(commit "history the rules postdate")
+          landed=$(commit "the rules land")
+          after=$(commit "after the rules")
+          later=$(commit "later still")
+          git -C "$fixture" switch --quiet --create elsewhere "$before"
+          elsewhere=$(commit "a line that never met the rules")
+
+          failed=0
+          expect() {
+            # $1: the case, in words. $2: the commit the scan must start after.
+            # $3: the base the event named. $4: the head. The resolver reads the
+            # repository it runs in, which is the checkout in the real call, so the
+            # fixture is entered rather than pointed at with `git -C`.
+            local got
+            got=$(cd "$fixture" && resolve_base "$3" "$4" "$landed")
+            if [ "$got" != "$2" ]; then
+              echo "::error::$1: resolve_base($3, $4) printed ${got}, and the answer is $2"
+              failed=1
+            else
+              printf '  %s: %s -> %s\n' "$1" "$3" "${got:0:7}"
+            fi
+          }
+          expect "a base before the epoch starts at the epoch" "$landed" "$before" "$later"
+          expect "a base at the epoch is used as given" "$landed" "$landed" "$later"
+          expect "a base after the epoch is used as given" "$after" "$after" "$later"
+          expect "a base whose range the epoch is not in is used" "$before" "$before" "$elsewhere"
+          if [ "$failed" -ne 0 ]; then
+            echo "self-test: the epoch resolution does not do what this job says it does"
+            exit 1
+          fi
+          rm -rf "$work"
+
+          # A pull request carries its base; a push carries the tip it was pushed
+          # from. Either way the range is what this change adds.
+          event_base="${BASE_SHA:-}"
+          [ -n "$event_base" ] || event_base="${PUSHED_FROM:-}"
+          case "$event_base" in
+            "" | 0000000000000000000000000000000000000000 | *[!0-9a-f]*)
+              event_base=""
+              echo "::notice::the event carried no usable base commit; falling back to the head's parent"
+              ;;
+          esac
+          if [ -z "$event_base" ] || ! git cat-file -e "${event_base}^{commit}" 2>/dev/null; then
+            event_base=$(git rev-parse --verify --quiet "${HEAD_SHA:-HEAD}^" || true)
+          fi
+          if [ -z "$event_base" ]; then
+            echo "::error::no commit to compare against, so the scan cannot be scoped to this change. Run this job by hand from a branch that has history."
+            exit 1
+          fi
+
+          base=$(resolve_base "$event_base" "${HEAD_SHA:-HEAD}" "$epoch")
+
+          # Printed the way the allowlist above is printed: a range a reader cannot
+          # see is a rule nobody can check.
+          echo "gitleaks epoch: ${epoch}, the commit the four shape rules in .gitleaks.toml landed at"
+          if [ "$base" = "$event_base" ]; then
+            echo "gitleaks range: ${event_base}..${HEAD_SHA}, the base the event named"
+          else
+            echo "gitleaks range: ${base}..${HEAD_SHA}, resolved from the event base ${event_base}, which is an ancestor of the epoch"
+          fi
+
+          # The next steps scan this range and read its messages, and a second copy
+          # of the resolution would be a second answer to the same question. The
+          # `GITHUB_ENV` file is how a step passes a value to the steps after it.
+          echo "SCAN_BASE=$base" >> "$GITHUB_ENV"
+
+      - name: Scan the commits this change adds, and name what they leak
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+
+          if [ -z "${SCAN_BASE:-}" ]; then
+            echo "::error::no range reached this step, so nothing would have been scanned: the step above resolves it."
+            exit 1
+          fi
+
+          # A colour-forcing git config (color.ui or color.diff set to `always`)
+          # makes `git log -p` emit ANSI escapes, which gitleaks' patch parser
+          # cannot read: it then prints `0 commits scanned`, `no leaks found` and
+          # exits 0. Reproduced on a developer machine, so pin both keys off for
+          # the child `git log` (GIT_CONFIG_* is `git -c` through the
+          # environment).
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false
+          export GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false
+
+          # The reports and the log live in the runner's temp directory rather than
+          # in the checkout, so that the tree pass after this one reads the tree
+          # this change publishes and not this job's own scratch.
+          echo "scanning ${SCAN_BASE}..${HEAD_SHA}"
+          status=0
+          ./gitleaks git --no-banner --redact --verbose --config .gitleaks.toml \
+            --log-opts="${SCAN_BASE}..${HEAD_SHA}" \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-report.json" \
+            --exit-code 0 2>&1 | tee "$RUNNER_TEMP/gitleaks.log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::gitleaks exited $status, so the scan did not complete and a clean report would mean nothing."
+            exit "$status"
+          fi
+          # A scan that read no commits exits 0 and finds nothing. Green there is
+          # green because nothing was checked. Read the count as a count: the
+          # substring `0 commits scanned` is also a substring of `10 commits
+          # scanned`, so require a leading non-zero digit instead. A log with no
+          # count line at all fails too, which is the direction that matters.
+          if ! grep --extended-regexp --quiet '[1-9][0-9]* commits scanned' "$RUNNER_TEMP/gitleaks.log"; then
+            echo "::error::the scan read no commits, so this job checked nothing: check the range above, the checkout depth, and the git colour settings."
+            exit 1
+          fi
+      - name: Scan the tree this checkout publishes, which the epoch cannot excuse
+        run: |
+          set -eu
+
+          # The range above covers what this change adds; this covers what it
+          # publishes. A promotion re-reads nothing behind the epoch, so a value
+          # those commits added and a file still carries is caught here rather than
+          # excused there. `gitleaks dir` reads the files in the directory it is
+          # given and skips `.git`, and the reports above are outside the checkout,
+          # so what it reads is the tree at the head.
+          status=0
+          ./gitleaks dir --no-banner --redact --verbose --config .gitleaks.toml \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-tree-report.json" \
+            --exit-code 0 . 2>&1 | tee "$RUNNER_TEMP/gitleaks-tree.log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::gitleaks exited $status, so the tree scan did not complete and a clean report would mean nothing."
+            exit "$status"
+          fi
+          # The same trap as the commit count above, in bytes: a scan that read no
+          # bytes exits 0 and finds nothing, so read that count as a number too.
+          if ! grep --extended-regexp --quiet 'scanned ~[1-9][0-9]* bytes' "$RUNNER_TEMP/gitleaks-tree.log"; then
+            echo "::error::the tree scan read no bytes, so this job checked nothing: check the directory it scanned."
+            exit 1
+          fi
+      - name: Read the messages of those commits, with the same rules
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+
+          # gitleaks reads the lines a commit adds and nothing else: a subject, a
+          # body and a file name are invisible to it, which the self-test above
+          # shows on a fixture rather than assuming. The largest measured leak in
+          # this repository is exactly there, so the messages of the same range go
+          # through the same rules: one file per commit, named by the commit, in a
+          # directory outside the checkout, and the scanner in `dir` mode over it.
+          # A finding then names the commit it came from.
+          # The messages come from the commits themselves rather than from the
+          # event payload, so no text an author wrote reaches this script as
+          # code: each message is written to a file, never passed as an argument.
+          if [ -z "${SCAN_BASE:-}" ]; then
+            echo "::error::no base commit reached this step, so the messages cannot be scoped to this change."
+            exit 1
+          fi
+
+          messages="${RUNNER_TEMP:?}/vocabulary-messages"
+          rm -rf "$messages"
+          mkdir -p "$messages"
+          for sha in $(git log --format=%H "${SCAN_BASE}..${HEAD_SHA}"); do
+            git log -1 --format='%s%n%n%b' "$sha" > "$messages/$sha.txt"
+          done
+          commits=$(ls -1 "$messages" | wc -l | tr -d ' ')
+          if [ "$commits" -eq 0 ]; then
+            echo "::error::the range ${SCAN_BASE}..${HEAD_SHA} carried no commits, so this check read nothing."
+            exit 1
+          fi
+          echo "reading the messages of $commits commit(s)"
+
+          ./gitleaks dir --no-banner --redact --config .gitleaks.toml \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-messages-report.json" \
+            --exit-code 0 "$messages"
+
+      - name: Fail on a finding, naming the rule and the file
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
           import re
           import sys
+          import tomllib
 
-          ours = {"whirl-core", "whirld", "whirl-worker", "whirl-cli"}
-          names = re.findall(r'^name = "([^"]+)"', open("Cargo.lock").read(), re.M)
-          extra = sorted(set(names) - ours)
-          if extra:
-              sys.exit("third-party dependencies appeared: " + ", ".join(extra))
-          print(f"Cargo.lock holds {len(names)} entries, all ours: {sorted(set(names))}")
-          PY
-      - name: Build the release binaries
-        run: cargo build --workspace --release
-      - name: Assert the binary size caps
-        run: |
-          python3 - <<'PY'
-          import os
-          import sys
+          # Three reports, one verdict: the added lines of this change, the messages
+          # of the same commits, and the tree the checkout publishes at the head. A
+          # finding is either a credential or a reference to the machinery that
+          # produced the change, and the two need different advice. The rules this
+          # repository writes about itself are the ones in `.gitleaks.toml`; every
+          # other rule id belongs to the scanner's own set, which is about secrets.
+          # The reports are written outside the checkout, which is what lets the
+          # tree scan read the tree instead of this job's own scratch.
+          with open(".gitleaks.toml", "rb") as handle:
+              own = {rule["id"] for rule in tomllib.load(handle).get("rules", [])}
 
-          # docs/architecture.md R2: the daemon stays under a megabyte and never
-          # links a platform backend. Caps are in MiB.
-          caps = {"whirld": 1.0, "whirl": 2.0, "whirl-worker": 12.0}
-          suffixes = ["", ".exe"]
-          failed = []
-          for name, cap in caps.items():
-              path = next(
-                  (f"target/release/{name}{s}" for s in suffixes
-                   if os.path.exists(f"target/release/{name}{s}")), None,
+          scanned = (
+              ("gitleaks-report.json", "the commits this change adds"),
+              ("gitleaks-messages-report.json", "the messages of those commits"),
+              ("gitleaks-tree-report.json", "the tree this checkout publishes"),
+          )
+          reports = pathlib.Path(os.environ["RUNNER_TEMP"])
+          findings = []
+          for name, where in scanned:
+              path = reports / name
+              if not path.exists():
+                  print(f"::error::{name} is missing, so this change was not checked by it.")
+                  sys.exit(1)
+              with path.open() as handle:
+                  for finding in json.load(handle):
+                      findings.append((where, finding))
+
+          if not findings:
+              print("gitleaks: no findings in the lines, the messages or the tree this change adds")
+              sys.exit(0)
+
+          for scanned_by, finding in findings:
+              file = finding.get("File") or "(unknown file)"
+              line = finding.get("StartLine") or 0
+              rule = finding.get("RuleID") or "(unknown rule)"
+              commit = (finding.get("Commit") or "")[:12]
+              # The message dump is one file per commit, named by the commit, and a
+              # finding in it has no file in the checkout to point at.
+              in_message = not commit and bool(
+                  re.fullmatch(r"[0-9a-f]{40}\.txt", pathlib.Path(file).name)
               )
-              if path is None:
-                  failed.append(f"{name}: no release binary")
-                  continue
-              size = os.path.getsize(path) / (1024 * 1024)
-              print(f"{name}: {size:.2f} MiB (cap {cap:.2f} MiB)")
-              if size > cap:
-                  failed.append(f"{name}: {size:.2f} MiB over the {cap:.2f} MiB cap")
-          if failed:
-              sys.exit("; ".join(failed))
+              if in_message:
+                  commit = pathlib.Path(file).name[:12]
+                  header = f"::error::gitleaks rule {rule} matched the message of commit {commit}"
+              else:
+                  where = f"commit {commit}" if commit else scanned_by
+                  header = (
+                      f"::error file={file},line={line}::gitleaks rule {rule} matched "
+                      f"{file}:{line} in {where}"
+                  )
+              if rule in own:
+                  advice = (
+                      "A reference to the machinery that produced the change does not belong in "
+                      "a public artifact: cite the commit, the pull request or the measurement "
+                      "instead, and if the location is one this project documents on purpose, add "
+                      "it to that rule's allowlist with a reason."
+                  )
+              else:
+                  advice = (
+                      "A credential in the history is a credential in every clone: rotate it, "
+                      "then remove it with an exemption only if it is not a secret."
+                  )
+              print(f"{header}. {advice}")
+          print(f"gitleaks: {len(findings)} finding(s), listed above by rule and file.")
+          sys.exit(1)
           PY
 
   artifacts:
@@ -156,19 +946,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: cargo build --workspace --release
-        run: cargo build --workspace --release
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the release build
+        run: bash scripts/ci.sh artifacts
+        shell: bash
       - name: Collect the binaries
         shell: bash
         run: |
@@ -181,7 +965,7 @@ jobs:
             done
           done
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: whirl-${{ runner.os }}-${{ github.sha }}
           path: dist/

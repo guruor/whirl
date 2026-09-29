@@ -8,15 +8,15 @@ run a rotation without touching your own wallpaper.
 ## Before you open a pull request
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-WHIRL_BACKEND=noop cargo test --workspace
-cargo build --workspace --release
+./scripts/ci.sh all
 ```
 
-These are exactly the commands CI runs. If a check is not in
-`.github/workflows/ci.yml`, it is a preference rather than a gate, so adding a
-check means adding it in both places in the same pull request.
+That is one script whose modes are the commands CI's jobs run: `fmt`, `clippy`,
+`test`, `msrv`, `guards` and `artifacts`, plus the container modes and `windows`.
+`docs/development.md` section 3 is the full picture, including what `all` leaves
+unproven. If a check is not a mode of that script it is a preference rather than a
+gate: adding one means adding the mode and the job that calls it, in the same pull
+request (`secrets` is the one job with no mode, and section 4 says why).
 
 Put the commands you ran and what you observed in the pull request body. "Tests
 pass" without the output is not evidence, and a reviewer who cannot reproduce your
@@ -39,7 +39,12 @@ result will send it back.
   `WHIRL_BACKEND=noop`, or `--backend noop`.
 - **Never commit a credential.** Not a key, not a token, not a `.env`, not an
   `auth.json`. The config stores credentials by reference to the platform's own
-  store (`docs/architecture.md` 6.3). No test may require a real key.
+  store (`docs/architecture.md` 6.3). No test may require a real key, and
+  `gitleaks git --config .gitleaks.toml --redact --log-opts="$(git merge-base
+  origin/main HEAD)..HEAD"` reproduces the `secrets` job locally (docs/development.md
+  section 6 has the details, including the one git setting that makes the scan read
+  nothing). An exemption in `.gitleaks.toml` needs a written reason and is printed
+  on every CI run.
 - **A decision change gets an ADR first.** `docs/decisions/NNNN-title.md` from
   `docs/decisions/0000-template.md`. When it is required is in
   `docs/development.md` section 6; when in doubt, write two paragraphs and be
@@ -47,9 +52,29 @@ result will send it back.
 
 ## Branches, commits, scope
 
-- One branch per change, from `main`, named `<area>/<short-topic>`, for example
+- **`development` integrates, `main` releases, a working branch is short-lived.**
+  Cut your branch from `development` and open the pull request with
+  `gh pr create --base development`. `main` only ever receives a promotion pull
+  request from `development`, after `development` is green and the
+  release-blocking checklists have been run on real hardware
+  (`docs/development.md` section 5).
+- **Nothing reaches `main` twice.** Anything that lands there, a promotion or a
+  later hotfix, is merged straight back into `development`, so `main`'s tip stays
+  an ancestor of `development`: the next working branch catches up without rebasing
+  under a reviewer, and a promotion is a straight merge with nothing to reconcile
+  (section 6 of the guide has the commands and the reason).
+- **A tag on `main` is a release.** `.github/workflows/release.yml` publishes it,
+  notes and artifacts included, and it refuses a final release whose notes are
+  missing, unfilled or incomplete. To rehearse that, use a prerelease tag
+  (`vX.Y.Z-rc.N`), which the workflow marks as a prerelease; a tag shaped like a
+  real release is not a rehearsal, and deleting it afterwards leaves a release in
+  every clone that fetched it.
+- **Branch protection does the remembering:** `main` requires a pull request and
+  passing checks, `development` requires passing checks. That is the expectation
+  these documents describe; the repository owner applies the settings.
+- One branch per change, named `<area>/<short-topic>`, for example
   `daemon/stale-socket-probe` or `worker/wallhaven-pagination`. Delete it after
-  it merges.
+  it merges, and never reuse it.
 - One change per pull request. A formatting sweep and a behaviour change are two
   pull requests.
 - Commit subject in the imperative, 72 characters or fewer, area prefix when it

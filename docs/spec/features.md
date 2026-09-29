@@ -57,6 +57,7 @@ not produce both went to Part 3 instead.
 | `whirl config path` / `whirl config check` | Print the config path; validate and print the effective plan (which sources load, which filters apply). `check` runs in the worker, so a bad source is caught before it costs a rotation. |
 | `whirl idle` | Block until state changes. For frontends, so none of them polls. |
 | `whirl version` | Daemon version and protocol version. |
+| `whirl ping` | Is the daemon there? One round trip that does no work: nothing on stdout, exit 0 when it answered, exit 2 when the socket is unreachable. |
 
 `decision:` deliberately not in v0.1, and why each can wait:
 
@@ -157,14 +158,11 @@ notes, which landed after the first draft of this spec: `docs/research/macos.md`
   plain-X11 setters can address outputs individually, and Hyprland is per-monitor
   but needs a resident helper (linux.md, "The decisive column, at a glance").
 
-`evidence:` the board query this paragraph used to carry is kept as **history, not
-current state**: it ran while the cards were still in flight
-(`sqlite3 ~/.hermes/kanban/boards/whirl/kanban.db "select id,status from tasks"` and
-`git log --oneline wt/t_57b8de1e` etc. from
-`/Users/govind.rajpurohit/Workspace/Personal/whirl`) and showed `t_57b8de1e` (macOS),
-`t_a7a134e2` (Windows), `t_be6f5e61` (Linux) and `t_b9e349e6` (schedulers) as
-`running`, with no `docs/research/*.md` on any branch. All four completed and were
-merged before this revision; the notes above, not that query, are the current answer.
+`evidence:` **history, not current state**: when this paragraph was written, none of
+the four research notes was in the tree, and all four landed before this revision.
+The merges are `docs/research/macos.md` at `3e1483f`, `docs/research/windows.md` at
+`333ba3c`, `docs/research/linux.md` at `841a7c0` and `docs/research/scheduling.md` at
+`c3d161e`. The notes above, not that earlier state, are the current answer.
 
 Fallback, stated now so the spec is actionable either way:
 

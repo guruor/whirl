@@ -525,6 +525,95 @@ impl Config {
     pub fn default_config_json() -> &'static str {
         DEFAULT_CONFIG_JSON
     }
+
+    /// The effective values of docs/architecture.md 2.6's `plan:` line, as the
+    /// config's own dotted key paths in file order.
+    ///
+    /// It lives here, beside the schema it reads, so that the daemon and the
+    /// worker produce the *same* line: `config check` prints it, and a rotation
+    /// records it, and 2.6's claim is that "what did the daemon actually adopt"
+    /// is answerable from the line alone, which a second implementation with its
+    /// own idea of the key order would quietly break. `whirl-core` is the one
+    /// crate all three binaries link (docs/development.md section 1).
+    ///
+    /// `backend` is passed in rather than read from `self.backend`: 2.6's values
+    /// are effective values, and the resolved backend is what the run adopted
+    /// when 4.3's precedence let `WHIRL_BACKEND` or `--backend` win over the
+    /// file. `display.mode_effective` is what the platform actually gets; with
+    /// no platform code yet it is the configured mode, which is honest only for
+    /// `all` and is why 3.7's fallback is a later card.
+    pub fn plan_pairs(&self, backend: Backend) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut push = |key: &str, value: String| pairs.push((key.to_string(), value));
+        push(
+            "schedule.interval_seconds",
+            self.schedule.interval_seconds.to_string(),
+        );
+        push(
+            "schedule.worker_deadline_seconds",
+            self.schedule.worker_deadline_seconds.to_string(),
+        );
+        push(
+            "startup.enabled",
+            u8::from(self.startup.enabled).to_string(),
+        );
+        push("startup.mode", self.startup.mode.as_str().to_string());
+        push(
+            "startup.respect_manual",
+            u8::from(self.startup.respect_manual).to_string(),
+        );
+        push("display.mode", self.display.mode.as_str().to_string());
+        push(
+            "display.mode_effective",
+            self.display.mode.as_str().to_string(),
+        );
+        push("min_width", self.min_width.to_string());
+        push("min_height", self.min_height.to_string());
+        push("filters.max_bytes", self.filters.max_bytes.to_string());
+        push(
+            "filters.ratio_tolerance",
+            self.filters.ratio_tolerance.to_string(),
+        );
+        push(
+            "filters.target_ratio",
+            match self.filters.target_ratio {
+                Some(ratio) => ratio.to_string(),
+                None => "-".to_string(),
+            },
+        );
+        push(
+            "state.history_entries",
+            self.state.history_entries.to_string(),
+        );
+        push(
+            "dedupe.recent_entries",
+            self.dedupe.recent_entries.to_string(),
+        );
+        push(
+            "cache.root",
+            match &self.cache.root {
+                Some(root) => root.display().to_string(),
+                None => "-".to_string(),
+            },
+        );
+        push("cache.max_bytes", self.cache.max_bytes.to_string());
+        push("cache.max_files", self.cache.max_files.to_string());
+        push("cache.grace_seconds", self.cache.grace_seconds.to_string());
+        push(
+            "cache.orphan_grace_seconds",
+            self.cache.orphan_grace_seconds.to_string(),
+        );
+        push("backend", backend.as_str().to_string());
+        push(
+            "sources",
+            self.sources
+                .iter()
+                .filter(|source| source.weight > 0)
+                .count()
+                .to_string(),
+        );
+        pairs
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1650,17 +1739,26 @@ pub mod paths {
 /// control character in a string, a duplicate key, trailing content after the
 /// document) because those are the mistakes that would otherwise be read as
 /// something else, and lenient about nothing else.
-mod json {
+///
+/// `pub` rather than private: the state files of
+/// docs/spec/state-and-cache.md section 6 are JSON too, and so are the API
+/// responses the `wallhaven` source reads (docs/spec/features.md 2.3), so one
+/// reader in the workspace is the rule (docs/development.md section 1) and a
+/// second one would be the duplication this project refuses. The error type is
+/// [`ConfigError`] because that is what this reader was written against; a
+/// caller reading a state file or an HTTP body names the source in its own
+/// message, and the `line N` this reader attaches is the part worth keeping.
+pub mod json {
     use super::ConfigError;
 
     #[derive(Debug, Clone, PartialEq)]
-    pub(super) struct Node {
-        pub(super) value: Value,
-        pub(super) line: usize,
+    pub struct Node {
+        pub value: Value,
+        pub line: usize,
     }
 
     #[derive(Debug, Clone, PartialEq)]
-    pub(super) enum Value {
+    pub enum Value {
         Null,
         Bool(bool),
         Num(f64),
@@ -1670,7 +1768,7 @@ mod json {
     }
 
     impl Node {
-        pub(super) fn kind_name(&self) -> &'static str {
+        pub fn kind_name(&self) -> &'static str {
             match self.value {
                 Value::Null => "null",
                 Value::Bool(_) => "boolean",
@@ -1681,39 +1779,39 @@ mod json {
             }
         }
 
-        pub(super) fn is_null(&self) -> bool {
+        pub fn is_null(&self) -> bool {
             matches!(self.value, Value::Null)
         }
 
-        pub(super) fn as_str(&self) -> Option<&str> {
+        pub fn as_str(&self) -> Option<&str> {
             match &self.value {
                 Value::Str(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(super) fn as_bool(&self) -> Option<bool> {
+        pub fn as_bool(&self) -> Option<bool> {
             match self.value {
                 Value::Bool(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(super) fn as_num(&self) -> Option<f64> {
+        pub fn as_num(&self) -> Option<f64> {
             match self.value {
                 Value::Num(value) => Some(value),
                 _ => None,
             }
         }
 
-        pub(super) fn as_array(&self) -> Option<&[Node]> {
+        pub fn as_array(&self) -> Option<&[Node]> {
             match &self.value {
                 Value::Arr(elements) => Some(elements),
                 _ => None,
             }
         }
 
-        pub(super) fn as_object(&self) -> Option<&[(String, Node)]> {
+        pub fn as_object(&self) -> Option<&[(String, Node)]> {
             match &self.value {
                 Value::Obj(entries) => Some(entries),
                 _ => None,
@@ -1722,7 +1820,7 @@ mod json {
     }
 
     /// Parse one JSON document.
-    pub(super) fn parse(text: &str) -> Result<Node, ConfigError> {
+    pub fn parse(text: &str) -> Result<Node, ConfigError> {
         let mut parser = Parser {
             bytes: text.as_bytes(),
             pos: 0,
@@ -1734,7 +1832,7 @@ mod json {
         if parser.pos < parser.bytes.len() {
             return Err(ConfigError::syntax(
                 parser.line,
-                "trailing content after the config object",
+                "trailing content after the document",
             ));
         }
         Ok(node)
@@ -2490,7 +2588,12 @@ mod tests {
 
     #[test]
     fn a_key_that_looks_like_an_api_key_is_refused() {
-        let text = "{\n  \"sources\": [\n    { \"id\": \"s\", \"kind\": \"wallhaven\", \"api_key_ref\": \"a1b2c3d4e5f60718293a4b5c6d7e8f90\" }\n  ]\n}";
+        // Key-shaped: 40 key-ish characters, which is what `looks_like_a_key`
+        // refuses from 32. Deliberately a repeated pattern rather than random
+        // hex: the rule is length and shape, not entropy, so the test still
+        // bites, and a secret scanner has no entropy here to object to. A
+        // random-looking literal is what got this test reported once.
+        let text = "{\n  \"sources\": [\n    { \"id\": \"s\", \"kind\": \"wallhaven\", \"api_key_ref\": \"example0example0example0example0example0\" }\n  ]\n}";
         let error = refusal(text);
         assert_eq!(error.field.as_deref(), Some("sources[0].api_key_ref"));
         assert!(error.to_string().contains("NAME, never a value"));

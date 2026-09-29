@@ -7,7 +7,12 @@ degraded-favorites case is now named as a fourth permitted overshoot cause with
 the sweep's behaviour spelled out instead of a hidden exemption (5.3, 5.5, 6.4,
 8.7). Round 1's non-blocking caveats are also applied: the byte-cap sample is
 reported as three draws rather than one (5.1, [L 6], [L 8], [L 9]), and three
-citation imprecisions and one wrong section number are corrected.
+citation imprecisions and one wrong section number are corrected. This revision
+adds the rule the document did not have for the `excl_file` lock file: which
+release sentence is true of which lock (7.2), what the fallback records (8.7), and
+what the daemon does when it finds `state/locks/daemon.lock` held by a holder
+that is gone (8.8), including the `rotate.lock` case and what the daemon reports,
+which is a startup message rather than a `status` key.
 
 This document fixes where whirl keeps its files, what each file contains, what
 gets deleted and when, and which process is allowed to write what. It is written
@@ -558,25 +563,32 @@ modified by whirl for as long as it is the anchor. This holds across cap
 changes, cache clears (which must restore it, section 8.2), and rotations that
 happen to pick the same image again.
 
-Check, the adversarial form, on a config that is legal under 5.1: leave
-`cache.max_bytes` at its default and set `cache.max_files` to 1, so the ordering
-rule (`cache.max_bytes >= filters.max_bytes`) still holds and the daemon starts.
+Check, the adversarial form, on a config that `docs/architecture.md` 4.3 and the
+validator both accept: `cache.max_files` at 2, the floor that section sets
+(`docs/architecture.md:1489`) and the lowest value `validate_ordering` admits
+(`crates/whirl-core/src/config.rs:1320`, whose refusal of 1 is asserted at
+`crates/whirl-core/src/config.rs:2450`); the byte cap at its default, so
+`cache.max_bytes >= filters.max_bytes` still holds; and `cache.grace_seconds` at
+0, its legal minimum (the paragraph after the steps gives both reasons).
 
 1. Run `whirl next` once. Record `anchor_path` and `anchor_digest` from
    `whirl status`, then pin that image with `whirl favorite`, so it is protected
    by two independent rules.
-2. Run `whirl next` again. The cache now holds two protected files (the pin and
-   the new anchor) against a count cap of 1, and the sweep runs at the end of
+2. Run `whirl next` again, then pin this image too. The cache now holds two
+   protected files against a count cap of 2, and the sweep runs at the end of
    that rotation.
-3. Confirm that (a) the image on screen is the second one, (b) the file recorded
-   in step 1 is still present and still matches its digest, and `whirl favorites`
-   still lists it, (c) the current `anchor_path` exists and still matches
-   `anchor_digest`, and (d) `whirl status` reports `cache_over_cap` with
-   `cache_over_reason: pinned` rather than pretending the cache is within budget.
-4. Run `whirl next` once more. The unprotected file (the second image) must now
-   be evicted, because the sweep removes unprotected entries until the caps are
-   satisfied or there are none left (5.3), while the pin and the new anchor
-   survive.
+3. Run `whirl next` once more. The cache now holds three protected files (the two
+   pins and the new anchor) against a count cap of 2, and the sweep runs at the
+   end of that rotation. Confirm that (a) the image on screen is the third one,
+   (b) both files pinned in steps 1 and 2 are still present, still match their
+   digests, and are still listed by `whirl favorites`, (c) the current
+   `anchor_path` exists and still matches `anchor_digest`, and (d) `whirl status`
+   reports `cache_over_cap` with `cache_over_reason: pinned` rather than
+   pretending the cache is within budget.
+4. Run `whirl next` once more. The file that is no longer the anchor (the third
+   image) is unprotected now and must be evicted, because the sweep removes
+   unprotected entries until the caps are satisfied or there are none left (5.3),
+   while both pins and the new anchor survive.
 
 `decision:` the check deliberately does not set `cache.max_bytes` to 1. 5.1 makes
 that config invalid, the daemon refuses to start on a config that fails
@@ -589,14 +601,49 @@ file with no index entry is an orphan, and step 3 of the sweep removes it once i
 is past `cache.grace_seconds`, for a reason that has nothing to do with the cap
 being tested.
 
+`decision:` `cache.max_files` is 2 here, and that is the floor's decision rather
+than this check's: 4.3 requires `cache.max_files >= 2`
+(`docs/architecture.md:1489`), `validate_ordering` refuses anything lower and
+names the key (`crates/whirl-core/src/config.rs:1320`), a test asserts that
+refusal (`crates/whirl-core/src/config.rs:2450`), and 8.7 turns it into a refusal
+to start, which is exactly what a value of 1 produced on a real daemon:
+`whirld: cache.max_files (line 3): <config>: 1 is less than 2`, exit 1. Nothing in
+this document says what the floor is for; what 5.3 and 5.5 do imply is that the
+file on screen and the file arriving in a rotation are protected at the same
+time, so a cap of 1 describes a cache that cannot hold an image and its successor
+together. 2 is the tightest value that admits both, and it is also the smallest
+cap under which this check observes anything: the check's pressure is protected
+files exceeding the cap, and a protected set of two does not exceed 2, which is
+why step 2 pins a second image.
+
+`decision:` the check also needs `cache.grace_seconds` at 0. 5.3 protects every
+cache file created inside that window, and at the default of 600 s every file the
+check creates is inside it, so step 4's eviction is not observable: the third
+image is still protected after it stops being the anchor. 4.3's ordering rules do
+not bound `cache.grace_seconds` (the list is `docs/architecture.md:1487-1490`, and
+this key is not in it) and `want_u64` accepts 0
+(`crates/whirl-core/src/config.rs:1503`), so 0 is legal and is what the check
+uses; leaving the default in force would mean waiting out the window between
+steps 3 and 4.
+
+The check drives the cache through rotations (steps 1 to 4), so it cannot be
+exercised end to end until a source kind ships. The cache and the sweep are not
+the gap — `crates/whirld/src/cache.rs`'s `pub fn sweep` exists, and its `pinned`
+outcome is INV-CACHE-1's `cache_over_reason: pinned` in `whirl status`. The gap
+is the sources: at this writing `local` is written and open as PR #33 and
+`wallhaven` is not written, so until #33 merges every `whirl next` ends `ERR
+no_candidates stage=source code=no_candidates message=no implementation for kind
+local in this build` and steps 1 to 4 are unperformable. Once #33 merges, the
+check runs as written against a local source, which needs no network.
+
 **INV-CACHE-3 (pins).** No pinned file is removed by the sweep, and every
 favorites entry is either present with a matching digest, or re-materialisable
 from its `origin`, or reported as unrecoverable. `whirl favorites` prints
 `missing` next to an entry whose file is absent, so the state cannot be invisible.
 
 Check: favourite something, evict everything else by lowering `cache.max_files`
-(never below 1) and leaving `cache.max_bytes` legal, restart, and confirm the
-file survived and `whirl favorites` still lists it.
+(never below 2, the floor 4.3 sets) and leaving `cache.max_bytes` legal, restart,
+and confirm the file survived and `whirl favorites` still lists it.
 
 ### 5.5 The sweep
 
@@ -695,29 +742,53 @@ report can `cat` them, and the reviewer can check them, without the daemon.
   "written_at": "2026-09-25T07:41:12Z",
   "entries": [
     {
-      "digest": "ab12cd34...",
-      "source": "space",
       "kind": "wallhaven",
-      "origin": "https://w.wallhaven.cc/full/ab/wallhaven-ab12cd.jpg",
       "origin_key": "wallhaven:ab12cd",
-      "width": 2560, "height": 1440, "bytes": 3822331,
+      "digest": "ab12cd34...",
       "cached_path": "/Users/.../sha256/ab/12/ab12cd34....jpg",
-      "mode": "copy",
       "set_at": "2026-09-25T07:41:12Z",
-      "via": "rotate"
+      "via": "source"
     }
   ]
 }
 ```
 
 - `history.json`: newest first, exactly `state.history_entries` entries (default
-  50, matching features.md F5's ring), the oldest dropped on write. `via` is one
-  of `rotate`, `prev`, `set`, `startup`, `external` (an image the user set by
-  hand, features.md 1.5).
-- `favorites.json`: the same entry shape plus `"added_at"`, unordered, one
-  `schema` and one `seq`. Pinned files are found by the digest, which is also the
-  cache filename, which is why "unfavorite" is a single-set operation with no
-  filesystem walk.
+  50, matching features.md F5's ring), the oldest dropped on write. `via` is
+  `docs/architecture.md` 2.6's closed vocabulary, the same five values the `set:`
+  record and `status.last_via` carry: `source`, `manual`, `prev`, `startup`,
+  `recovered`. An image the user set by hand is `kind: external` with
+  `via: startup` (features.md 1.5, architecture.md 1.7.3), not a `via` of its own:
+  `kind` names the origin and `via` names the route, and one closed list on both
+  the wire and the disk is what keeps a state file and a `history` response from
+  disagreeing. `decision:` an earlier draft of this section named `rotate`, `set`
+  and `external` instead. `rotate` and `set` are `source` and `manual`; the
+  `external` spelling is `startup`. A reader accepts all three from a file an
+  earlier build wrote, and this build writes none of them.
+- The entry is the six fields a rotation produces or the daemon knows: `kind`,
+  `origin_key`, `digest`, `cached_path`, `set_at`, `via`. Architecture 2.6's
+  worker result is `<digest> <origin_key> <via> <path>`; `kind` comes from the
+  source the daemon spawned and `set_at` from the moment it wrote the ring.
+  `digest` and `cached_path` are `null` where there is nothing to record: an
+  `external` image whose bytes could not be hashed, and a `reference`-mode set,
+  where the file whirl must not delete is the user's own (6.1; 2.6's `-` on the
+  wire).
+- `decision:` the entry carries no `source`, `origin`, `width`, `height`, `bytes`
+  or `mode`. The first five are `cache/index.json` fields (2.1): that is where
+  the sweep, a `prev` re-materialisation and the favorites lookup read them, and
+  a state file that repeated them would be a second copy free to disagree with
+  the index. `mode` is not a record field at all: it is the source's own config
+  key (`sources[].mode`, architecture 4.2), and a `reference`-mode set is visible
+  as `cached_path: null`. The example above used to carry all six, which is a
+  shape the worker cannot produce.
+- `favorites.json`: `kind`, `origin_key`, `digest`, `cached_path` and
+  `"added_at"`, and no `set_at` or `via`, which describe a rotation rather than a
+  pin; unordered, one `schema` and one `seq`. `state` is not stored either:
+  whether the bytes are there is a fact about the disk right now, so the reader
+  recomputes it and the `favorites` record prints it, and a value written before
+  the file was deleted is never believed. Pinned files are found by the digest,
+  which is also the cache filename, which is why "unfavorite" is a single-set
+  operation with no filesystem walk.
 
 ### 6.3 The write protocol, every state file, no exceptions
 
@@ -793,14 +864,27 @@ favorites.
 4. `schema` greater than the daemon's: a downgrade, not corruption. Quarantine is
    wrong here because the file is presumably fine and a newer whirl wrote it, so
    the file is left exactly as it is, that file becomes read-only for this
-   daemon, and `whirl status` reports `state_schema_newer: favorites.json
-   (found 2, this build understands 1)`. Overwriting it would be destructive and
-   silent; refusing is loud and reversible.
+   daemon, and `whirl status` reports `state_schema_newer: 1`. The key is typed
+   `0|1` (architecture.md 2.10) because it is a status key a client parses rather
+   than a message, and the file name and both numbers go to the log, which is
+   where 6.4 step 2 puts the detail: `favorites.json was written by schema 2 and
+   this build understands 1`. Overwriting it would be destructive and silent;
+   refusing is loud and reversible.
 
 ### 6.5 Resetting without losing the cache
 
 `decision:` reset is a first-class pair of verbs rather than advice, because R1
 makes it trivial and a user should not have to remember a path.
+
+`decision:` **`whirl reset` is not in the v0.1 surface, and the table below is
+the design for a verb no v0.1 build has.** `docs/spec/features.md` 1.1 ships a
+closed verb set ("v0.1 ships this verb set and no more") and holds no `reset`;
+section 9 of this document adds no verb to it ("no new verb is needed and none is
+added"); and `docs/architecture.md` 2.5 and 2.5.1, the protocol grammar and the
+CLI verb mapping, close over the same set. The CLI answers `whirl reset` with its
+unknown-command error and the protocol has no request for it, so until the verb
+lands the raw form below is the whole of what a user can do, and the mentions of
+it in 1.4, 6.4 and 8.2 read as this design rather than as a command that exists.
 
 | Verb | Effect | Cache | History | Favorites |
 |---|---|---|---|---|
@@ -836,33 +920,51 @@ and it only happens when a daemon dies.
 
 ### 7.2 Ownership table, and the locks
 
-| Path | Writer | Readers |
-|---|---|---|
-| `config.json` | the user, in an editor | daemon, at start and on reload |
-| `state/current.json` | daemon | daemon; humans with `cat` |
-| `state/history.json` | daemon | daemon |
-| `state/favorites.json` | daemon | daemon |
-| `log` | daemon | humans |
-| `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup |
-| `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both |
-| `cache/index.json` | daemon | daemon; `whirl status` |
-| `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only |
-| `cache/tmp/**` | the worker run that created it | nobody |
+`Writer` names the one process that writes the file. `Readers` names the
+processes that open it: a `whirl` verb that shows a file's contents is not one of
+them, because it asks the daemon, which is already named on the row, and `whirl
+status` reports `cache/index.json`'s `root_id` (2.1) from the daemon that opened
+it. `Surface` names the `whirl` verbs a user runs to observe or change the file,
+or `none` where no verb does, which leaves the filesystem as the only way in.
+Every surface below is answered by the daemon, because the daemon is the process
+that opens the file.
+
+| Path | Writer | Readers | Surface |
+|---|---|---|---|
+| `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path | `whirl config path`, `whirl config check`, `whirl sources` |
+| `state/current.json` | daemon | daemon; humans | `whirl status`; `whirl pause`, `whirl resume` |
+| `state/history.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl history`; `whirl prev` |
+| `state/favorites.json` | daemon | daemon | `whirl favorites`; `whirl favorite`, `whirl unfavorite` |
+| `log` | daemon | humans | none |
+| `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup | `whirl status` (`lock_mode`) |
+| `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both | `whirl status` (`sweep_deferred`) |
+| `cache/index.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl status` (`cache_root_id`) |
+| `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only | `whirl status` (`cache_files`, `cache_bytes`) |
+| `cache/tmp/**` | the worker run that created it | nobody | none |
 
 - `daemon.lock` is taken with `flock(LOCK_EX|LOCK_NB)` on POSIX [L 3] and
-  `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)` on Windows [9].
+  `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY)` on Windows [9],
+  or with the `excl_file` fallback of 8.7 where that call answers `ENOTSUP`.
   A second daemon exits with a message naming the first daemon's pid, rather than
   unlinking a live socket, which is what `whd.rs:456` does today with an
-  unconditional `remove_file(&cfg.socket)`.
+  unconditional `remove_file(&cfg.socket)`; a lock file left behind by a daemon
+  that is gone is the second kind of refusal, classified and named in the same
+  message under 8.8.
 - `rotate.lock` is the same primitive, and it is what makes a sweep unable to run
   concurrently with a download (5.5) and two rotations unable to run at once.
   `decision:` the daemon holds it only for the sweep, not for the whole rotation,
   because the worker's own lifetime already serialises downloads and holding it
   across the worker would deadlock the two roles.
-- Both locks are advisory, and both are released by the operating system when the
-  holding process exits, including `SIGKILL` [L 3]. There is no stale-lock
-  recovery logic and no pid file to go out of date, which is the point of using
-  the OS primitive.
+- Both locks are advisory. Where the lock is the OS primitive, the operating
+  system releases it when the holding process exits, including `SIGKILL`: a lock
+  belongs to an open file description, and termination closes the descriptors, so
+  the kernel drops it without whirl doing anything [L 3] [12]. That release is
+  what preferring the primitive buys. The `excl_file` fallback of 8.7 does not
+  have it: that lock is a file whose existence is the lock, nothing removes the
+  file when the holder is killed, and its record of the holder is a pid file that
+  can go out of date. 8.8 is the rule for a lock file left behind, and
+  `lock_mode` in `status` (2.10) is how a running daemon says which of the two
+  it holds.
 - `decision:` the socket is unlinked only after a successful connection attempt
   fails, so a running daemon's socket is never removed by a starting one.
 - `decision:` the worker never opens the log file. It writes its result and its
@@ -885,8 +987,10 @@ and it only happens when a daemon dies.
    can see, instead of a second download nobody asked for.
 3. The worker runs: enumerates, filters, downloads, renames, sets, exits with one
    result line on stdout.
-4. The daemon takes `rotate.lock` (the worker has exited, so this cannot block),
-   validates that the reported path is inside the cache root and exists, writes
+4. The daemon takes `rotate.lock` (the worker has exited, so this cannot block;
+   where the `excl_file` fallback of 8.7 is in force, the daemon removes the
+   reaped worker's lock file here, under 8.8), validates that the reported path
+   is inside the cache root and exists, writes
    `current.json`, `history.json` and the index entry, runs the sweep, and
    releases the lock.
 5. The daemon notifies `idle` subscribers once, and only once. The prototype's
@@ -1006,8 +1110,13 @@ happen.
   allowed to be a failure path for the product.
 - Cache root on a filesystem that does not support `flock`: the lock file's
   `flock` returns `ENOTSUP` [L 3]. Fall back to an `O_CREAT|O_EXCL` lock file
-  that names the holder pid and start time, and report `lock_mode: excl_file` in
-  `status` so the weaker guarantee is visible rather than assumed.
+  whose existence is the lock and whose contents name the holder: its pid, and
+  the platform's own start time for that pid, which is the pair 8.8 needs to tell
+  a live holder from a recycled pid. Report `lock_mode: excl_file` in `status` so
+  the weaker guarantee is visible rather than assumed. `decision:` the fallback is
+  a property of the filesystem and not of one lock, so it covers both locks of
+  7.2, and 8.8 is the rule for either of them found left behind by a holder that
+  is gone.
 - `config.json` missing: written with defaults and fully commented, as
   features.md F1 requires. `config.json` unparseable: the daemon does not start,
   and the message names the byte offset, because a config error is the one error
@@ -1021,6 +1130,91 @@ happen.
   in 5.4 be written on legal configs only.
 - A second `whirl next` while a rotation is in flight: refused with `busy`, not
   queued (7.3).
+
+### 8.8 A lock file whose holder is gone
+
+`decision:` the rule is refusal, not recovery: a lock file left behind by a holder
+that is gone is reported to the operator rather than taken over. The daemon never
+unlinks, renames, truncates or overwrites a lock file in order to become the
+holder of it, with one exception it holds proof for, the rotation lock of a
+worker it has just reaped (`rotate.lock` below). This case belongs to the
+`excl_file` fallback of 8.7 alone: under `flock` and `LockFileEx` the kernel
+releases the lock when the holder exits and there is nothing to judge (7.2).
+
+Why the file is not reclaimed. Taking it over needs a compare-and-swap on the
+path, and the fallback is in force exactly where the filesystem does not provide
+the primitive that would give one. Two daemons starting in the same instant, each
+having read a dead holder and each having replaced the file, both run: two
+writers of `current.json`, which is the one failure 7.1 and R5 are written to
+prevent. So the cost of refusing is stated rather than hidden: on such a
+filesystem a `SIGKILL`ed or crashed daemon needs one file removed by hand before
+whirl starts again, and `lock_mode: excl_file` in `status` (2.10, 8.7) is how the
+operator learns the weaker lock was in use when that happened.
+
+What the daemon judges, and what a pid is worth. The record in the lock file is
+the holder's pid and the platform's own start time for that pid (8.7), because a
+pid alone is not an identity: pids are reused, so a recorded pid that answers as
+alive may be an unrelated process. The pair is what makes the message true, and
+the message is the whole output of this case:
+
+| Recorded holder | Message names it as |
+|---|---|
+| pid live, start time matches the record | the holder: `held by pid 4711, started <t>` |
+| pid live, start time differs from the record | a recycled pid: `left by pid 4711 started <t>; pid 4711 is now a different process` |
+| pid gone | a holder that exited: `left by pid 4711, started <t>, which is not running` |
+| liveness or start time unreadable | unjudged: `left by pid 4711, start time unreadable` |
+
+None of the four takes the file. Liveness and start time, per platform:
+
+- macOS and Linux: `kill(pid, 0)`, which the manual page names as the idiom:
+  "A value of 0, however, will cause error checking to be performed (with no
+  signal being sent). This can be used to check the validity of pid" [L 10]. So `0`
+  is alive, `ESRCH` is gone, and `EPERM` is alive and not ours, which is still
+  alive. Start time: macOS `sysctl(KERN_PROC_PID)` and `kp_proc.p_starttime`
+  [L 10], Linux `/proc/<pid>/stat` field 22, "The time the process started after
+  system boot", in clock ticks [13].
+- Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` for the pid, and
+  `GetProcessTimes` for `lpCreationTime`, "a FILETIME structure that receives the
+  creation time of the process" [14] [15]. No Windows host was available here, so
+  this column is documented API behaviour rather than something measured on this
+  machine (architecture.md 3.7 lists it as unverified [D 2]). A failed open is
+  read as gone only where the API documents the pid as nonexistent or unopenable,
+  and as unjudged for `ERROR_ACCESS_DENIED`, which the same page documents for the
+  System and CSRSS processes [14].
+- The judgement is not load-bearing: it changes the sentence, never the action,
+  because all four rows refuse. That is deliberate, and it is what makes pid reuse
+  a reporting problem rather than a correctness problem.
+
+`rotate.lock` under the fallback. The fallback is a property of the filesystem,
+so it applies to `rotate.lock` too (8.7), and the same rule applies to it with
+one exception the parent is entitled to make: the daemon spawned the worker, and
+once it has reaped it (1.7.1, 1.7.2, 7.3 step 4) that worker is provably gone, so
+the daemon removes the lock file here when the record in it names the worker it
+has just reaped. No liveness probe and no pid-reuse question arise, because only
+the parent holds the exit status. A `rotate.lock` naming any other holder,
+including the hand-run worker of 5.5 step 3, is not removed: the sweep does not
+steal it and defers exactly as 5.5 step 1 and `sweep_deferred` (2.10) already
+describe, with a holder that has since exited. That is the one place this section
+reads `sweep_deferred`'s gloss ("already held by someone else") a shade wider
+than its words, and it is named here rather than left for a reader to notice.
+
+What the daemon reports, which is a message and not a key. The refusal happens at
+1.5 step 1, before the control socket is bound, so there is no `status` to carry
+a key and no third value for `lock_mode` (2.10). The message goes to stderr and to
+the log, names the lock path, the classification above, and the one action that
+clears it, for example:
+
+    whirl: state/locks/daemon.lock left by pid 4711, started 2026-09-25T07:41:12Z,
+    which is not running; remove /Users/you/.local/state/whirl/locks/daemon.lock
+    and the supervisor will try again
+
+Exit is 1, which the frontend contract already fixes as "the daemon refused"
+(architecture.md section 8 item 7), and the supervisor keeps trying on its own
+cadence: `KeepAlive` at 10.1 s on macOS, `Restart=always` with `RestartSec=5` on
+Linux, `RestartOnFailure` on Windows (architecture.md section 5). While the
+refusal stands every `whirl` verb exits 2 with the unreachable-daemon message
+(architecture.md failure mode 1), which is all the CLI can say: it does not read
+the lock file and does not start the daemon (2.5.1).
 
 ## 9. Where this supersedes the prototype, and where it touches features.md
 
@@ -1079,8 +1273,9 @@ Against this card's criteria:
 - **The eviction rule is a testable invariant that protects the displayed
   image.** INV-CACHE-1 states the bound with its four permitted exceptions and
   names the status keys that carry them; INV-CACHE-2 is stated in the adversarial
-  form on a config that is legal under 5.1 (`cache.max_files` of 1, byte cap at
-  its default) so a reviewer can attempt to break it in three steps without
+  form on a config that is legal under 5.1 (`cache.max_files` at 2, the floor
+  `docs/architecture.md` 4.3 sets, byte cap at its default, `cache.grace_seconds`
+  at 0) so a reviewer can attempt to break it in three steps without
   needing a config the document refuses to run; section 5.3 is the protection
   rule; section 5.5 is the one sweep that
   implements it. The "displayed image is never deleted out from under the
@@ -1094,7 +1289,9 @@ Against this card's criteria:
   see only the old file or the new one.
 - **The concurrency rule names which process owns which file.** Section 7.1 is
   the rule in one sentence; 7.2 is the per-file table with the writer and the
-  readers; 7.3 is the handoff order.
+  readers; 7.3 is the handoff order; 8.8 is what happens to a lock file whose
+  holder is gone, which is the one case where the OS primitive of 7.2 cannot
+  answer for itself.
 - **Citations for platform conventions.** Apple's File System Programming Guide
   for `Application Support`, `Caches` and `Logs` [1][2]; the XDG Base Directory
   Specification for config, state, cache and runtime [3]; Microsoft's
@@ -1102,13 +1299,17 @@ Against this card's criteria:
   `%LOCALAPPDATA%` and the "use `SHGetKnownFolderPath`" rule [4][5][6]; the pipe
   name form [7]; `MoveFileEx` flags [8] and `LockFileEx` [9] for the two Windows
   primitives; POSIX `rename` [10] and the macOS manual pages [L 1][L 2][L 3] for
-  the atomicity and durability claims underneath section 3 and 6.3.
+  the atomicity and durability claims underneath section 3 and 6.3; the Linux
+  `flock` page [12] for the release-on-close claim that 8.8 rests on, and the
+  Linux and Windows process-identity pages [13][14][15] for its liveness rule.
 - **Specification only.** No production code, no `prototype/` edits, no
   credentials. The only files added are this document and the probe scripts and
   their README under `docs/spec/probes/`, which exist to produce `[L 5]`, `[L 6]`
   and `[L 8]` and are not part of the product.
-- **The review gate.** This document is completed with `kanban_request_review`,
-  not `kanban_complete`, per the orchestrator's note on the card.
+- **The review gate.** This document goes through the project's review gate rather
+  than a self-check: a second party read it at `1261786`, and the round-2 review
+  covers the pack at `cedf839` (`docs/reviews/research-spec-review.md`,
+  `docs/reviews/research-spec-review-round2.md`).
 
 ## 11. Evidence
 
@@ -1118,13 +1319,14 @@ Local artifacts. `[L n]` is cited inline above.
 |---|---|---|
 | [L 1] | `man 2 rename` | "If new exists, it is first removed. Both old and new must be ... on the same file system." and "The rename() system call guarantees that an instance of new will always exist, even if the system should crash in the middle of the operation." |
 | [L 2] | `man 2 fsync` | "Note that while fsync() will flush all data from the host to the drive ..., the drive itself may not physically write the data to the platters for quite some time". F_FULLFSYNC named as the stricter variant. |
-| [L 3] | `man 2 flock` | Exclusive and shared locks, `LOCK_NB` returns `EWOULDBLOCK` when held, `ENOTSUP` for an unsupported file type, locks are on files rather than descriptors and are released when the descriptor is closed. |
+| [L 3] | `man 2 flock` | Exclusive and shared locks, `LOCK_NB` returns `EWOULDBLOCK` when held, `ENOTSUP` for an unsupported file type, locks are on files rather than descriptors. The release-on-close sentence is not on this page; [12] states it, and 8.8 relies on [12] for it. |
 | [L 4] | `grep -n -A12 "func rename" $(go env GOROOT)/src/os/file_windows.go`; `internal/syscall/windows/syscall_windows.go:357-367` | Go 1.26.1 on this machine: `os.Rename` on Windows is `windows.Rename`, which is `MoveFileEx(from, to, MOVEFILE_REPLACE_EXISTING)`. `MOVEFILE_COPY_ALLOWED` is not passed. |
 | [L 5] | `python3 docs/spec/probes/atomic_write_probe.py 400` (four runs), `python3 docs/spec/probes/hash_cost.py 20`, `python3 docs/spec/probes/index_size.py 500` | In-place rewrite: 3068 bad reads of 3508, 3054 of 3496, 3832 of 4270, 2387 of 2830, so 87.4%, 87.4%, 89.7% and 84.3% of concurrent reads saw a truncated or unparsable file. Temp-plus-`rename`: 0 bad reads of 971, 981, 949, 983. Hashing a 21.0 MB file: 14.4, 14.6 and 13.9 ms against 2.3, 1.6 and 1.5 ms for the read alone. A 500-entry `index.json` matching the section 2.1 schema: 170607 bytes compact, 220135 bytes indented, 341 bytes per entry. |
 | [L 6] | `curl -A "whirl-spec-probe" "https://wallhaven.cc/api/v1/search?sorting=random&purity=100&ratios=16x9&atleast=2560x1440&page={1,2}"` then `python3 docs/spec/probes/size_stats.py wallhaven-p1.json wallhaven-p2.json` | Draw 1 of 3, 2026-09-25: 48 images, `file_size` 0.05 MB to 20.34 MB, median 2.25 MB, mean 3.83 MB, per-file spread 378x. A count cap of 40 spans 2.2 MB to 813.6 MB. The endpoint is the one features.md 2.3 specifies; no key needed for `purity=100` [11]. `sorting=random` returns a different 48 images on every request, so this row is one sample and not a reproducible distribution. |
 | [L 7] | `sw_vers; uname -m; python3 --version` | macOS 26.5.2 (25F84), arm64, Python 3.14.7, Go 1.26.1, rustc 1.94.0. Every local measurement above was taken on this machine. |
 | [L 8] | `curl -sS -A "whirl-spec-probe" "https://wallhaven.cc/api/v1/search?sorting=random&purity=100&ratios=16x9&atleast=2560x1440&page={1,2}"` into `/tmp/whirl-l6b/p1.json` and `p2.json`, then `python3 docs/spec/probes/size_stats.py /tmp/whirl-l6b/p1.json /tmp/whirl-l6b/p2.json` | Draw 2 of 3, re-run on this machine while applying this review round: 48 images, 0.19 MB to 16.03 MB, median 2.11 MB, p90 10.19 MB, mean 3.23 MB, total 154.9 MB, per-file spread 82x. A count cap of 40 spans 7.8 MB to 641.3 MB, 129.1 MB at this draw's mean; 500 files is 1.61 GB at this mean. |
 | [L 9] | the same query, re-drawn by the round-1 review of this document (recorded in this card's comment thread, 2026-09-25 13:21) | Draw 3 of 3: 48 images, 0.23 MB minimum, 2.59 MB median, 5.56 MB p90, 14.02 MB maximum, mean 2.90 MB, spread 60x. Not produced by the author of this document; included because it is an independent draw of the same query and it is the tightest of the three, which is why 5.1 quotes the 60x draw and not the 378x one. |
+| [L 10] | `man 2 kill`, `man 1 ps`, `man 2 flock`, `ps -o pid=,lstart= -p <pid>`, and `grep -n p_starttime "$(xcrun --show-sdk-path)/usr/include/sys/proc.h"` with `grep -n KERN_PROC_PID "$(xcrun --show-sdk-path)/usr/include/sys/sysctl.h"`, while writing 8.8 | `kill(pid, 0)` is the existence check: "A value of 0, however, will cause error checking to be performed (with no signal being sent). This can be used to check the validity of pid", and `ESRCH` is "No process or process group can be found corresponding to that specified by pid"; sending a signal needs a real or effective user ID matching the receiver's, so `EPERM` means the process exists and is not ours. `ps` documents `lstart` as "The exact time the command started" and prints one for a live pid (`Fri Sep 25 20:39:57 2026`); the value comes from `sysctl(KERN_PROC_PID)`, `sys/sysctl.h:437`, into `kp_proc.p_starttime`, `sys/proc.h:97`, "process start time". The macOS `flock` page documents the lock/descriptor association, `EWOULDBLOCK` under `LOCK_NB` and `ENOTSUP`, and does not print the release-on-close sentence that [12] does. |
 
 Sibling research documents. `[D n]` is cited inline above.
 
@@ -1156,3 +1358,7 @@ citation as a decision, not as an observation.
 [9] https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex
 [10] https://pubs.opengroup.org/onlinepubs/9699919799/functions/rename.html
 [11] https://wallhaven.cc/help/api
+[12] https://man7.org/linux/man-pages/man2/flock.2.html
+[13] https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
+[14] https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
+[15] https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes

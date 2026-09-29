@@ -6,7 +6,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/sh</string><string>-c</string>
-        <string>printf 'H fire %%s\n' "$(date +%%s.%%N)" >> "/Users/govind.rajpurohit/whirl-probe-H.log"</string>
+        <string>printf 'H fire %%s\n' "$(date +%%s.%%N)" >> "$HOME/whirl-probe-H.log"</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>

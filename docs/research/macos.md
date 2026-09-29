@@ -536,8 +536,8 @@ how each is produced.
 | [V10] | `brew info --cask desktoppr`; `curl https://api.github.com/repos/scriptingosx/desktoppr/releases/latest` | cask artifact `desktoppr-0.5-218.pkg (Pkg)`; release `v0.5` ships both `.pkg` and `.zip` |
 
 Side effects on the machine, stated plainly: the wallpaper on the live Space was moved through
-three images and left on `~/.hermes/cache/scratch/wh-rotate/wh-cache/wh-commons-24733753.jpg`, the
-image the session started with. The Space that was frontmost partway through had held
+three images and left on the cached image `wh-commons-24733753.jpg`, the image the session started
+with. The Space that was frontmost partway through had held
 `~/Library/Caches/spice/.../Wallhaven_l8x1pr.jpg`, which no longer exists on disk (Spice pruned
 it), so that exact image could not be written back; `wp-set` reported
 `FAILED error=The file doesn't exist.` The store was not otherwise edited by hand, no plist was

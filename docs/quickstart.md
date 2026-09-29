@@ -1,0 +1,99 @@
+# whirl quickstart
+
+whirl rotates your desktop wallpaper through a folder of pictures you already have: a small daemon,
+a config file, no window. Everything below was run in this order on macOS on 2026-09-27, with one
+scratch home standing in for yours. The scratch home did not contain the three installs of section
+1: those ran unpinned and replaced this machine's own three binaries. Add `--root <dir>` (the
+paragraph under the install block) so a replayer's run does not.
+
+## 1. Install it
+
+```sh
+git clone --branch development https://github.com/guruor/whirl
+cd whirl
+cargo install --path crates/whirl-cli    --locked
+cargo install --path crates/whirld       --locked
+cargo install --path crates/whirl-worker --locked
+```
+
+The `cargo install` lines above need Rust on your `PATH`; if `cargo` is missing, install it from
+<https://rustup.rs>.
+
+`development` and not `main`, which cannot set a wallpaper yet. The three binaries land in
+`$CARGO_HOME/bin`, the `CARGO_HOME` your shell exported: on a stock install that is `~/.cargo/bin`
+and it is already on your `PATH`, and on this machine `CARGO_HOME` is `~/.local/share/cargo`, so they
+land in `~/.local/share/cargo/bin`. Keep the three in one directory either way, because `whirld`
+looks for `whirl-worker` beside itself and not on `PATH`.
+
+Anyone running this list on a machine that is not theirs, and any acceptance or smoke run, must add
+`--root <dir>` to all three lines: `--root` is what decides the destination, not the shell's
+environment. A `cargo` on `PATH` that is a version manager's shim can re-export `CARGO_HOME` over the
+value you exported, so `CARGO_HOME=<dir> cargo install --path …` looks isolated and is not. On macOS
+mise's shim does exactly that: a run of these three lines that exported a scratch `CARGO_HOME` still
+replaced this machine's own three binaries. The shape that holds is
+
+```sh
+cargo install --path crates/whirld --root <dir> --locked
+```
+
+which puts the binary and cargo's own metadata under `<dir>` and touches nothing else.
+
+## 2. Point it at your pictures
+
+```sh
+mkdir -p "$HOME/.whirl"
+cat > "$HOME/.whirl/config.json" <<'JSON'
+{
+  "backend": "native",
+  "sources": [
+    { "id": "pictures", "kind": "local", "paths": ["~/Pictures/Wallpapers"] }
+  ]
+}
+JSON
+```
+
+`~/Pictures/Wallpapers` is the line to change. The `local` source walks that folder and takes any
+`jpg`, `jpeg`, `png`, `heic` or `webp` at least 1600x900.
+
+## 3. Start it, and rotate
+
+```sh
+export WHIRL_CONFIG="$HOME/.whirl/config.json" WHIRL_SOCKET="$HOME/.whirl/whirl.sock" WHIRL_STATE_DIR="$HOME/.whirl/state" WHIRL_CACHE_DIR="$HOME/.whirl/cache"
+
+whirld
+```
+
+`whirld` runs in the foreground and logs to stderr, so leave that terminal alone. In a second
+terminal, paste that same `export` line, then:
+
+```sh
+whirl next
+```
+
+It prints `queued` and then `set: <digest> <origin_key> <via> <path>`, naming the picture it set.
+`whirl config check` prints what a source did, `candidates=` and `admitted=` and the rejection
+counters; it asks the daemon, so it only works while `whirld` is up.
+
+When the collection turns out smaller than the folder is, read the terminal `whirld` is running in
+rather than `whirl config check`: that record's field set is fixed and its counters are the
+candidates removed per stage (docs/architecture.md 2.6, docs/spec/features.md 2.5), so a file the
+source drops before it becomes a candidate moves none of them. `whirld` appends the worker's own
+words to that same stderr, where such a file reads `warning: source pictures: entries skipped: 1
+unreadable, 0 symlink, 0 revisited`.
+
+## 4. Stop it
+
+Ctrl-C in the daemon's terminal. Nothing else is left running.
+
+## 5. Three things worth knowing
+
+- The screen changes a moment *after* `whirl next` returns. macOS applies the picture out of
+  process, so the `set:` line means the write was accepted, not that the desktop has repainted:
+  two runs here put the write the store records 2.6 s and 3.4 s later.
+- `WHIRL_BACKEND` in your shell disarms the whole run without saying so. With `WHIRL_BACKEND=noop`
+  exported (a leftover from a test) every stage still runs except the platform setter: `whirl next`
+  prints its `set:` line, the history records it, and your wallpaper never changes. `whirl config
+  check` prints `backend=` in its plan line; unset it and restart the daemon.
+- Not implemented yet: the launchd agent that would start `whirld` at login and restart it. Today
+  whirl rotates only while the daemon runs (`whirl next`, or every 30 minutes on its own,
+  `schedule.interval_seconds`), and a reboot stops it until you start it again.

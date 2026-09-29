@@ -11,3 +11,11 @@ use super::SetError;
 pub fn set(_path: &str) -> Result<(), SetError> {
     Ok(())
 }
+
+/// Report nothing at all, and not the machine's real image either. The noop path
+/// set nothing, so it has nothing it could truthfully report as an anchor, and
+/// reading the live desktop here would make every noop test depend on the desk of
+/// whoever ran it.
+pub fn current() -> Result<Option<String>, SetError> {
+    Ok(None)
+}

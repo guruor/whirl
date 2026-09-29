@@ -56,10 +56,27 @@ fn stderr(output: &Output) -> String {
 #[test]
 fn help_prints_the_verb_table_and_exits_zero() {
     let dir = scratch("help");
-    let output = run(&dir, &["--help"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(output.status.code(), Some(0));
-    let text = stdout(&output);
+    let flag = run(&dir, &["--help"]);
+    assert!(flag.status.success(), "{}", stderr(&flag));
+    assert_eq!(flag.status.code(), Some(0));
+
+    // `help` is the name USAGE gives this text on its own last line, so the verb
+    // and the two flags are one command line with three spellings: same stdout,
+    // same exit code, and nothing on stderr.
+    for args in [["-h"], ["help"]] {
+        let output = run(&dir, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}: {}",
+            args[0],
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), stdout(&flag), "{}", args[0]);
+        assert_eq!(stderr(&output), "", "{} writes nothing to stderr", args[0]);
+    }
+
+    let text = stdout(&flag);
     assert!(text.starts_with("usage: whirl <command>"), "{text}");
     for verb in [
         "next",
@@ -67,8 +84,69 @@ fn help_prints_the_verb_table_and_exits_zero() {
         "history [n]",
         "config check",
         "ping",
+        "help",
     ] {
         assert!(text.contains(verb), "{verb} in {text}");
+    }
+}
+
+/// The commands the usage text advertises, one argv per command. Each entry is
+/// padded to a description column, so the verb spec is everything before the
+/// first run of two spaces.
+fn advertised(text: &str) -> Vec<Vec<String>> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .map(|line| line.split("  ").next().unwrap_or_default().trim())
+        .filter(|spec| !spec.is_empty())
+        .map(|spec| spec.split(' ').map(str::to_owned).collect())
+        .collect()
+}
+
+/// A concrete command line for one advertised spec: the words as written, with a
+/// value for every placeholder, chosen by the placeholder's name.
+fn concrete(spec: &[String]) -> Vec<String> {
+    spec.iter()
+        .map(|word| {
+            let placeholder = word.trim_matches(['<', '>', '[', ']']);
+            if placeholder == word {
+                return word.clone(); // a literal subcommand: `path`, `check`
+            }
+            match placeholder.split('|').next().unwrap_or_default() {
+                "n" => "10".to_owned(),
+                "path" => "/tmp/whirl-advertised.jpg".to_owned(),
+                // An id of any shape reaches the arm; the value is not the subject.
+                _ => "1".to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// Every command USAGE names is one this binary accepts. This is the invariant
+/// the `help` line broke: it sat at the end of USAGE while `request()` had no arm
+/// for it, so the text that exists to tell a reader what to type sent them to the
+/// catch-all and exit 3. The reverse direction (an arm USAGE does not name) is
+/// not observable from a spawned binary and is not asserted here.
+#[test]
+fn every_command_the_usage_names_is_accepted() {
+    let dir = scratch("advertised");
+    let text = stdout(&run(&dir, &["help"]));
+    let commands = advertised(&text);
+    assert!(
+        commands.len() >= 17,
+        "the usage parse found {} commands: {commands:?}",
+        commands.len()
+    );
+
+    for spec in commands {
+        let args = concrete(&spec);
+        let words: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run(&dir, &words);
+        assert!(
+            !stderr(&output).contains("is not a command"),
+            "{} is advertised and rejected: {}",
+            spec.join(" "),
+            stderr(&output)
+        );
     }
 }
 

@@ -9,6 +9,11 @@ the specs, the architecture and the development guide; [prototype/](prototype/)
 holds a throwaway spike that establishes the two numbers the design rests on. The
 Cargo workspace under `crates/` is the next thing to land.
 
+## Running it
+
+[docs/quickstart.md](docs/quickstart.md): build it, point it at a folder of your
+own pictures, force a rotation. One page, hands-on, macOS.
+
 ## Why another wallpaper app
 
 They start small and drift. A measured example on macOS (Spice, a Go/Fyne

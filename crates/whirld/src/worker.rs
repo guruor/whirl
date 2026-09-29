@@ -5,11 +5,14 @@
 //! non-empty stdout line as the result. The environment is `env_clear()` plus
 //! the names 1.6 lists, which is the fix for `[M 16]` (the prototype inherited
 //! the daemon's whole environment) and what lets the Linux adapters see the
-//! session signals they need.
+//! session signals they need. Two of those names are set to this daemon's own
+//! *resolved* paths rather than to whatever the session had -
+//! `WHIRL_STATE_DIR` and `WHIRL_CACHE_DIR` - because the worker reads the
+//! recent window of 4.1 out of the two files the daemon wrote (7.2).
 
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use whirl_core::config::Backend;
 use whirl_core::protocol::{self, ErrorCode, SetRecord, Via};
@@ -77,18 +80,86 @@ const POLL: Duration = Duration::from_millis(5);
 /// How long the worker gets after `SIGTERM` before `SIGKILL` (1.7.1).
 const TERM_GRACE: Duration = Duration::from_secs(5);
 
+/// How many times the spawn is attempted when the kernel refuses it with
+/// `ETXTBSY`: the first, plus nine retries.
+///
+/// `ETXTBSY` means the kernel refused **before anything ran**. Linux refuses to
+/// `execve` a file that any process holds open for writing (`deny_write_access`
+/// on the exec target), so no worker existed, no `rotate.lock` was taken and
+/// nothing was written: re-attempting is free. The alternative is a
+/// `worker_failed` report (2.7) about a process that never started.
+///
+/// The condition is transient **by construction**, not by luck: *any* open-for-
+/// write descriptor on the file being exec'd causes it, and the holder is always
+/// someone who is about to be done with it. Under `cargo test` it is a forked
+/// child of a sibling thread that inherited the descriptor `Scripts::script`
+/// wrote with (`fork` duplicates the descriptor into the child, which can
+/// outlive the write in the parent). In an install it is the process replacing
+/// the binary, which holds it open for write only while it copies.
+const SPAWN_ATTEMPTS: usize = 10;
+
+/// The sleep between two spawn attempts: nine of them is 450 ms of waiting in
+/// the worst case, and it is only ever reached on a real `ETXTBSY`. Every other
+/// errno (a missing program, a directory, a permission denial) returns on the
+/// first attempt with today's message and today's immediacy.
+const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(50);
+
+/// The spawn, with the `ETXTBSY` retry of `SPAWN_ATTEMPTS` and
+/// `SPAWN_RETRY_PAUSE` around it, and nothing else around it: a refusal the
+/// kernel made for any other reason comes back on the first attempt.
+///
+/// The retry is this function rather than a loop inside `Worker::run` so that it
+/// can also be shown working where no kernel refusal reaches the caller, which is
+/// every guest but a native Linux one (the test module measures which, and
+/// `a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds` is the test that
+/// runs on all of them): the caller supplies `spawn`, so a test's closure can
+/// refuse with `ETXTBSY` as many times as it likes.
+fn spawn_with_retry(mut spawn: impl FnMut() -> std::io::Result<Child>) -> std::io::Result<Child> {
+    let mut attempt = 1;
+    loop {
+        match spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => {
+                if attempt >= SPAWN_ATTEMPTS {
+                    return Err(error);
+                }
+                attempt += 1;
+                std::thread::sleep(SPAWN_RETRY_PAUSE);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub struct Worker {
     program: PathBuf,
     config_path: PathBuf,
     backend: Backend,
+    /// The two directories this daemon resolved and opened (4.3's precedence,
+    /// 7.2's ownership table): where `history.json` is written, and where the
+    /// cache root that holds `index.json` is. They are carried here rather than
+    /// re-derived by the child, which is the defect this pair fixes: a
+    /// `Window::load` whose state directory is not the daemon's reads no
+    /// history, so the recent window of 4.1 is silently empty and consecutive
+    /// rotations repeat.
+    state_dir: PathBuf,
+    cache_dir: PathBuf,
 }
 
 impl Worker {
-    pub fn new(program: PathBuf, config_path: PathBuf, backend: Backend) -> Worker {
+    pub fn new(
+        program: PathBuf,
+        config_path: PathBuf,
+        backend: Backend,
+        state_dir: PathBuf,
+        cache_dir: PathBuf,
+    ) -> Worker {
         Worker {
             program,
             config_path,
             backend,
+            state_dir,
+            cache_dir,
         }
     }
 
@@ -114,6 +185,30 @@ impl Worker {
         run: u64,
         deadline: Duration,
     ) -> Result<Outcome, WorkerError> {
+        self.run_reporting_reaped(verb, target, run, deadline, &mut None)
+    }
+
+    /// The same run, with 8.8's proof attached: `reaped` is where the pid of the
+    /// child this process **has reaped** goes. That pid is the one thing that
+    /// entitles a take of `rotate.lock` to remove a lock file under 8.7's
+    /// `excl_file` fallback (8.8, 7.3 step 4): the parent holds the exit status,
+    /// so the holder is provably gone and no liveness probe is needed.
+    ///
+    /// It stays `None` wherever this process has no exit status to show: the
+    /// spawn paths that never produced a worker, and a `try_wait` that failed.
+    /// 1.7.1's deadline is **not** one of them. `terminate` reaps the child it
+    /// kills, in the grace window or after `SIGKILL`, and returns the pid of the
+    /// exit status it holds; the deadline branch reports that pid here, so a
+    /// timed-out worker's `rotate.lock` is removed by the sweep that follows
+    /// under 8.7's fallback like any other reaped worker's (7.3 step 4, 8.8).
+    pub(crate) fn run_reporting_reaped(
+        &self,
+        verb: Verb,
+        target: Option<&str>,
+        run: u64,
+        deadline: Duration,
+        reaped: &mut Option<u32>,
+    ) -> Result<Outcome, WorkerError> {
         let mut command = Command::new(&self.program);
         command
             .arg("--config")
@@ -134,6 +229,19 @@ impl Worker {
         // asked to re-resolve it (docs/development.md section 7).
         command.env("WHIRL_CONFIG", &self.config_path);
         command.env("WHIRL_BACKEND", self.backend.as_str());
+        // The same reasoning for 4.3's two path knobs, and here it is a
+        // correctness rule rather than a convenience: the worker's recent window
+        // of 4.1 is read from `history.json` in the state directory and
+        // `index.json` in the cache root (7.2's ownership table puts both files
+        // on the daemon). The scrub below would otherwise leave the child to
+        // re-derive both from `HOME` and the compiled defaults, so a daemon that
+        // took either path from the environment (4.3 puts it ahead of the file)
+        // would write history the worker never reads and get an empty window
+        // back. The values are this daemon's resolved ones, not whatever the
+        // session had: a forwards-when-set pass-through would still rely on the
+        // child resolving exactly as the daemon did.
+        command.env("WHIRL_STATE_DIR", &self.state_dir);
+        command.env("WHIRL_CACHE_DIR", &self.cache_dir);
         // Only when the daemon's own environment sets it, and never written to
         // a file (docs/architecture.md 6.3). The value is never printed.
         if let Some(value) = std::env::var_os("WHIRL_WALLHAVEN_API_KEY") {
@@ -147,15 +255,23 @@ impl Worker {
             }
         }
 
-        let mut child = command
+        // `ETXTBSY` is the kernel refusing before anything ran, so a retry costs
+        // nothing and a report would be about a worker that never existed. Every
+        // other refusal is today's first-attempt failure.
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| WorkerError::Failed {
-                code: ErrorCode::WorkerFailed,
-                message: format!("cannot spawn {}: {error}", self.program.display()),
-            })?;
+            .stderr(Stdio::piped());
+
+        let mut child = match spawn_with_retry(|| command.spawn()) {
+            Ok(child) => child,
+            Err(error) => {
+                return Err(WorkerError::Failed {
+                    code: ErrorCode::WorkerFailed,
+                    message: format!("cannot spawn {}: {error}", self.program.display()),
+                });
+            }
+        };
 
         let deadline_at = Instant::now() + deadline;
         let status = loop {
@@ -170,11 +286,24 @@ impl Worker {
                 }
             }
             if Instant::now() >= deadline_at {
-                terminate(&mut child);
+                // 8.8's proof, on the path where the daemon does the killing:
+                // `terminate` reaped the child, so this pid's holder is provably
+                // gone and 7.3 step 4's sweep may remove that worker's
+                // `rotate.lock` under 8.7's `excl_file` fallback. Nothing extra
+                // is waited for -- the reap is the `try_wait`/`wait` 1.7.1's
+                // escalation already performed -- so a hung rotation still
+                // cannot keep this daemon from answering `status`.
+                *reaped = terminate(&mut child);
                 return Err(WorkerError::Timeout);
             }
             std::thread::sleep(POLL);
         };
+
+        // 8.8's proof, and the only place it is obtained: `try_wait` returned the
+        // exit status, so this process has reaped the child that held that pid.
+        // Every path that returns above this line leaves `reaped` exactly as the
+        // caller left it.
+        *reaped = Some(child.id());
 
         // Read after the exit. The contract caps stdout at two lines and stderr
         // at one, so the pipe buffer cannot be full; a worker that ignored the
@@ -187,6 +316,42 @@ impl Worker {
         }
         if let Some(mut pipe) = child.stderr.take() {
             let _ = pipe.read_to_string(&mut stderr);
+        }
+
+        // The daemon owns the worker's pipes and appends what the worker wrote to
+        // the log: `[D 6 §7.2]`'s `decision:` says the worker "writes its result
+        // and its diagnostics to stdout and stderr, and the daemon, which is its
+        // parent and owns the pipes, appends them", and architecture.md 1.6
+        // says the daemon "keeps the whole capture for the log". Until this
+        // loop, this daemon appended stdout and dropped stderr unless the exit
+        // code was non-zero, so stderr was read as an error channel and not as
+        // the diagnostics surface 7.2 makes it.
+        //
+        // A file skipped before candidacy is what that costs. features.md 2.2's
+        // `min_width` row decides it ("a file whose header cannot be read is
+        // excluded and *logged*, because a file we cannot measure is a file we
+        // cannot promise will display"), the counts it moves have no column in
+        // 2.6's `source:` record because 2.5's filter reporting is the
+        // candidates removed *per stage*, and `whirl_core::source::Enumerated`
+        // states the rule for the family ("a walk that ended before it spent
+        // every configured page says so on stderr where it happens, which is the
+        // surface an operator reads"). So a worker that exited 0 after skipping
+        // a user's files told nobody: the file was absent from `config check`
+        // (not a candidate, every rejection counter 0, `reason=-`) and absent
+        // from this log, and a collection looked smaller than it is with no
+        // reason given.
+        //
+        // Every diagnostic line is appended, on every exit, so the worker's own
+        // words come first and this daemon's report of a failure follows them:
+        // the `stage=<name> code=<code> message=<text>` line that
+        // [`failure_from`] reads is on this same stderr, and the caller logs the
+        // code it named (`whirld: rotation <run> failed: ...` in the scheduler,
+        // the `ERR` code of 2.7 to the client).
+        for line in stderr.lines() {
+            let line = line.trim_end();
+            if !line.is_empty() {
+                eprintln!("whirld: worker {} run {run}: {line}", verb.as_str());
+            }
         }
 
         if !status.success() {
@@ -258,26 +423,1165 @@ fn failure_from(stderr: &str) -> WorkerError {
 /// `SIGTERM`, five seconds, then `SIGKILL` (1.7.1).
 ///
 /// `Child::kill` is `SIGKILL` on Unix and the standard library has no signal
-/// API, so the polite half goes through `kill(1)`, which exists on every Unix
-/// this build targets. A missing `kill` falls straight through to `SIGKILL`.
-fn terminate(child: &mut std::process::Child) {
+/// API, so the polite half is one `kill(2)` call, through the declaration and
+/// the `send_signal` wrapper below. A syscall has no program that can be
+/// missing, so the absent-`kill`-binary class is gone rather than covered by a
+/// second program that could be absent as well, and no `exec` is left anywhere
+/// on the signal path. What this module may not assume is that a `kill` program
+/// is installed, and the history is kept here because the failure mode was
+/// silence:
+///
+/// `kill(1)` is `procps`' on Debian, `procps` is priority `important` rather
+/// than `required`, and the slim images this project builds and reviews in
+/// (`rust:1.85-slim`, `rust:1.94-slim-bookworm`, both arm64) have no `kill`
+/// anywhere on `PATH`. `Command::new("kill")` there failed with `ENOENT` (code
+/// 2) before any signal existed, and because that error was discarded, the
+/// grace below ran its whole five seconds against a worker that was never told
+/// anything before the run ended in `SIGKILL` alone. That is 1.7.1's grace with
+/// the polite half missing, and it is what
+/// `a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace` reported
+/// as "no SIGTERM trap ran in 30s" in a container, identically on base
+/// `7e22e1a` and on `origin/development`, with the run taking exactly
+/// `DEADLINE` plus `TERM_GRACE` (8.01s) because nothing had been signalled.
+///
+/// It was not a PID 1 story, and measuring said so: under `cargo test` in that
+/// image PID 1 is `cargo`, which forks the test binary, which forks the worker,
+/// so the worker is a grandchild with an ordinary PID (probe: worker PID 33 and
+/// the script's own `$$` 33, while PID 1 held `sh`). Nothing in this path turns
+/// on PID 1's default dispositions; all of it turns on whether a `kill` program
+/// exists, which is why the answer is a route that cannot be missing rather than
+/// a second program that might be.
+///
+/// The route changed the failure mode, so this is what the syscall can return
+/// and what each one is worth here. It is printed, not discarded:
+///
+/// - `ESRCH`, no such process: the child exited by itself between the deadline
+///   that put us here and this call, which is the one race this path always had
+///   and is not a defect. Worth the line anyway, because a pid that is already
+///   gone is exactly the case where a polite half that never landed leaves no
+///   trace in the outcome: the run still ends in `Timeout` either way.
+/// - `EPERM`, this process may not signal that pid: a child of ours is not a
+///   candidate for it outside a sandbox or a uid change, and nothing here could
+///   fix it if it were. Not fatal, `SIGKILL` below is attempted either way, and
+///   the run ends in `Timeout` exactly as 1.7.1 says.
+/// - `EINVAL`, the signal number is not one this platform accepts: unreachable
+///   from this code, which passes `SIGTERM` and (in the test) `SIGNAL_NONE`,
+///   both valid on every Unix here. It is a programming error, and it gets the
+///   same line as the other two.
+///
+/// **What it returns, and why that is now a value.** `Some(pid)` means this
+/// process holds that child's exit status: the grace-window `try_wait` returned
+/// it, or the `wait` after `SIGKILL` did. Holding the exit status of `pid` is
+/// 8.8's proof that the holder of `pid` is gone, and it is the one thing that
+/// entitles a take of `rotate.lock` to remove a lock file under 8.7's
+/// `excl_file` fallback (7.3 step 4), so the deadline branch of
+/// `run_reporting_reaped` reports it rather than dropping it. `None` is the two
+/// answers that show nothing: a `try_wait` that failed, and a `wait` that
+/// failed.
+///
+/// The `wait` is not new and its bound is not new: it is the blocking wait
+/// 1.7.1's escalation already performed after `SIGKILL`, read instead of
+/// discarded. It is bounded by the killed process's exit: a process the kernel
+/// cannot deliver `SIGKILL` to yet (uninterruptible I/O) has the kill pending,
+/// so the wait ends when that process does, and no poll loop changes that.
+/// Dropping the wait would leave this process without an exit status and the
+/// daemon without 8.8's exception, which is what this function is here to
+/// supply. A rotation that hangs costs the deadline path exactly what it cost
+/// before, and the daemon keeps answering `status` throughout, because the wait
+/// is on the rotation's own thread (1.7.1, 1.8).
+fn terminate(child: &mut std::process::Child) -> Option<u32> {
+    let pid = child.id();
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if let Err(error) = send_signal(pid, SIGTERM) {
+            eprintln!("whirld: worker {pid}: SIGTERM: {error}");
+        }
     }
     let grace = Instant::now() + TERM_GRACE;
     while Instant::now() < grace {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            // The exit status, in hand: the child is reaped by this process.
+            Ok(Some(_)) => return Some(pid),
             Ok(None) => std::thread::sleep(POLL),
             Err(_) => break,
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    // `Ok` is the exit status of the killed child, so it too is a reap.
+    child.wait().ok().map(|_| pid)
+}
+
+/// `SIGTERM`: the polite half of 1.7.1. 15 on every Unix this build targets,
+/// macOS included.
+#[cfg(unix)]
+const SIGTERM: i32 = 15;
+
+// `kill(2)`, declared by hand because this workspace has no third-party
+// dependencies (v0.1) and there is no `libc` to borrow the declaration from.
+// `flock` is declared the same way in `lock.rs` and `tests/daemon_lock.rs`, and
+// `umask` in `socket.rs`.
+//
+// `pid_t` is `i32` on macOS and on Linux, and this module is Unix-only (every
+// module of this binary is: `main.rs`), so one declaration covers both.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+/// Send `signal` to `pid`, through `kill(2)` and nothing else.
+///
+/// `Ok(())` means the kernel accepted the signal for delivery. `Err` carries
+/// the errno, which is what `terminate` above prints and what the test below
+/// asserts on. There is no second route: on every Unix this builds for, the
+/// syscall is the thing that exists, and it is the only thing that has to.
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: `kill(2)` takes two integers, reads no memory and dereferences no
+    // pointer, so no argument can make it fault and the most a bad one buys is
+    // `EINVAL`. `pid` is a live child's own id from `Child::id`, which is a
+    // `pid_t` widened to `u32` on Unix, so the cast narrows nothing back.
+    let sent = unsafe { kill(pid as i32, signal) };
+    if sent == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread::JoinHandle;
+
+    /// A temp directory with scripts in it. The tests below are the only place
+    /// where a "worker" is anything other than `whirl-worker`: a deliberately
+    /// slow or misbehaving program is the only way to reach the deadline and the
+    /// `SIGTERM`/`SIGKILL` escalation without waiting five minutes for the real
+    /// one, and `Worker::new` takes the program path, so a script is a worker as
+    /// far as this module is concerned.
+    struct Scripts {
+        dir: PathBuf,
+    }
+
+    impl Scripts {
+        fn new(name: &str) -> Scripts {
+            let dir = std::env::temp_dir()
+                .join(format!("whirl-worker-test-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("a temp directory");
+            Scripts { dir }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+
+        /// Write an executable `/bin/sh` script: the same interpreter every Unix
+        /// this build targets has, and `env_clear()` does not touch argv.
+        fn script(&self, name: &str, body: &str) -> PathBuf {
+            let path = self.path(name);
+            fs::write(&path, body).expect("a script");
+            let mut permissions = fs::metadata(&path).expect("the script").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("an executable script");
+            path
+        }
+
+        fn text(&self, name: &str) -> String {
+            fs::read_to_string(self.path(name)).unwrap_or_else(|error| {
+                panic!("{} was not written: {error}", self.path(name).display())
+            })
+        }
+
+        fn exists(&self, name: &str) -> bool {
+            self.path(name).exists()
+        }
+    }
+
+    impl Drop for Scripts {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The config path is never read: every script here ignores its argv, which
+    /// is itself part of what is being shown (1.6's argv is fixed and the
+    /// program is told, not asked). The two directories are the daemon's
+    /// resolved ones; nothing here reads them either, except the one test that
+    /// asks what the child was told.
+    fn worker(program: PathBuf) -> Worker {
+        Worker::new(
+            program,
+            PathBuf::from("/nonexistent/whirl/config.json"),
+            Backend::Noop,
+            PathBuf::from("/nonexistent/whirl/state"),
+            PathBuf::from("/nonexistent/whirl/cache"),
+        )
+    }
+
+    /// The deadline for the tests that are not about the deadline. `cargo test`
+    /// runs these in parallel and each one spawns a process, so a one-second
+    /// deadline here would be testing the machine's load rather than the worker.
+    fn generous() -> Duration {
+        Duration::from_secs(30)
+    }
+
+    /// The deadline of the test that *is* about the deadline.
+    ///
+    /// It has to be short enough that this test proves the escalation rather than
+    /// the 300 s default of 1.7.1, and long enough that it cannot be defeated by
+    /// the child's own start-up: the child has to be forked, exec'd, and have
+    /// installed its `TERM` trap before the deadline can fire, and a `SIGTERM`
+    /// delivered before the trap exists kills it by default action, which is a
+    /// failure that says nothing about the daemon.
+    ///
+    /// One second was not long enough. Reproduced on this machine (macOS, 6 `sh`
+    /// busy loops plus the eight test binaries of `cargo test --workspace` in
+    /// parallel): 1 run in 8 failed on `elapsed >= TERM_GRACE` with the child
+    /// dead in about 1 s, which is that race and not a daemon defect. Three
+    /// seconds is 100x below the documented default; the trap is also installed
+    /// before the pid file is written, so a child that is slow to start survives
+    /// the signal whenever the two orderings can still be reconciled.
+    ///
+    /// It is not enough on its own, and `9d2402eb` is where that became plain.
+    /// The child's arming - fork, exec, trap, pid file - took 0.57 s to 2.83 s
+    /// across 28 runs under the card's 12-spinner load, so this deadline sits
+    /// barely above the worst run rather than the order of magnitude above it the
+    /// paragraph above claims; and in 1 of the card's 14 loaded full-suite runs
+    /// the child had still not armed when the deadline fired, the `SIGTERM` killed
+    /// it by default action, and the run failed at the marker assertion (the
+    /// `worker.rs:829` run: 3.51 s of test, no marker, child dead at the
+    /// deadline) with nothing wrong with the daemon.
+    ///
+    /// That is a premise, not an assertion, and no fixed deadline can hold it on
+    /// a machine whose load is not this test's to bound. So the test no longer
+    /// assumes it: a run whose child had no trap in place when the deadline fired
+    /// is discarded and re-run, `ARMED_ATTEMPTS` times, and only a child that
+    /// could have trapped the signal is allowed to speak about the daemon.
+    const DEADLINE: Duration = Duration::from_secs(3);
+
+    /// Two files are the same file: the device and inode comparison behind
+    /// `[ a -ef b ]`, used to ask whether this process's own stdin is the null
+    /// device.
+    fn same_file(left: &str, right: &str) -> bool {
+        match (fs::metadata(left), fs::metadata(right)) {
+            (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+            _ => false,
+        }
+    }
+
+    /// 1.6's environment rule, as a set equality rather than a membership test:
+    /// the child sees the two names that are always set, the four the daemon
+    /// adds (the config path, the backend, and this daemon's resolved state and
+    /// cache directories), the API key when the daemon has one, the nine Linux
+    /// session variables on Linux when they are set, and nothing else. The shell
+    /// sets `PWD`, `SHLVL` and `_` for itself, which is why they are named here
+    /// instead of silently tolerated.
+    ///
+    /// An implementation that forgot `env_clear()` fails on the extra names: the
+    /// test process's own environment has at least `CARGO_*` in it under
+    /// `cargo test`, and the assertion prints both sets when it fails.
+    #[test]
+    fn the_environment_is_exactly_the_names_1_6_lists() {
+        let scripts = Scripts::new("env");
+        let dump = scripts.path("env.txt");
+        let program = scripts.script(
+            "dump.sh",
+            &format!("#!/bin/sh\nenv > '{}'\n", dump.display()),
+        );
+
+        let outcome = worker(program).run(Verb::Rotate, None, 1, generous());
+        assert!(
+            matches!(outcome, Err(WorkerError::Failed { .. })),
+            "the script prints no set: line: {outcome:?}"
+        );
+
+        let mut names: Vec<String> = scripts
+            .text("env.txt")
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_string()))
+            .collect();
+        names.sort();
+
+        let mut expected: Vec<String> = ALWAYS.iter().map(|name| name.to_string()).collect();
+        expected.push("WHIRL_CONFIG".to_string());
+        expected.push("WHIRL_BACKEND".to_string());
+        // The two path knobs of 4.3 the worker resolves for itself. They are set
+        // unconditionally, to this daemon's resolved directories, so the child
+        // cannot read a different `history.json` than the daemon wrote: that is
+        // the recent window of 4.1, and an empty one repeats the image just set.
+        expected.push("WHIRL_STATE_DIR".to_string());
+        expected.push("WHIRL_CACHE_DIR".to_string());
+        if std::env::var_os("WHIRL_WALLHAVEN_API_KEY").is_some() {
+            expected.push("WHIRL_WALLHAVEN_API_KEY".to_string());
+        }
+        if cfg!(target_os = "linux") {
+            for name in LINUX_ONLY {
+                if std::env::var_os(name).is_some() {
+                    expected.push(name.to_string());
+                }
+            }
+        }
+        expected.sort();
+
+        // The shell sets its own `PWD`, `SHLVL` and `_` for the process it
+        // execs, and those are the *only* names the daemon did not put there
+        // that are tolerated. They are named in one place and checked for
+        // membership, so a variable smuggled in under a different name fails.
+        const SHELL_OWNED: [&str; 3] = ["PWD", "SHLVL", "_"];
+        let outside: Vec<&String> = names
+            .iter()
+            .filter(|name| !expected.contains(name))
+            .collect();
+        let unexpected: Vec<&&String> = outside
+            .iter()
+            .filter(|name| !SHELL_OWNED.contains(&name.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "the worker saw names 1.6 does not list: {unexpected:?} (whole environment: {})",
+            names.join(" ")
+        );
+        for name in &expected {
+            assert!(
+                names.contains(name),
+                "{name} is missing from the worker's environment ({})",
+                names.join(" ")
+            );
+        }
+    }
+
+    /// The daemon's own resolved state and cache directories reach the worker,
+    /// and they are this daemon's values rather than whatever the test process's
+    /// session had.
+    ///
+    /// This is the seam the recent window of 4.1 was dropped across.
+    /// `whirl_worker::pipeline::Window::load` reads `history.json` from
+    /// `WHIRL_STATE_DIR` and `index.json` from `WHIRL_CACHE_DIR`, so a scrub that
+    /// left the child to re-derive both from `HOME` and the compiled defaults
+    /// handed it a window built from a directory the daemon never wrote: the
+    /// window came out empty, and consecutive rotations set the same image while
+    /// an unused candidate sat in the source's own list.
+    #[test]
+    fn the_daemons_resolved_directories_reach_the_worker() {
+        let scripts = Scripts::new("resolved-paths");
+        let dump = scripts.path("paths.txt");
+        let program = scripts.script(
+            "paths.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s %s' \"$WHIRL_STATE_DIR\" \"$WHIRL_CACHE_DIR\" > '{}'\n",
+                dump.display()
+            ),
+        );
+        // Deliberately not the platform defaults, and deliberately not this
+        // process's environment: a scrub that forwarded the ambient values would
+        // pass with the defaults and fail here.
+        let state_dir = scripts.path("state");
+        let cache_dir = scripts.path("cache");
+        let worker = Worker::new(
+            program,
+            PathBuf::from("/nonexistent/whirl/config.json"),
+            Backend::Noop,
+            state_dir.clone(),
+            cache_dir.clone(),
+        );
+
+        let outcome = worker.run(Verb::Rotate, None, 1, generous());
+        assert!(
+            matches!(outcome, Err(WorkerError::Failed { .. })),
+            "the script prints no set: line: {outcome:?}"
+        );
+
+        assert_eq!(
+            scripts.text("paths.txt"),
+            format!("{} {}", state_dir.display(), cache_dir.display()),
+            "the worker must be told the directories the daemon resolved; re-deriving its own \
+             leaves the recent window of 4.1 empty"
+        );
+    }
+
+    /// How closely the test can pin the *early* side of the deadline: how much
+    /// before `DEADLINE` a `SIGTERM` may be and still count as at it.
+    ///
+    /// The reading it is applied to is a late-biased one and can never lead the
+    /// signal: the watcher polls every `WATCH_POLL`, and a shell runs a trap only
+    /// between the commands it is executing, so the marker lags the true
+    /// `SIGTERM` by however long the command in flight takes to return plus
+    /// however long the shell and the watching thread waited for a core. Both of
+    /// those are the machine's, and `9d2402eb` measured them under load (12 busy
+    /// loops on 8 cores) in the same runs, which is where the script
+    /// below got its shape:
+    ///
+    /// - a shell blocked in the `wait` builtin, which is what the script does
+    ///   now, ran the trap 5.8 ms to 23.8 ms after the signal;
+    /// - the same loop with a foreground `sleep 0.05` in flight, which is what it
+    ///   did before, ran it 47.8 ms to 531 ms after the signal - the handler
+    ///   cannot run until the command in flight returns - and the card's two
+    ///   failures at `worker.rs:848` (a measured grace of 4.3953 s and 4.3763 s
+    ///   against this 5 s minus this tolerance) are that same lag one load-step
+    ///   deeper, at 0.60 s and 0.62 s;
+    /// - the watcher's own observation lagged the marker write by 1 ms to 9 ms.
+    ///
+    /// 500 ms is therefore an order of magnitude above the handler's measured
+    /// tail rather than a blanket over it, and it leaves the grace assertion
+    /// below (which subtracts this same reading from the total) about 470 ms of
+    /// room. It is also six times below the 3 s the defect this asserts against
+    /// is off by, so the mutation in the pull request still fails by thousands of
+    /// milliseconds rather than by a hair.
+    const TOLERANCE: Duration = Duration::from_millis(500);
+
+    /// How many runs the test gives the child to arm inside the deadline before
+    /// it gives up on the machine.
+    ///
+    /// The premise a run needs is that the child has its `TERM` trap in place
+    /// when the deadline fires; that is the child's arming racing the deadline,
+    /// and the arming is the machine's, not the daemon's. Three, because the
+    /// card's box missed it in 1 run of 14 (0.57 s to 2.83 s of arming against a
+    /// 3 s deadline): three misses in a row are then about 1 in 2700, and the
+    /// extra time is only paid when a run is discarded - about 3.5 s for a child
+    /// that died on the signal, and the grace on top if it armed and the handler
+    /// was starved instead.
+    const ARMED_ATTEMPTS: usize = 3;
+
+    /// The tolerance on the *late* side: how much after the deadline the
+    /// `SIGTERM` may be, and how much after `DEADLINE + TERM_GRACE` the total
+    /// may be. Deliberately looser than `TOLERANCE`, because it is a sanity
+    /// check on the total rather than one of the two facts this test exists for:
+    /// it catches an escalation that runs away (a worker never killed, a wait
+    /// measured in seconds instead of milliseconds), and the cost of being wrong
+    /// the other way is a test the scheduler can fail, which would be worse than
+    /// missing a defect this card does not concern.
+    const SLACK: Duration = Duration::from_secs(2);
+
+    /// How often the watcher below looks for the marker file.
+    const WATCH_POLL: Duration = Duration::from_millis(2);
+
+    /// The watcher's own bail-out, so a worker that is never signalled cannot
+    /// leave a thread spinning past the end of the test. Longer than the
+    /// deadline plus the grace, which is all the run can take.
+    const WATCH_BOUND: Duration = Duration::from_secs(30);
+
+    /// `ESRCH`: the errno `kill(pid, 0)` returns once the pid is gone. macOS and
+    /// Linux agree on 3, so unlike `EWOULDBLOCK` in `tests/daemon_lock.rs` this
+    /// one needs no `cfg`.
+    const ESRCH: i32 = 3;
+
+    /// How many times a deadline test repeats a run in which the worker never
+    /// reached its own first write, with the deadline tripled each time.
+    ///
+    /// `DEADLINE` owns the reason the first attempt can lose that race: the child
+    /// has to be forked, exec'd and given a slice of CPU before anything of the
+    /// script runs, and the deadline is already counting. `DEADLINE`'s evidence
+    /// was a busy machine losing it once in eight; a machine at load average 44
+    /// on eight cores loses it about once in ten, which is what this corrects
+    /// for. The retries are of the *precondition* only: every run still has to
+    /// end in the deadline, the reap is asserted on the first run that has the
+    /// worker's pid, and a first attempt that gets there is the only attempt.
+    const START_UP_ATTEMPTS: u32 = 3;
+
+    /// `kill(2)`'s own existence question: signal 0 is never delivered, it only
+    /// asks whether the pid is there and whether this process could signal it.
+    /// The test below leans on that to prove the killed worker is gone. It lives
+    /// here rather than beside `SIGTERM` because this test is its only caller.
+    const SIGNAL_NONE: i32 = 0;
+
+    /// When the child's two files appeared, on the test's own clock.
+    ///
+    /// `[armed, trapped]`, in that order: the pid file the child writes with its
+    /// `TERM` trap already installed, and the marker that trap appends to. The
+    /// first is the child saying it could trap a signal at all, which the test
+    /// needs to read separately from the second, because only the second proves
+    /// one was trapped.
+    ///
+    /// A timestamp written by the trap itself would be a wall-clock reading
+    /// taken in another process, and the test has no way to compare that with
+    /// the `Instant` it takes before the spawn. So the child's files keep their
+    /// one job, and this thread watches for them and records an `Instant` when
+    /// each exists: one clock, one process, nothing to correlate.
+    ///
+    /// The reading is always at or after the write, never before it, as
+    /// described on `TOLERANCE`.
+    struct TermWatch {
+        stop: Arc<AtomicBool>,
+        running: JoinHandle<()>,
+        seen: mpsc::Receiver<(usize, Instant)>,
+    }
+
+    impl TermWatch {
+        fn new(files: [PathBuf; 2]) -> TermWatch {
+            let (sender, seen) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let watching = Arc::clone(&stop);
+            let running = std::thread::spawn(move || {
+                let give_up = Instant::now() + WATCH_BOUND;
+                let mut reported = [false; 2];
+                loop {
+                    let mut pending = false;
+                    for (index, path) in files.iter().enumerate() {
+                        if !reported[index] && path.exists() {
+                            reported[index] = true;
+                            let _ = sender.send((index, Instant::now()));
+                        }
+                        pending |= !reported[index];
+                    }
+                    if !pending || watching.load(Ordering::SeqCst) || Instant::now() >= give_up {
+                        // A file written in the same instant the test stopped
+                        // watching is still reported rather than lost to the
+                        // race, since the file outlives both threads.
+                        for (index, path) in files.iter().enumerate() {
+                            if !reported[index] && path.exists() {
+                                let _ = sender.send((index, Instant::now()));
+                            }
+                        }
+                        return;
+                    }
+                    std::thread::sleep(WATCH_POLL);
+                }
+            });
+            TermWatch {
+                stop,
+                running,
+                seen,
+            }
+        }
+
+        /// The two readings, once the watcher has stopped: `None` for a file the
+        /// child never wrote.
+        fn moment(self) -> [Option<Instant>; 2] {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = self.running.join();
+            let mut moments = [None; 2];
+            while let Ok((index, moment)) = self.seen.try_recv() {
+                moments[index] = Some(moment);
+            }
+            moments
+        }
+    }
+
+    /// `SIGTERM` **at the deadline**, the whole five-second grace, then
+    /// `SIGKILL` (1.7.1). The script appends to the marker file from its `TERM`
+    /// trap and keeps running through the signal, so the marker proves the
+    /// polite signal arrived and the exit proves the kill was needed and worked.
+    ///
+    /// Three facts, not one, and the reason is the earlier version of this test.
+    /// It asserted only `elapsed >= TERM_GRACE`, which a daemon that sent
+    /// `SIGTERM` the instant the child existed and `SIGKILL` five seconds later
+    /// satisfied, while never looking at the deadline at all: the test passed
+    /// for the wrong reason. The moment the trap ran is now recorded, and
+    /// checked against the deadline itself:
+    ///
+    /// 1. the trap ran no earlier than the deadline, within `TOLERANCE`;
+    /// 2. it did not run late either, within `SLACK`;
+    /// 3. the exit came at least the grace after the trap, within `TOLERANCE`;
+    /// 4. and the total is the deadline plus the grace, within those bounds.
+    ///
+    /// A daemon that skipped `SIGTERM` fails 1 and the marker assertion; one
+    /// that killed alongside the signal fails 3 and 4; one that returned without
+    /// killing leaves the process alive and fails the `kill(pid, 0)` probe.
+    ///
+    /// A fifth fact, and it is 8.8's rather than 1.7.1's: the deadline's
+    /// `SIGKILL` is a reap, so `run_reporting_reaped` reports the pid whose exit
+    /// status this process holds, and 7.3 step 4's sweep can therefore remove
+    /// that worker's `rotate.lock` under 8.7's `excl_file` fallback. This is the
+    /// branch of `terminate` where `SIGKILL` was needed and the `wait` after it
+    /// supplied the exit status; the run that dies on `SIGTERM` alone is the
+    /// other branch, and `the_deadline_reports_the_pid_of_a_worker_that_dies_on_sigterm`
+    /// is that one.
+    ///
+    /// What it still cannot see: the instant of the signal itself, any closer
+    /// than `TOLERANCE` early and `SLACK` late, and the signal by number. The
+    /// signal is observed only through the shell's trap table, so this says
+    /// "the trap the script installed for `TERM` ran", which on every shell
+    /// here means `SIGTERM` and not that the daemon sent it with `kill(2)`
+    /// rather than by any other route to the same signal.
+    ///
+    /// The `trap` is the script's first statement and the pid file its second:
+    /// both orderings are load-sensitive, and installing the handler before
+    /// anything that can block keeps the window in which a `SIGTERM` would kill
+    /// the child by default action as small as the shell can make it. The loop
+    /// that follows blocks in `wait` rather than inside a `sleep`, so the trap
+    /// runs when the signal arrives instead of when the command in flight
+    /// returns (numbers on `TOLERANCE`).
+    ///
+    /// A run whose child could not arm before the deadline is discarded and
+    /// re-run, and the two ways a run can end with no marker are pulled apart
+    /// rather than assumed: a child that had its trap in place and never trapped
+    /// the signal is the daemon failing to deliver it politely, which is a
+    /// failure, while a child that had no trap to trap with is the machine, which
+    /// is a re-run (`ARMED_ATTEMPTS`). Read as one shape, the second is
+    /// `9d2402eb`'s second window.
+    #[test]
+    fn a_slow_worker_is_termed_at_the_deadline_and_killed_after_the_grace() {
+        let scripts = Scripts::new("escalate");
+        let marker = scripts.path("term.txt");
+        let pid = scripts.path("pid.txt");
+
+        let mut arming = Vec::new();
+        let (outcome, elapsed, termed_at, reaped) = loop {
+            // A discarded run leaves its own pid file behind, and a stale one
+            // would tell the arm check below about the run before it.
+            let _ = fs::remove_file(&pid);
+            let _ = fs::remove_file(&marker);
+            let program = scripts.script(
+                "slow.sh",
+                &format!(
+                    "#!/bin/sh\ntrap 'echo term >> \"{}\"' TERM\necho $$ > '{}'\nwhile :; do sleep 0.05 & wait; done\n",
+                    marker.display(),
+                    pid.display()
+                ),
+            );
+
+            let started = Instant::now();
+            // The pid file is watched for first: it is the child saying it could
+            // trap a signal at all, and the check below needs that answer even
+            // when the marker never appears.
+            let watch = TermWatch::new([pid.clone(), marker.clone()]);
+            // Declared inside the loop, so every attempt reports the child it
+            // spawned: a discarded attempt spawns and reaps one too, and the pid
+            // it holds must not outlive the attempt it belongs to.
+            let mut reaped = None;
+            let outcome =
+                worker(program).run_reporting_reaped(Verb::Rotate, None, 7, DEADLINE, &mut reaped);
+            let elapsed = started.elapsed();
+            let [armed_at, termed_at] = watch.moment();
+            let armed_at = armed_at.map(|moment| moment.duration_since(started));
+            let termed_at = termed_at.map(|moment| moment.duration_since(started));
+            arming.push(armed_at);
+
+            if let Some(termed_at) = termed_at {
+                break (outcome, elapsed, termed_at, reaped);
+            }
+
+            // No trap ran. A child whose handler was in place before the deadline
+            // could have trapped the signal, so a run that also ended at once has
+            // the signal going undelivered or the kill travelling alongside it.
+            assert!(
+                armed_at.is_none_or(|moment| moment > DEADLINE),
+                "the child had its TERM trap in place {armed_at:?} after the spawn, before the \
+                 {DEADLINE:?} deadline, and the run was over {elapsed:?} after the spawn with no \
+                 trap run: the polite SIGTERM was not delivered, or the child was killed \
+                 alongside it"
+            );
+            // The other shape: nothing was armed to trap with, so the deadline
+            // met a shell with the default disposition for `SIGTERM`. That is
+            // start-up latency, and the run is worth discarding and repeating.
+            assert!(
+                arming.len() < ARMED_ATTEMPTS,
+                "no child of {ARMED_ATTEMPTS} armed inside the {DEADLINE:?} deadline, so no run \
+                 could trap a signal: the arming came {arming:?} after the spawns, against a \
+                 {DEADLINE:?} deadline. That is this machine's start-up latency, not the daemon's \
+                 escalation"
+            );
+        };
+        let after_term = elapsed - termed_at;
+
+        assert!(
+            matches!(outcome, Err(WorkerError::Timeout)),
+            "the deadline expired, whatever the worker did on the way out: {outcome:?}"
+        );
+        assert!(
+            termed_at >= DEADLINE - TOLERANCE,
+            "SIGTERM is sent at the {DEADLINE:?} deadline, not before it: the trap ran {termed_at:?} after the spawn, and only {TOLERANCE:?} of tolerance is allowed"
+        );
+        assert!(
+            termed_at <= DEADLINE + SLACK,
+            "and not after it either: the trap ran {termed_at:?} after the spawn, and only {SLACK:?} of slack is allowed"
+        );
+        assert!(
+            after_term >= TERM_GRACE - TOLERANCE,
+            "the worker is killed a whole {TERM_GRACE:?} after SIGTERM: the exit came {after_term:?} after the trap ran"
+        );
+        assert!(
+            elapsed >= DEADLINE + TERM_GRACE - TOLERANCE,
+            "the total is the deadline plus the grace: {elapsed:?} elapsed, at least {DEADLINE:?} plus {TERM_GRACE:?} expected"
+        );
+        assert!(
+            elapsed <= DEADLINE + TERM_GRACE + SLACK,
+            "and no more than that plus slack: {elapsed:?} elapsed"
+        );
+        assert!(
+            scripts.exists("term.txt"),
+            "the worker was sent SIGTERM before being killed"
+        );
+        assert_eq!(
+            scripts.text("term.txt").trim(),
+            "term",
+            "the trap ran once, on the one SIGTERM"
+        );
+
+        let pid: u32 = scripts.text("pid.txt").trim().parse().expect("a pid");
+        assert_eq!(
+            reaped,
+            Some(pid),
+            "8.8: 1.7.1's `SIGKILL` is a reap, so the run reports the pid whose exit status it holds, which is what 7.3 step 4's sweep removes a leftover `rotate.lock` on"
+        );
+        // Through the same syscall the daemon just used, so this probe is not
+        // itself a reason for the test to fail on an image with no `kill(1)`
+        // binary (see `terminate`): signal 0 is `kill(2)`'s own existence
+        // question and is never delivered. `ESRCH` is a stricter answer than
+        // the `kill(1)` exit status this replaces, which said only that the
+        // command was unhappy, not why.
+        let probe = send_signal(pid, SIGNAL_NONE);
+        assert!(
+            matches!(&probe, Err(error) if error.raw_os_error() == Some(ESRCH)),
+            "the worker was killed and reaped, so {pid} is gone: {probe:?}"
+        );
+    }
+
+    /// The deadline's other reap, and the cheap one: a worker that dies on
+    /// `SIGTERM` alone is reaped inside the grace window, so `terminate` reports
+    /// it from the `try_wait` of that loop rather than from the `wait` after a
+    /// `SIGKILL`. The fact is the same one 8.8 rests on -- this process holds
+    /// the exit status, so the holder of that pid is provably gone -- and it
+    /// arrives earlier and without an escalation, which is the branch a worker
+    /// honouring 1.7.1's polite signal actually takes.
+    ///
+    /// Both branches are asserted, because a `terminate` that reported the pid
+    /// only after `SIGKILL` (or only in the grace window) would satisfy one test
+    /// and not the other.
+    ///
+    /// The run is retried while the machine loses the worker's start-up race to
+    /// the deadline, per `START_UP_ATTEMPTS`; the reap below is not retried.
+    #[test]
+    fn the_deadline_reports_the_pid_of_a_worker_that_dies_on_sigterm() {
+        let scripts = Scripts::new("deadline-term");
+        let pid = scripts.path("pid.txt");
+        // No `trap` line: the shell's default action for `SIGTERM` is to die, so
+        // this worker is gone within a poll of the signal and the grace window
+        // never elapses. The cost is the deadline, not the deadline plus the
+        // grace.
+        let program = scripts.script(
+            "polite.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nwhile :; do sleep 0.05; done\n",
+                pid.display()
+            ),
+        );
+
+        // `START_UP_ATTEMPTS` is why this is a loop and not one run: the child has
+        // to be forked, exec'd and given a slice of CPU before it can write its
+        // pid, and a machine under load can lose that race to `DEADLINE`. A run
+        // whose worker never wrote is a run with no worker in it -- nothing is
+        // reaped in it that the daemon could be blamed for -- so it is the
+        // precondition that is retried, with the deadline tripled. The assertion
+        // below is made on the first run that has the file and is never retried.
+        let mut worker_pid: Option<u32> = None;
+        let mut reaped = None;
+        let mut run = 3;
+        for attempt in 0..START_UP_ATTEMPTS {
+            run += 1;
+            reaped = None;
+            let outcome = worker(program.clone()).run_reporting_reaped(
+                Verb::Rotate,
+                None,
+                run,
+                DEADLINE * 3u32.pow(attempt),
+                &mut reaped,
+            );
+
+            assert!(
+                matches!(outcome, Err(WorkerError::Timeout)),
+                "the deadline expired, whatever the worker did on the way out: {outcome:?}"
+            );
+            match fs::read_to_string(&pid) {
+                Ok(text) => {
+                    worker_pid = Some(text.trim().parse().expect("a pid"));
+                    break;
+                }
+                // The child never reached its first statement. That is the
+                // start-up race and not a reading about the daemon: retry.
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => panic!("the worker's pid file: {error}"),
+            }
+        }
+        let worker_pid = worker_pid.unwrap_or_else(|| {
+            panic!(
+                "no worker reached its pid in {START_UP_ATTEMPTS} runs of {DEADLINE:?} and wider: this machine could not start a process inside any of them, so this is the start-up race `DEADLINE` describes and nothing is known about the daemon"
+            )
+        });
+        assert_eq!(
+            reaped,
+            Some(worker_pid),
+            "the grace window reaped it, and the exit status is the proof 8.8 asks for"
+        );
+        let probe = send_signal(worker_pid, SIGNAL_NONE);
+        assert!(
+            matches!(&probe, Err(error) if error.raw_os_error() == Some(ESRCH)),
+            "the reap is real: {worker_pid} is gone: {probe:?}"
+        );
+    }
+
+    /// The other answer of `terminate`, pinned so that the deadline's assignment
+    /// is not read as "always a pid": a spawn that never produced a worker has
+    /// no exit status to show, so `reaped` is left exactly as the caller left it
+    /// and 8.8's exception has nothing to act on.
+    #[test]
+    fn a_spawn_that_never_produced_a_worker_reports_no_reaped_pid() {
+        let scripts = Scripts::new("no-worker");
+        let mut reaped = None;
+
+        let outcome = worker(scripts.path("absent.sh")).run_reporting_reaped(
+            Verb::Rotate,
+            None,
+            1,
+            generous(),
+            &mut reaped,
+        );
+
+        assert!(
+            matches!(
+                outcome,
+                Err(WorkerError::Failed {
+                    code: ErrorCode::WorkerFailed,
+                    ..
+                })
+            ),
+            "a program that is not there is 2.7's `worker_failed`: {outcome:?}"
+        );
+        assert_eq!(
+            reaped, None,
+            "no worker existed, so this process holds no exit status and names no pid"
+        );
+    }
+
+    /// A worker that dies on its own reports the code it named on stderr (2.7),
+    /// and the daemon does not wait for the deadline to notice.
+    #[test]
+    fn a_worker_that_names_a_code_reports_it() {
+        let scripts = Scripts::new("named-code");
+        let program = scripts.script(
+            "fail.sh",
+            "#!/bin/sh\necho 'stage=set code=set_failed message=the setter refused' >&2\nexit 3\n",
+        );
+
+        let started = Instant::now();
+        let outcome = worker(program).run(Verb::Rotate, None, 1, Duration::from_secs(300));
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Err(WorkerError::Failed { code, message }) => {
+                assert_eq!(code, ErrorCode::SetFailed);
+                assert_eq!(
+                    message,
+                    "stage=set code=set_failed message=the setter refused"
+                );
+            }
+            other => panic!("the worker's own code wins over worker_failed: {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the exit was seen and not waited out: {elapsed:?}"
+        );
+    }
+
+    /// A worker that dies silently is `worker_failed`, with whatever it said as
+    /// the message: 2.7's code for an exit the daemon cannot explain.
+    #[test]
+    fn a_silent_death_is_worker_failed() {
+        let scripts = Scripts::new("silent-death");
+        let program = scripts.script(
+            "crash.sh",
+            "#!/bin/sh\necho 'whirl-worker: the download stage panicked' >&2\nexit 1\n",
+        );
+
+        match worker(program).run(Verb::Rotate, None, 1, generous()) {
+            Err(WorkerError::Failed { code, message }) => {
+                assert_eq!(code, ErrorCode::WorkerFailed);
+                assert_eq!(message, "whirl-worker: the download stage panicked");
+            }
+            other => panic!("a non-zero exit with no code: {other:?}"),
+        }
+    }
+
+    /// A worker that exits 0 having printed no `set:` line is `worker_failed`
+    /// too, and the message names what it did print, because that line is all
+    /// the evidence there is (1.6's stdout shape).
+    #[test]
+    fn a_zero_exit_without_a_set_line_is_worker_failed() {
+        let scripts = Scripts::new("no-set-line");
+        let program = scripts.script("quiet.sh", "#!/bin/sh\necho 'downloaded: ok'\n");
+
+        match worker(program).run(Verb::Rotate, None, 1, generous()) {
+            Err(WorkerError::Failed { code, message }) => {
+                assert_eq!(code, ErrorCode::WorkerFailed);
+                assert!(
+                    message.contains("downloaded: ok"),
+                    "the offending line is in the message: {message}"
+                );
+            }
+            other => panic!("exit 0 without a set: line is a failure: {other:?}"),
+        }
+    }
+
+    /// The happy path of the stdout parse: the *last* non-empty line is the
+    /// result, and a trailing carriage return is trimmed off it. Both are
+    /// asserted on the parsed record, so a parse that took the first line or
+    /// left the `\r` in the path fails on a field.
+    ///
+    /// The line here is the worker's own (`set: <digest> <origin_key> <abs
+    /// path>`, 1.6's three fields), which is *not* the four-field `set:` line of
+    /// 2.6: that one carries the `via` and is written by the daemon to a client.
+    #[test]
+    fn the_last_non_empty_line_is_the_result() {
+        let scripts = Scripts::new("last-line");
+        let digest = "a".repeat(64);
+        let program = scripts.script(
+            "set.sh",
+            &format!(
+                "#!/bin/sh\nprintf 'downloaded: {digest} /tmp/candidate.jpg\\n'\nprintf 'set: {digest} pictures:0123456789abcdef /tmp/candidate.jpg\\r'\n"
+            ),
+        );
+
+        match worker(program).run(Verb::Rotate, None, 7, generous()) {
+            Ok(Outcome::Set(record)) => {
+                assert_eq!(record.digest, digest);
+                assert_eq!(record.origin_key, "pictures:0123456789abcdef");
+                assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"));
+                assert_eq!(record.via, Via::Source);
+            }
+            other => panic!("the last line is a set: line: {other:?}"),
+        }
+    }
+
+    /// 1.6's stdin rule: the worker's stdin is the null device, not whatever the
+    /// daemon has. The check is `[ /dev/fd/0 -ef /dev/null ]`, and the test says
+    /// so out loud when its own stdin is *also* the null device, because then an
+    /// inherited stdin would look the same and the assertion would prove
+    /// nothing.
+    #[test]
+    fn the_worker_reads_the_null_device_not_the_daemons_stdin() {
+        let scripts = Scripts::new("stdin");
+        let digest = "b".repeat(64);
+        let program = scripts.script(
+            "stdin.sh",
+            &format!(
+                "#!/bin/sh\nif [ /dev/fd/0 -ef /dev/null ]; then\n  printf 'set: {digest} pictures:fedcba9876543210 /tmp/candidate.jpg\\n'\nelse\n  echo 'stage=stdin code=bad_args message=stdin was inherited' >&2\n  exit 3\nfi\n"
+            ),
+        );
+
+        if same_file("/dev/fd/0", "/dev/null") {
+            eprintln!(
+                "note: this harness's own stdin is the null device, so an inherited stdin would be indistinguishable; the assertion below is vacuous here"
+            );
+        }
+        match worker(program).run(Verb::Rotate, None, 1, generous()) {
+            Ok(Outcome::Set(record)) => {
+                assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"))
+            }
+            other => panic!("the worker's stdin must be the null device: {other:?}"),
+        }
+    }
+
+    /// How long the writer of `a_spawn_that_finds_the_script_busy_is_retried`
+    /// holds the script open for write.
+    ///
+    /// It is held before the run and released 100 ms into it, which is what makes
+    /// the first spawn attempt find the writer still there: without the retry
+    /// this test is red on Linux, and red with the CI's own message. It is also
+    /// short enough that a release thread descheduled for hundreds of
+    /// milliseconds still lands inside `SPAWN_ATTEMPTS`'s 450 ms budget, and long
+    /// enough that a pass cannot come from the release winning the race to the
+    /// first spawn.
+    const WRITER_HELD: Duration = Duration::from_millis(100);
+
+    /// `None` when this guest refuses an exec of a script that is held open for
+    /// write, which is the case the test below asserts on; `Some(reason)` when it
+    /// does not, which is a platform fact that test reports rather than fails on.
+    ///
+    /// The question is asked by attempting the exec, because there are three
+    /// platforms behind it and only one of them is Linux:
+    ///
+    /// - Linux refuses the call: `deny_write_access` on the exec target returns
+    ///   `ETXTBSY`, which `Command::spawn` hands back as
+    ///   `ErrorKind::ExecutableFileBusy`.
+    /// - Darwin does not enforce the rule at all, so the script runs and the child
+    ///   exits 0. That is why the test below has always been vacuous on macOS.
+    /// - The emulated amd64 guest does enforce the rule - a hand-written
+    ///   `fork`+`execv` in that same guest still prints `Text file busy` - but the
+    ///   refusal never reaches the caller: `Command::spawn` on Linux is glibc's
+    ///   `posix_spawnp`, and under the translation the errno of a failed exec is
+    ///   lost, so `posix_spawnp` returns 0 and `spawn` returns a child that exits
+    ///   127 (glibc's `SPAWN_ERROR`) having written nothing to either stream.
+    ///   Measured for every exec failure and not only this one - a missing file, a
+    ///   mode-0644 file and a directory all come back the same way - so on that
+    ///   guest no test can see a spawn failure through `Command::spawn` at all.
+    ///
+    /// The probe's script is `exit 0`, so a guest that runs it leaves a child that
+    /// exited 0 with nothing on either stream, and any other outcome is this
+    /// helper's own failure rather than a result to interpret.
+    fn why_the_busy_exec_is_not_refused(scripts: &Scripts) -> Option<&'static str> {
+        let program = scripts.script("exec-probe.sh", "#!/bin/sh\nexit 0\n");
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .expect("a writable handle on the probe script");
+
+        let started = Command::new(&program)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let answer = match started {
+            Err(error) if error.kind() == ErrorKind::ExecutableFileBusy => None,
+            Err(error) => panic!(
+                "the probe's exec of a busy script failed with {error}, which is not the kernel's \
+                 ETXTBSY refusal"
+            ),
+            Ok(child) => {
+                let output = child.wait_with_output().expect("the probe child's output");
+                match output.status.code() {
+                    Some(0) => Some(
+                        "this kernel does not refuse an exec of a file held open for write (Darwin)",
+                    ),
+                    Some(127) if output.stdout.is_empty() && output.stderr.is_empty() => Some(
+                        "this guest cannot report an exec failure through Command::spawn (the \
+                         emulated amd64 translation loses glibc's posix_spawnp errno), so the \
+                         refusal never reaches the caller",
+                    ),
+                    code => panic!(
+                        "the probe child exited {code:?} with stdout {:?} and stderr {:?}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                }
+            }
+        };
+        drop(writer);
+        answer
+    }
+
+    /// A spawn the kernel refuses with `ETXTBSY` is re-attempted, and the retry
+    /// really runs the worker: the assertion is the parsed `Outcome::Set` and its
+    /// fields, not "the spawn did not return an error".
+    ///
+    /// The rule being exercised is Linux's: `execve` refuses a file that any
+    /// process holds open for writing (`deny_write_access` on the exec target)
+    /// with `ETXTBSY`. In the CI failure that produced this test the holder was a
+    /// child forked from a *sibling* thread while `Scripts::script`'s writable
+    /// descriptor was still open, because `fork` duplicates the descriptor into
+    /// the child and the child can keep it past the write in the parent. That
+    /// interleaving cannot be constructed deterministically from a test, so the
+    /// writer here stands in for it: the same kernel rule, the same refusal, the
+    /// same release.
+    ///
+    /// The assertion runs only where the kernel's refusal reaches this process,
+    /// which `busy_exec` measures first: Darwin does not enforce the rule at all,
+    /// and the emulated amd64 guest enforces it with a kernel whose answer never
+    /// arrives here. Both print the reason and return, so a green run on those
+    /// guests says nothing about the retry; the retry itself is asserted on every
+    /// guest by `a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds`, which
+    /// is the test to read for the loop's behaviour rather than for its end.
+    #[test]
+    fn a_spawn_that_finds_the_script_busy_is_retried() {
+        let scripts = Scripts::new("busy");
+
+        if let Some(reason) = why_the_busy_exec_is_not_refused(&scripts) {
+            eprintln!(
+                "note: {reason}; the retry is not exercised end to end here, and \
+                 a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds covers it"
+            );
+            return;
+        }
+
+        let digest = "c".repeat(64);
+        let program = scripts.script(
+            "busy.sh",
+            &format!(
+                "#!/bin/sh\nprintf 'set: {digest} pictures:0123456789abcdef /tmp/candidate.jpg\\n'\n"
+            ),
+        );
+
+        // Held before the run, so the first attempt cannot miss it.
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .expect("a writable handle on the script");
+        let releasing = std::thread::spawn(move || {
+            std::thread::sleep(WRITER_HELD);
+            drop(writer);
+        });
+
+        let outcome = worker(program).run(Verb::Rotate, None, 1, generous());
+        releasing.join().expect("the writer thread");
+
+        match outcome {
+            Ok(Outcome::Set(record)) => {
+                assert_eq!(record.digest, digest);
+                assert_eq!(record.origin_key, "pictures:0123456789abcdef");
+                assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"));
+                assert_eq!(record.via, Via::Source);
+            }
+            other => panic!("a script that is busy for 100 ms is not a failed spawn: {other:?}"),
+        }
+    }
+
+    /// The retry loop itself: a spawn refused with `ETXTBSY` is attempted again
+    /// until it succeeds, a refusal that is not `ETXTBSY` comes back on the first
+    /// attempt, and after `SPAWN_ATTEMPTS` the caller sees the last refusal.
+    ///
+    /// The refusals here are the closure's rather than a kernel's, and that is what
+    /// makes this the half of the retry's coverage which runs everywhere: the
+    /// emulated amd64 guest cannot report an exec failure through `Command::spawn`
+    /// at all, and on Darwin the kernel never refuses the exec, so on both of them
+    /// `a_spawn_that_finds_the_script_busy_is_retried` prints its reason and
+    /// returns without asserting anything. The end-to-end case stays there, with
+    /// its writer, its kernel rule and its parsed `Outcome::Set` unchanged.
+    ///
+    /// The budget is the real one, so this test is asleep for about 550 ms by
+    /// design: nine 50 ms pauses in the exhausted case and two in the retried one.
+    #[test]
+    fn a_spawn_refused_with_etxtbsy_is_retried_until_it_succeeds() {
+        // 26 is `ETXTBSY` on Linux and on Darwin, and it is the errno the kernel
+        // returns; asking the mapping out loud is what keeps this test from
+        // passing for the wrong reason if that is ever not true.
+        let busy = || {
+            let error = io::Error::from_raw_os_error(26);
+            assert_eq!(
+                error.kind(),
+                ErrorKind::ExecutableFileBusy,
+                "26 must be ETXTBSY here, or this test refuses nothing"
+            );
+            error
+        };
+
+        // Two refusals, and then the spawn the retry is there to reach.
+        let mut attempts = 0;
+        let mut child = spawn_with_retry(|| {
+            attempts += 1;
+            if attempts <= 2 {
+                return Err(busy());
+            }
+            Command::new("/bin/sh").arg("-c").arg("exit 0").spawn()
+        })
+        .expect("the third attempt runs the program");
+        assert_eq!(attempts, 3, "the first success ends the retry");
+        assert!(child.wait().expect("the worker").success());
+
+        // Refusals that do not stop: the caller gets the last one unwrapped, and
+        // `SPAWN_ATTEMPTS` is the whole budget.
+        let mut attempts = 0;
+        let error = spawn_with_retry(|| {
+            attempts += 1;
+            Err::<Child, io::Error>(busy())
+        })
+        .expect_err("ten refusals are not a spawn");
+        assert_eq!(attempts, SPAWN_ATTEMPTS);
+        assert_eq!(error.kind(), ErrorKind::ExecutableFileBusy);
+
+        // Every other errno returns on the first attempt: the retry is for the
+        // kernel refusing before anything ran, not for a spawn that failed.
+        let mut attempts = 0;
+        let error = spawn_with_retry(|| {
+            attempts += 1;
+            Err::<Child, io::Error>(io::Error::from_raw_os_error(2))
+        })
+        .expect_err("a missing program is not a spawn");
+        assert_eq!(attempts, 1, "only ETXTBSY is retried");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
 }

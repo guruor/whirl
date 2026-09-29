@@ -1,10 +1,10 @@
 # whirl design docs
 
-Everything here is written before the code it describes, and each document names
-the evidence it rests on. Nothing is final until it has been reviewed against its
-own acceptance criteria: "written" means the document exists, "reviewed" means
-someone who did not write it has reproduced its evidence and said so, in
-`reviews/`.
+Everything in the index below is written before the code it describes, and each
+document names the evidence it rests on. Nothing is final until it has been
+reviewed against its own acceptance criteria: "written" means the document
+exists, "reviewed" means someone who did not write it has reproduced its
+evidence and said so, in `reviews/`.
 
 | document | status | what it decides |
 |---|---|---|
@@ -16,8 +16,8 @@ someone who did not write it has reproduced its evidence and said so, in
 | `spec/state-and-cache.md` | reviewed | per-OS state and cache locations, eviction policy, atomic writes, corruption recovery |
 | `architecture.md` | reviewed | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
 | `development.md` | reviewed | repo layout, build and test matrix, release process, contribution workflow |
-| `decisions/` | template in place, no decisions recorded yet | one ADR per decision that changes the architecture; template in `0000-template.md` |
-| `reviews/` | four reports: the pack in two rounds, the architecture set in two rounds | one review report per reviewed document: what the reviewer ran, what they observed, what they could not check |
+| `decisions/` | one ADR recorded: `0001-macos-artifacts-ship-unsigned-in-v0.1.0.md` | one ADR per decision that changes the architecture; template in `0000-template.md` |
+| `reviews/` | four reports: the pack in two rounds, the architecture set in two rounds | one report per reviewed **pack**, not one per document: `research-spec-review.md` and its round 2 cover the six-document research and spec pack, `architecture-review.md` and its round 2 cover the two architecture documents; each says what the reviewer ran, what they observed, what they could not check |
 
 ## Reading order
 
@@ -28,7 +28,8 @@ one, for a first pull request.
 
 ## Where the code is
 
-`crates/` does not exist yet; the workspace scaffold is the next thing to land,
-and `development.md` section 1 is the tree it has to produce. Until it lands,
-`development.md`'s commands are verified against a throwaway scaffold rather than
-against this repository, and it says so.
+`crates/` is the Cargo workspace: `whirl-core`, `whirld`, `whirl-cli` and
+`whirl-worker`, four members and no third-party dependency, the four crates
+`development.md` section 1 names. It landed with the first slice of the engine,
+pull request #1. Which of `development.md`'s commands have been run, and against
+what, is the status table at the top of that document.

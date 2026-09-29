@@ -78,11 +78,7 @@ impl Effective {
             .or_else(paths::socket_file)
             .ok_or("no socket path: neither --socket, WHIRL_SOCKET, `socket` nor a platform default is available")?;
 
-        let state_dir = env_path("WHIRL_STATE_DIR")
-            .or_else(paths::state_dir)
-            .ok_or(
-                "no state directory: neither WHIRL_STATE_DIR nor a platform default is available",
-            )?;
+        let state_dir = state_dir()?;
 
         let cache_dir = env_path("WHIRL_CACHE_DIR")
             .or_else(|| config.cache.root.clone())
@@ -99,7 +95,12 @@ impl Effective {
         };
 
         create_private_dir(&state_dir)?;
-        create_private_dir(&cache_dir)?;
+        // 8.4: the cache root is probed rather than refused. A cache that cannot
+        // be written is a degraded daemon (`cache_writable: 0`, 8.5), not a
+        // daemon that does not start: only the state directory refuses (1.5).
+        if let Err(message) = create_private_dir(&cache_dir) {
+            eprintln!("whirld: warning: {message}");
+        }
         writable(&state_dir)?;
 
         Ok(Effective {
@@ -135,6 +136,23 @@ impl Effective {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
+}
+
+/// The state directory, resolved the way `resolve` does it: `WHIRL_STATE_DIR`,
+/// then the platform default (docs/architecture.md 4.3's precedence — this is the
+/// one path with no config-file arm, because the config lives in the state
+/// directory's own tree).
+///
+/// It is a function of its own because 1.5 step 1 takes the daemon lock before
+/// anything else resolves, and one resolution is what keeps step 1 and the rest
+/// of startup from being able to disagree about which directory that is.
+pub fn state_dir() -> Result<PathBuf, String> {
+    env_path("WHIRL_STATE_DIR")
+        .or_else(paths::state_dir)
+        .ok_or_else(|| {
+            "no state directory: neither WHIRL_STATE_DIR nor a platform default is available"
+                .to_string()
+        })
 }
 
 /// Read the config, writing the annotated default first when the file is absent
@@ -191,6 +209,24 @@ fn restrict(path: &Path, mode: u32) -> Result<(), String> {
 #[cfg(not(unix))]
 fn restrict(_path: &Path, _mode: u32) -> Result<(), String> {
     Ok(())
+}
+
+/// 8.4: "attempt to create and remove `tmp/<run>-probe.part`", taken at start and
+/// again at each rotation rather than cached, because a cache directory can
+/// become unwritable while the daemon runs (a remount, a full disk, a chmod).
+///
+/// This is the only thing that writes into the cache root before the cache card
+/// lands, and it writes nothing that outlives the call.
+pub(crate) fn probe_cache_writable(cache_dir: &Path, run: u64) -> bool {
+    let tmp = cache_dir.join("tmp");
+    if create_private_dir(&tmp).is_err() {
+        return false;
+    }
+    let probe = tmp.join(format!("{run}-probe.part"));
+    if std::fs::write(&probe, b"").is_err() {
+        return false;
+    }
+    std::fs::remove_file(&probe).is_ok()
 }
 
 /// 1.5 step 2: refuse to start when the state directory cannot be written, and

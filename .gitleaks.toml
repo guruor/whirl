@@ -1,0 +1,65 @@
+# The secret scanner's configuration. `.github/workflows/ci.yml`, job `secrets`,
+# is the only thing that reads it.
+#
+# Two kinds of entry live here. The rules catch a reference to the machinery that
+# produced a change, and the exemptions say that a scanner hit is not a leak. The
+# rules that ship with gitleaks stay on as well: this file adds to them and
+# replaces nothing. An exemption is a claim that a hit is not a secret, and a
+# claim needs a reason and a reader: every entry below carries a `description`,
+# and the `secrets` job prints every entry and its reason on every run and fails
+# when one has none (docs/development.md section 6, `Secrets`). Nothing else is
+# exempt -- a hit no entry names fails the job.
+#
+# No rule below names a product, a directory or a person, and that is deliberate.
+# This file is public, and a rule that spelled the tracker, its home directory or
+# its agent handles would publish the vocabulary it exists to keep out of a
+# public artifact. Each rule is therefore the shape alone, taken from the real
+# form on the machine that runs the work. The `secrets` job plants one sample of
+# every shape and fails when a rule does not fire on it, so a shape that stops
+# describing the real thing is a red job rather than a silent pass.
+
+title = "whirl"
+
+[extend]
+# Without this, a config file *replaces* the shipped rule set instead of adding
+# to it, and a scanner that silently checks nothing is worse than none.
+useDefault = true
+
+# What these rules look for is a reference to whoever produced the change: a work
+# item marker, a private home directory, a named checkout, a role handle. A
+# reader of this repository can open none of them, and none of them is the
+# change. Cite the commit, the pull request or the measurement instead.
+
+[[rules]]
+id = "internal-work-item-reference"
+description = "A work-item marker of the shape the operator's tracker mints: a lowercase letter, an underscore, eight hexadecimal digits. It resolves for nobody reading this repository, in a comment, a document, a commit subject or a branch name."
+regex = '''\bt_[0-9a-f]{8}\b'''
+
+[[rules]]
+id = "private-home-directory-path"
+description = "A path under somebody's home directory, one level into a dot-directory this project does not send a reader to. It names a directory that exists on one machine, the one that ran the work, so an example config or a pasted transcript that carries it carries that machine's layout. A platform location this project cites on purpose belongs in this rule's allowlist below, with a reason."
+regex = '''(?:~|\$HOME|\$\{HOME\}|\{home\}|/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+)/\.[A-Za-z0-9][A-Za-z0-9._-]*/'''
+
+[[rules.allowlists]]
+description = "The home dot-directories this project's own documentation sends a reader to, where a hit is the documentation rather than a leak: the XDG config, state and cache roots, the Rust toolchain's directory, and this project's own directory. Any other first component under a home directory is a private location, which is what the rule is for."
+regextarget = "match"
+regexes = ['''/\.(?:config|local|cache|cargo|whirl)/''']
+
+[[rules]]
+id = "named-worktree-path"
+description = "A path into the per-agent checkout directory this repository already ignores, with a name after it. The name belongs to whoever made the checkout rather than to the project, and an absolute path through it puts that name in every reader's terminal: the ignore entry keeps the directory out of a commit, not out of a pasted transcript."
+regex = '''\.worktrees/[A-Za-z0-9._-]+'''
+
+[[rules]]
+id = "agent-role-handle"
+description = "A handle of the runtime that dispatched the work: a one-letter namespace prefix, a hyphen and a lowercase word, which is the form these handles take everywhere. A review record, a document, a comment and a commit name the project and the change, never the handle of the agent that wrote them."
+regex = '''\bp-[a-z][a-z0-9]{1,11}\b'''
+
+[[rules.allowlists]]
+description = "The words an ordinary technical register puts after that prefix, where the token is prose rather than a handle: the value of a statistic, the state of a governor, and the hacking, wave, type, norm, series and adic words of the same register. A sentence or a commit message about one of those is not a reference to the machinery that ran the work, and the advice this job prints for a handle is nonsense for it: measured before this entry existed, a commit message about a test statistic failed the job. A word after the prefix that is not on this list is still judged by the shape, the self-test plants one of these sentences so that dropping the entry is a red job rather than a quiet one, and the one hit the entry can hide is a handle whose word is on the list."
+regextarget = "match"
+regexes = ['''^p-(?:adic|hacking|norms?|series|states?|types?|values?|waves?)$''']
+
+[[allowlists]]
+description = "Build output and agent worktrees are throwaway directories. Both are gitignored, so a scan of a pull request's own commits cannot see them; this entry is here so that the day one is force-added, its contents are excluded by a stated rule rather than by luck."
+paths = ['^target/', '^\.worktrees/']

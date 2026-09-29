@@ -434,18 +434,22 @@ fn main() {
         env::var("WHD_STATE_DIR").unwrap_or_else(|_| format!("{home}/.local/state/wh")),
     );
     let _ = fs::create_dir_all(&state_dir);
+    // The one root every default below that is not the socket is built from:
+    // this user's cache directory, the same `<home>/...` shape the state
+    // directory above uses and the same directory
+    // `prototype/wh-rotate/example-config.json` names. A compiled default may
+    // not address one machine's scratch tree, and the example and the default
+    // have to be one path rather than two conventions.
+    let cache_root = format!("{home}/.cache/wh-rotate");
     let cfg = Cfg {
         socket: PathBuf::from(
             env::var("WHD_SOCKET").unwrap_or_else(|_| format!("{}/sock", state_dir.display())),
         ),
         state_dir: state_dir.clone(),
-        rotator: env::var("WHD_ROTATOR")
-            .unwrap_or_else(|_| format!("{home}/.hermes/cache/scratch/wh-rotate/wh-rotate")),
+        rotator: env::var("WHD_ROTATOR").unwrap_or_else(|_| format!("{cache_root}/wh-rotate")),
         rotator_cfg: env::var("WH_ROTATE_CONFIG")
-            .unwrap_or_else(|_| format!("{home}/.hermes/cache/scratch/wh-rotate/multi-config.json")),
-        cache_dir: env::var("WHD_CACHE").unwrap_or_else(|_| {
-            format!("{home}/.hermes/cache/scratch/wh-rotate/wh-cache")
-        }),
+            .unwrap_or_else(|_| format!("{cache_root}/multi-config.json")),
+        cache_dir: env::var("WHD_CACHE").unwrap_or_else(|_| format!("{cache_root}/wh-cache")),
         interval: env::var("WHD_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
