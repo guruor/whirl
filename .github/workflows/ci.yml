@@ -18,12 +18,14 @@ name: ci
 # `test (windows-latest)`, which runs it.
 #
 # What the `secrets` job judges is every place a change publishes words, from one
-# rule set in `.gitleaks.toml`: the lines its commits add (gitleaks, the mechanism
-# already here), the messages those commits carry (gitleaks again, over a dump of
-# them, because the scanner reads added lines and nothing else), the tree the
-# checkout publishes at the head (gitleaks in `dir` mode, because the range reads
-# what a change adds and only the tree catches pre-rule text still sitting in one),
-# and the exemptions, which it prints so that one is never silent.
+# rule set in `.gitleaks.toml`: the lines its commits add, including what a merge
+# introduces relative to its first parent (gitleaks, the mechanism already here; a
+# merge carries no patch unless the scan asks for one), the messages those commits
+# carry (gitleaks again, over a dump of them, because the scanner reads added lines
+# and nothing else), the tree the checkout publishes at the head (gitleaks in `dir`
+# mode, because the range reads what a change adds and only the tree catches
+# pre-rule text still sitting in one), and the exemptions, which it prints so that
+# one is never silent.
 #
 # The range starts after the commit the project's own rules landed at
 # (`GITLEAKS_EPOCH`, the job's env below), not at the base the event names. A
@@ -32,10 +34,10 @@ name: ci
 # scanning from there judges history by a rule it never had.
 #
 # The job proves its own rules can fail as well: a step in it plants one sample of
-# every shape the rules forbid, in a commit and in a file, so a rule that stops
-# matching the real thing, or an exemption the scanner does not read, is a red job
-# rather than a green one. It plants one sentence the rules must not touch as
-# well, so a rule that starts reporting ordinary prose is red too. The resolution
+# every shape the rules forbid, in a commit, in a file and inside a merge, so a rule
+# that stops matching the real thing, or an exemption the scanner does not read, is
+# a red job rather than a green one. It plants one sentence the rules must not touch
+# as well, so a rule that starts reporting ordinary prose is red too. The resolution
 # of the range is proved the same way, on a fixture, before the scan trusts it.
 #
 # Triggers (docs/development.md section 6): `development` integrates, `main`
@@ -438,6 +440,17 @@ jobs:
               return head()
 
 
+          def merge(branch, message):
+              # Always a merge commit (`--no-ff`), so the fixture is the shape the
+              # scan has to read a patch out of, never a fast-forward that leaves no
+              # merge behind to read.
+              run(
+                  ["git", "merge", "--quiet", "--no-ff", "--message", message, branch],
+                  cwd=fixture,
+              )
+              return head()
+
+
           (fixture / "clean.txt").write_text("a line with no reference in it\n")
           clean_base = commit("a clean start")
 
@@ -468,8 +481,35 @@ jobs:
           (fixture / "clean.txt").write_text("a line with no reference in it\na second one\n")
           clean_head = commit("clean again")
 
+          # The promotion shape, and the case the range pass could not read: a merge
+          # whose first parent is behind the range's base, so the merge is the only
+          # commit in the range and everything it introduces arrives relative to that
+          # first parent. `git log -p` prints no patch for a merge unless it is asked
+          # for one, so this is the fixture that measures `0 commits scanned` over a
+          # range of real commits (the range `1375e81..9f057db` in the v0.1.0
+          # promotion) with a plant inside it. A green on the plant below is the
+          # bug, not the fix. `merged_from` is the commit the merge starts from,
+          # which the range's base is a descendant of.
+          merged_from = clean_head
+          run(["git", "switch", "--quiet", "--create", "carried", merged_from], cwd=fixture)
+          (fixture / "merged.txt").write_text(
+              "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in SAMPLES.items())
+          )
+          carried_head = commit("a change a merge carries")
+          run(["git", "switch", "--quiet", "main"], cwd=fixture)
+          merge_head = merge("carried", "a merge that carries the change above")
+
+          # The same merge shape with nothing planted in it: a merge is not a rule
+          # shape, and a range that holds one has to pass.
+          run(["git", "switch", "--quiet", "--create", "carried-clean", merge_head], cwd=fixture)
+          (fixture / "carried.txt").write_text("a line with no reference in it\n")
+          carried_clean_head = commit("a change a merge carries, with nothing planted")
+          run(["git", "switch", "--quiet", "main"], cwd=fixture)
+          quiet_merge_head = merge("carried-clean", "a merge that carries nothing planted")
+
           print(f"fixture: {fixture}")
           print(f"  {clean_base[:7]} clean start, {planted_head[:7]} planted, {allowed_head[:7]} documented, {prose_head[:7]} prose, {clean_head[:7]} clean again")
+          print(f"  {carried_head[:7]} carried by a merge, {merge_head[:7]} the merge, {carried_clean_head[:7]} carried clean, {quiet_merge_head[:7]} the clean merge")
 
           # The tree pass scans a directory of files rather than a range of commits, so
           # its fixture is a directory of its own: the samples as file content, and the
@@ -495,7 +535,12 @@ jobs:
               completed = run(
                   [
                       gitleaks, "git", "--no-banner", "--redact", "--config", config,
-                      "--log-opts", f"{base}..{head_sha}",
+                      # The two tokens the job's scan step passes, in the same order:
+                      # `git log -p` prints no patch for a merge unless it is asked for
+                      # one, so without this a merge's own changes are read by no pass
+                      # at all. Kept in step with that step by hand, which is why the
+                      # job's own invocation is exercised as well.
+                      "--log-opts", f"--diff-merges=first-parent {base}..{head_sha}",
                       "--report-format", "json", "--report-path", report, "--exit-code", "0",
                   ],
                   cwd=fixture,
@@ -622,6 +667,45 @@ jobs:
               else:
                   print(f"  {label}: reported nothing")
 
+          # The merge, which is the hole this fixture exists for. The samples are in a
+          # file that only the merge carries, so a scan that does not read a merge's
+          # first-parent patch reads `0 commits scanned`, reports nothing, and fails
+          # here: that is how the range pass read the whole v0.1.0 promotion as zero
+          # bytes. A finding has to name the file as well, or the red is not actionable.
+          merged_lines = scan_range(carried_head, merge_head, work / "merged.json")
+          reported = {finding["RuleID"]: finding for finding in merged_lines}
+          for rule_id in sorted(SAMPLES):
+              if rule_id in reported:
+                  finding = reported[rule_id]
+                  print(
+                      f"  {rule_id}: fired on its sample carried only by a merge, in "
+                      f"{finding['File']}:{finding['StartLine']}"
+                  )
+              else:
+                  fail(
+                      f"{rule_id} did not fire on its sample inside a merge's first-parent "
+                      "patch, so the scan does not read what a merge introduces"
+                  )
+          for rule_id, finding in sorted(reported.items()):
+              if "merged.txt" not in finding["File"]:
+                  fail(
+                      f"a merge's finding for {rule_id} names {finding['File']}, and the "
+                      "plant is in merged.txt"
+                  )
+
+          # And the same merge shape with nothing planted in it, which has to pass: a
+          # merge is not a rule shape. This is the direction that keeps the job from
+          # being red on every promotion.
+          clean_merge = scan_range(carried_clean_head, quiet_merge_head, work / "clean-merge.json")
+          if clean_merge:
+              for finding in clean_merge:
+                  fail(
+                      f"a merge carrying nothing planted was reported by {finding['RuleID']} in "
+                      f"{finding['File']}:{finding['StartLine']}"
+                  )
+          else:
+              print(f"  a merge that carries nothing planted: reported nothing")
+
           for note in notes:
               print(f"::warning::{note}")
 
@@ -635,9 +719,9 @@ jobs:
 
           print(
               f"self-test: {len(SAMPLES)} rule(s) fired on a planted sample, in the added lines, in a "
-              "commit message and in a file; the allowlist kept a documented location and dropped an "
-              "ordinary sentence that carries a token of a handle's shape; two clean inputs reported "
-              "nothing"
+              "commit message, in a file and inside a merge; the allowlist kept a documented location "
+              "and dropped an ordinary sentence that carries a token of a handle's shape; three clean "
+              "inputs reported nothing, one of them a merge"
           )
           PY
 
@@ -776,26 +860,64 @@ jobs:
           export GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false
           export GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false
 
+          # The guard that this job checked something is the range, not the scanner's
+          # patch count. gitleaks prints `N commits scanned` for the commits whose patch
+          # carried additions (`detect/detect.go`: `len(d.commitMap)`, with its own note
+          # that the number "might be smaller than expected due to commits with no
+          # additions"), so a range of merges that introduce nothing reads `0 commits
+          # scanned` while holding real commits. Measured on run 36591232572: the range
+          # `1375e81..9f057db` holds 2 commits, both merges, and the scan read `0 commits
+          # scanned` and failed the job. Read the range instead: `git rev-list --count`
+          # is zero exactly when there is nothing to read, and a range that resolved to
+          # nothing still fails loudly, with the message below.
+          range_commits=$(git rev-list --count "${SCAN_BASE}..${HEAD_SHA}")
+          if [ "$range_commits" -eq 0 ]; then
+            echo "::error::the scan read no commits, so this job checked nothing: check the range above, the checkout depth, and the git colour settings."
+            exit 1
+          fi
+
           # The reports and the log live in the runner's temp directory rather than
           # in the checkout, so that the tree pass after this one reads the tree
           # this change publishes and not this job's own scratch.
-          echo "scanning ${SCAN_BASE}..${HEAD_SHA}"
+          # `--diff-merges=first-parent` is what makes a merge readable: `git log -p`
+          # prints no patch for a merge commit by default, so everything a merge
+          # introduces relative to its first parent was read by no pass (the v0.1.0
+          # promotion merge `397a99c` carries 1,847,765 bytes of it). gitleaks passes
+          # `--log-opts` to `git log -p -U0` as separate arguments, split on spaces
+          # (`sources/git.go`), so the flag reaches git ahead of the range. It is the
+          # diff option, not `--first-parent`, which would restrict the traversal to
+          # the first-parent chain and drop commits from the range.
+          echo "scanning ${SCAN_BASE}..${HEAD_SHA}, ${range_commits} commit(s) in the range"
           status=0
           ./gitleaks git --no-banner --redact --verbose --config .gitleaks.toml \
-            --log-opts="${SCAN_BASE}..${HEAD_SHA}" \
+            --log-opts="--diff-merges=first-parent ${SCAN_BASE}..${HEAD_SHA}" \
             --report-format json --report-path "$RUNNER_TEMP/gitleaks-report.json" \
             --exit-code 0 2>&1 | tee "$RUNNER_TEMP/gitleaks.log" || status=$?
           if [ "$status" -ne 0 ]; then
             echo "::error::gitleaks exited $status, so the scan did not complete and a clean report would mean nothing."
             exit "$status"
           fi
-          # A scan that read no commits exits 0 and finds nothing. Green there is
-          # green because nothing was checked. Read the count as a count: the
-          # substring `0 commits scanned` is also a substring of `10 commits
-          # scanned`, so require a leading non-zero digit instead. A log with no
-          # count line at all fails too, which is the direction that matters.
-          if ! grep --extended-regexp --quiet '[1-9][0-9]* commits scanned' "$RUNNER_TEMP/gitleaks.log"; then
-            echo "::error::the scan read no commits, so this job checked nothing: check the range above, the checkout depth, and the git colour settings."
+          # What the scanner read, printed beside the range's own count: the two differ
+          # whenever a commit in the range introduced nothing to read, which is what a
+          # merge carrying nothing does. Printed and not gated on, because it counts
+          # patches while the guard above counts the commits of the range.
+          scanner_commits=$(grep --extended-regexp --only-matching '[0-9]+ commits scanned' "$RUNNER_TEMP/gitleaks.log" | head -n 1)
+          scanner_commits=${scanner_commits%% *}
+          echo "gitleaks read ${scanner_commits:-no count line} of those ${range_commits} commit(s)"
+          # The count guard the range guard replaces failed on any scan that read
+          # nothing, and the range guard must not: a range of merges that introduce
+          # nothing reads nothing honestly. What that guard was there for is kept here
+          # instead. If the range yields a patch to the scanner's own `git log`
+          # invocation with the colour settings pinned off, then a scan that read no
+          # commits of it read nothing rather than finding nothing, and that is the
+          # failure the guard existed for. A colour-forcing git config is the measured
+          # way to get there: with `color.ui = always` gitleaks prints `0 commits
+          # scanned`, `no leaks found` and exits 0 over a range whose patch is right
+          # there, which is why the two keys are pinned off above.
+          if [ "${scanner_commits:-0}" -eq 0 ] &&
+             git -c color.ui=false -c color.diff=false log -p -U0 --diff-merges=first-parent \
+               "${SCAN_BASE}..${HEAD_SHA}" | grep --quiet '^diff --git'; then
+            echo "::error::the range ${SCAN_BASE}..${HEAD_SHA} yields a patch, read with the colour settings pinned off, but the scan read no commits of it, so this job checked nothing: check the git colour settings above and the scanner's own log."
             exit 1
           fi
       - name: Scan the tree this checkout publishes, which the epoch cannot excuse
@@ -816,7 +938,7 @@ jobs:
             echo "::error::gitleaks exited $status, so the tree scan did not complete and a clean report would mean nothing."
             exit "$status"
           fi
-          # The same trap as the commit count above, in bytes: a scan that read no
+          # The same trap as the range scan above, in bytes: a scan that read no
           # bytes exits 0 and finds nothing, so read that count as a number too.
           if ! grep --extended-regexp --quiet 'scanned ~[1-9][0-9]* bytes' "$RUNNER_TEMP/gitleaks-tree.log"; then
             echo "::error::the tree scan read no bytes, so this job checked nothing: check the directory it scanned."
