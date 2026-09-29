@@ -13,7 +13,7 @@
 #      with docs/research/probes/wallpaper_store.py, the one plist reader in this tree
 #   2. asks the existing probe docs/research/probes/wp_probe.m which image is on screen, and
 #      refuses to write unless the snapshot's node is the node holding it. A write reaches the
-#      frontmost Space only (docs/research/macos.md section 3), so restoring from another Space
+#      frontmost Space only (docs/research/macos.md section 2), so restoring from another Space
 #      would repaint the wrong one and leave a trace there. The node is named by the snapshot's own
 #      uuid rather than resolved from the image, because several store nodes can hold one file and
 #      the store does not say which of them is frontmost (docs/research/probes/README.md)
