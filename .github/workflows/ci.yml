@@ -20,13 +20,23 @@ name: ci
 # What the `secrets` job judges is every place a change publishes words, from one
 # rule set in `.gitleaks.toml`: the lines its commits add (gitleaks, the mechanism
 # already here), the messages those commits carry (gitleaks again, over a dump of
-# them, because the scanner reads added lines and nothing else), and the
-# exemptions, which it prints so that one is never silent. The job proves its own
-# rules can fail as well: a step in it plants one sample of every shape the rules
-# forbid, so a rule that stops matching the real thing, or an exemption the
-# scanner does not read, is a red job rather than a green one. It plants one
-# sentence the rules must not touch as well, so a rule that starts reporting
-# ordinary prose is red too.
+# them, because the scanner reads added lines and nothing else), the tree the
+# checkout publishes at the head (gitleaks in `dir` mode, because the range reads
+# what a change adds and only the tree catches pre-rule text still sitting in one),
+# and the exemptions, which it prints so that one is never silent.
+#
+# The range starts after the commit the project's own rules landed at
+# (`GITLEAKS_EPOCH`, the job's env below), not at the base the event names. A
+# promotion pull request has base `main`, which is hundreds of commits behind
+# `development`, and every one of them was written before those rules existed, so
+# scanning from there judges history by a rule it never had.
+#
+# The job proves its own rules can fail as well: a step in it plants one sample of
+# every shape the rules forbid, in a commit and in a file, so a rule that stops
+# matching the real thing, or an exemption the scanner does not read, is a red job
+# rather than a green one. It plants one sentence the rules must not touch as
+# well, so a rule that starts reporting ordinary prose is red too. The resolution
+# of the range is proved the same way, on a fixture, before the scan trusts it.
 #
 # Triggers (docs/development.md section 6): `development` integrates, `main`
 # releases. So this workflow runs for a push to either branch, and for a pull
@@ -170,6 +180,13 @@ jobs:
       # cannot both pass. No action is used for the scanner, so there is no tag
       # to trust: the version, the URL and the digest are all pinned here.
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      # The commit the four shape rules in `.gitleaks.toml` landed at (69db553,
+      # 2026-09-27), and the boundary every scan in this job respects: history at
+      # or before it predates those rules, so reading it again judges it by a rule
+      # it never had. One named commit rather than a list of exempted shas, and
+      # the tree pass below is what keeps it honest: what the boundary skips, the
+      # tree catches if a file still carries it.
+      GITLEAKS_EPOCH: 69db553ba158121e345c774434f0bd670fe081bf
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -454,6 +471,19 @@ jobs:
           print(f"fixture: {fixture}")
           print(f"  {clean_base[:7]} clean start, {planted_head[:7]} planted, {allowed_head[:7]} documented, {prose_head[:7]} prose, {clean_head[:7]} clean again")
 
+          # The tree pass scans a directory of files rather than a range of commits, so
+          # its fixture is a directory of its own: the samples as file content, and the
+          # location the allowlist exempts beside them. It cannot be the fixture
+          # repository's working tree, which is a checkout at one commit and not the
+          # plain directory the job scans.
+          tree = work / "tree"
+          tree.mkdir()
+          (tree / "planted.txt").write_text(
+              "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in SAMPLES.items())
+          )
+          (tree / "allowed.txt").write_text(allowed_sample + "\n")
+          print(f"tree:    {tree}")
+
 
           def rule_ids(report):
               with report.open() as handle:
@@ -474,12 +504,15 @@ jobs:
               return rule_ids(report)
 
 
-          def scan_messages(message_dir, report):
+          # `gitleaks dir` reads a directory of files. The job uses that mode twice, for
+          # the dump of commit messages and for the tree pass, and it is the same scan
+          # both times, so it is this one function.
+          def scan_dir(directory, report):
               completed = run(
                   [
                       gitleaks, "dir", "--no-banner", "--redact", "--config", config,
                       "--report-format", "json", "--report-path", report, "--exit-code", "0",
-                      message_dir,
+                      directory,
                   ],
                   cwd=fixture,
               )
@@ -518,7 +551,7 @@ jobs:
           for rule_id in sorted(reported - set(SAMPLES)):
               notes.append(f"{rule_id} also fired in the fixture; it is not one of the rules under test")
 
-          planted_messages = scan_messages(str(messages), work / "messages.json")
+          planted_messages = scan_dir(str(messages), work / "messages.json")
           reported = {finding["RuleID"] for finding in planted_messages}
           for rule_id in sorted(SAMPLES):
               if rule_id in reported:
@@ -527,6 +560,32 @@ jobs:
                   fail(f"{rule_id} did not fire on its sample in a commit message")
           for rule_id in sorted(reported - set(SAMPLES)):
               notes.append(f"{rule_id} also fired on the message fixture; it is not one of the rules under test")
+
+          # The tree pass, which is the same directory mode over a plain directory of
+          # files. Every sample has to fire there too, or the pass that makes the range's
+          # boundary honest would be the one nothing shows can fail.
+          planted_tree = scan_dir(str(tree), work / "tree.json")
+          reported = {finding["RuleID"] for finding in planted_tree}
+          for rule_id in sorted(SAMPLES):
+              if rule_id in reported:
+                  print(f"  {rule_id}: fired on its sample in a file, in the tree pass")
+              else:
+                  fail(f"{rule_id} did not fire on its sample in a file, so the tree pass does not catch it")
+          for rule_id in sorted(reported - set(SAMPLES)):
+              notes.append(f"{rule_id} also fired on the tree fixture; it is not one of the rules under test")
+          # And the exemption has to keep working in that mode as well, or a path this
+          # project documents on purpose would fail every run of the tree pass.
+          documented_tree = [
+              finding for finding in planted_tree if finding["File"].endswith("allowed.txt")
+          ]
+          if documented_tree:
+              for finding in documented_tree:
+                  fail(
+                      f"the documented location {allowed_sample} was reported by {finding['RuleID']} "
+                      "in the tree pass, so the allowlist is not doing its job there"
+                  )
+          else:
+              print(f"  {allowed_rule}: dropped {allowed_sample} in the tree pass as well")
 
           documented = scan_range(planted_head, allowed_head, work / "allowed.json")
           if documented:
@@ -554,8 +613,8 @@ jobs:
 
           for label, findings in (
               ("a commit with nothing planted", scan_range(prose_head, clean_head, work / "clean.json")),
-              ("a message with nothing planted", scan_messages(str(clean_messages), work / "clean-messages.json")),
-              ("a message of ordinary prose", scan_messages(str(prose_messages), work / "prose-messages.json")),
+              ("a message with nothing planted", scan_dir(str(clean_messages), work / "clean-messages.json")),
+              ("a message of ordinary prose", scan_dir(str(prose_messages), work / "prose-messages.json")),
           ):
               if findings:
                   for finding in findings:
@@ -575,13 +634,14 @@ jobs:
               sys.exit(1)
 
           print(
-              f"self-test: {len(SAMPLES)} rule(s) fired on a planted sample, in the added lines and in a "
-              "commit message; the allowlist kept a documented location and dropped an ordinary sentence "
-              "that carries a token of a handle's shape; two clean inputs reported nothing"
+              f"self-test: {len(SAMPLES)} rule(s) fired on a planted sample, in the added lines, in a "
+              "commit message and in a file; the allowlist kept a documented location and dropped an "
+              "ordinary sentence that carries a token of a handle's shape; two clean inputs reported "
+              "nothing"
           )
           PY
 
-      - name: Scan the commits this change adds, and name what they leak
+      - name: Resolve the range against the epoch the rules landed at, and prove the resolution
         env:
           # Event payload values reach the shell as environment variables, not as
           # text spliced into the script, and the script validates them as hex.
@@ -591,21 +651,118 @@ jobs:
         run: |
           set -eu
 
-          # A pull request carries its base; a push to `main` carries the tip it
-          # was pushed from. Either way the range is what this change adds.
-          base="${BASE_SHA:-}"
-          [ -n "$base" ] || base="${PUSHED_FROM:-}"
-          case "$base" in
+          # The commit the scan starts after, given the base the event names and the
+          # epoch the rules landed at (`GITLEAKS_EPOCH`, the job's env above). The
+          # base is used as given when it is at or after the epoch, and replaced by
+          # the epoch when it is an ancestor of the epoch and the epoch is an
+          # ancestor of the head: a promotion pull request names `main`'s tip, which
+          # is behind every rule in `.gitleaks.toml`, so scanning from there
+          # re-judges history those rules postdate (measured on this repository: 60
+          # findings of one of them across 24 commits, every commit older than the
+          # epoch). A branch that never met the epoch keeps the range it had,
+          # because the epoch is not in it.
+          #
+          # $1: the base the event named. $2: the head. $3: the epoch.
+          resolve_base() {
+            local base="$1" head="$2" epoch="$3"
+            if [ -n "$base" ] && [ "$base" != "$epoch" ] &&
+               git merge-base --is-ancestor "$base" "$epoch" 2>/dev/null &&
+               git merge-base --is-ancestor "$epoch" "$head" 2>/dev/null; then
+              printf '%s\n' "$epoch"
+              return 0
+            fi
+            printf '%s\n' "$base"
+          }
+
+          # The resolution is proved here, before the scan below trusts it. A
+          # boundary that quietly swallowed the range would make this job red by
+          # reading nothing, and a hard-coded sha is exactly the value that goes
+          # stale or gets mistyped, so the cases are exercised on a throwaway
+          # repository in the runner's temp directory rather than reasoned about.
+          epoch="${GITLEAKS_EPOCH:?the job env does not name the epoch the rules landed at}"
+          work=$(mktemp -d)
+          fixture="$work/fixture"
+          git init --quiet --initial-branch=main "$fixture"
+          git -C "$fixture" config user.name self-test
+          git -C "$fixture" config user.email self-test@example.invalid
+          commit() {
+            git -C "$fixture" commit --quiet --allow-empty --message "$1"
+            git -C "$fixture" rev-parse HEAD
+          }
+          before=$(commit "history the rules postdate")
+          landed=$(commit "the rules land")
+          after=$(commit "after the rules")
+          later=$(commit "later still")
+          git -C "$fixture" switch --quiet --create elsewhere "$before"
+          elsewhere=$(commit "a line that never met the rules")
+
+          failed=0
+          expect() {
+            # $1: the case, in words. $2: the commit the scan must start after.
+            # $3: the base the event named. $4: the head. The resolver reads the
+            # repository it runs in, which is the checkout in the real call, so the
+            # fixture is entered rather than pointed at with `git -C`.
+            local got
+            got=$(cd "$fixture" && resolve_base "$3" "$4" "$landed")
+            if [ "$got" != "$2" ]; then
+              echo "::error::$1: resolve_base($3, $4) printed ${got}, and the answer is $2"
+              failed=1
+            else
+              printf '  %s: %s -> %s\n' "$1" "$3" "${got:0:7}"
+            fi
+          }
+          expect "a base before the epoch starts at the epoch" "$landed" "$before" "$later"
+          expect "a base at the epoch is used as given" "$landed" "$landed" "$later"
+          expect "a base after the epoch is used as given" "$after" "$after" "$later"
+          expect "a base whose range the epoch is not in is used" "$before" "$before" "$elsewhere"
+          if [ "$failed" -ne 0 ]; then
+            echo "self-test: the epoch resolution does not do what this job says it does"
+            exit 1
+          fi
+          rm -rf "$work"
+
+          # A pull request carries its base; a push carries the tip it was pushed
+          # from. Either way the range is what this change adds.
+          event_base="${BASE_SHA:-}"
+          [ -n "$event_base" ] || event_base="${PUSHED_FROM:-}"
+          case "$event_base" in
             "" | 0000000000000000000000000000000000000000 | *[!0-9a-f]*)
-              base=""
+              event_base=""
               echo "::notice::the event carried no usable base commit; falling back to the head's parent"
               ;;
           esac
-          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
-            base=$(git rev-parse --verify --quiet "${HEAD_SHA:-HEAD}^" || true)
+          if [ -z "$event_base" ] || ! git cat-file -e "${event_base}^{commit}" 2>/dev/null; then
+            event_base=$(git rev-parse --verify --quiet "${HEAD_SHA:-HEAD}^" || true)
           fi
-          if [ -z "$base" ]; then
+          if [ -z "$event_base" ]; then
             echo "::error::no commit to compare against, so the scan cannot be scoped to this change. Run this job by hand from a branch that has history."
+            exit 1
+          fi
+
+          base=$(resolve_base "$event_base" "${HEAD_SHA:-HEAD}" "$epoch")
+
+          # Printed the way the allowlist above is printed: a range a reader cannot
+          # see is a rule nobody can check.
+          echo "gitleaks epoch: ${epoch}, the commit the four shape rules in .gitleaks.toml landed at"
+          if [ "$base" = "$event_base" ]; then
+            echo "gitleaks range: ${event_base}..${HEAD_SHA}, the base the event named"
+          else
+            echo "gitleaks range: ${base}..${HEAD_SHA}, resolved from the event base ${event_base}, which is an ancestor of the epoch"
+          fi
+
+          # The next steps scan this range and read its messages, and a second copy
+          # of the resolution would be a second answer to the same question. The
+          # `GITHUB_ENV` file is how a step passes a value to the steps after it.
+          echo "SCAN_BASE=$base" >> "$GITHUB_ENV"
+
+      - name: Scan the commits this change adds, and name what they leak
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+
+          if [ -z "${SCAN_BASE:-}" ]; then
+            echo "::error::no range reached this step, so nothing would have been scanned: the step above resolves it."
             exit 1
           fi
 
@@ -619,18 +776,15 @@ jobs:
           export GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false
           export GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false
 
-          # The next step reads the messages of the same commits, and a
-          # second copy of the resolution above would be a second answer to
-          # the same question. `GITHUB_ENV` is how a step passes a value to
-          # the steps after it.
-          echo "SCAN_BASE=$base" >> "$GITHUB_ENV"
-
-          echo "scanning ${base}..${HEAD_SHA}"
+          # The reports and the log live in the runner's temp directory rather than
+          # in the checkout, so that the tree pass after this one reads the tree
+          # this change publishes and not this job's own scratch.
+          echo "scanning ${SCAN_BASE}..${HEAD_SHA}"
           status=0
           ./gitleaks git --no-banner --redact --verbose --config .gitleaks.toml \
-            --log-opts="$base..${HEAD_SHA}" \
-            --report-format json --report-path gitleaks-report.json \
-            --exit-code 0 2>&1 | tee gitleaks.log || status=$?
+            --log-opts="${SCAN_BASE}..${HEAD_SHA}" \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-report.json" \
+            --exit-code 0 2>&1 | tee "$RUNNER_TEMP/gitleaks.log" || status=$?
           if [ "$status" -ne 0 ]; then
             echo "::error::gitleaks exited $status, so the scan did not complete and a clean report would mean nothing."
             exit "$status"
@@ -640,8 +794,32 @@ jobs:
           # substring `0 commits scanned` is also a substring of `10 commits
           # scanned`, so require a leading non-zero digit instead. A log with no
           # count line at all fails too, which is the direction that matters.
-          if ! grep --extended-regexp --quiet '[1-9][0-9]* commits scanned' gitleaks.log; then
+          if ! grep --extended-regexp --quiet '[1-9][0-9]* commits scanned' "$RUNNER_TEMP/gitleaks.log"; then
             echo "::error::the scan read no commits, so this job checked nothing: check the range above, the checkout depth, and the git colour settings."
+            exit 1
+          fi
+      - name: Scan the tree this checkout publishes, which the epoch cannot excuse
+        run: |
+          set -eu
+
+          # The range above covers what this change adds; this covers what it
+          # publishes. A promotion re-reads nothing behind the epoch, so a value
+          # those commits added and a file still carries is caught here rather than
+          # excused there. `gitleaks dir` reads the files in the directory it is
+          # given and skips `.git`, and the reports above are outside the checkout,
+          # so what it reads is the tree at the head.
+          status=0
+          ./gitleaks dir --no-banner --redact --verbose --config .gitleaks.toml \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-tree-report.json" \
+            --exit-code 0 . 2>&1 | tee "$RUNNER_TEMP/gitleaks-tree.log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::gitleaks exited $status, so the tree scan did not complete and a clean report would mean nothing."
+            exit "$status"
+          fi
+          # The same trap as the commit count above, in bytes: a scan that read no
+          # bytes exits 0 and finds nothing, so read that count as a number too.
+          if ! grep --extended-regexp --quiet 'scanned ~[1-9][0-9]* bytes' "$RUNNER_TEMP/gitleaks-tree.log"; then
+            echo "::error::the tree scan read no bytes, so this job checked nothing: check the directory it scanned."
             exit 1
           fi
       - name: Read the messages of those commits, with the same rules
@@ -679,59 +857,65 @@ jobs:
           echo "reading the messages of $commits commit(s)"
 
           ./gitleaks dir --no-banner --redact --config .gitleaks.toml \
-            --report-format json --report-path gitleaks-messages-report.json \
+            --report-format json --report-path "$RUNNER_TEMP/gitleaks-messages-report.json" \
             --exit-code 0 "$messages"
 
       - name: Fail on a finding, naming the rule and the file
         run: |
           python3 - <<'PY'
           import json
+          import os
           import pathlib
           import re
           import sys
           import tomllib
 
-          # Both reports, one verdict: the added lines of this change, and the
-          # messages of the same commits. A finding is either a credential or a
-          # reference to the machinery that produced the change, and the two need
-          # different advice. The rules this repository writes about itself are the
-          # ones in `.gitleaks.toml`; every other rule id belongs to the scanner's
-          # own set, which is about secrets.
+          # Three reports, one verdict: the added lines of this change, the messages
+          # of the same commits, and the tree the checkout publishes at the head. A
+          # finding is either a credential or a reference to the machinery that
+          # produced the change, and the two need different advice. The rules this
+          # repository writes about itself are the ones in `.gitleaks.toml`; every
+          # other rule id belongs to the scanner's own set, which is about secrets.
+          # The reports are written outside the checkout, which is what lets the
+          # tree scan read the tree instead of this job's own scratch.
           with open(".gitleaks.toml", "rb") as handle:
               own = {rule["id"] for rule in tomllib.load(handle).get("rules", [])}
 
+          scanned = (
+              ("gitleaks-report.json", "the commits this change adds"),
+              ("gitleaks-messages-report.json", "the messages of those commits"),
+              ("gitleaks-tree-report.json", "the tree this checkout publishes"),
+          )
+          reports = pathlib.Path(os.environ["RUNNER_TEMP"])
           findings = []
-          for report in ("gitleaks-report.json", "gitleaks-messages-report.json"):
-              path = pathlib.Path(report)
+          for name, where in scanned:
+              path = reports / name
               if not path.exists():
-                  print(f"::error::{report} is missing, so this change was not checked by it.")
+                  print(f"::error::{name} is missing, so this change was not checked by it.")
                   sys.exit(1)
               with path.open() as handle:
                   for finding in json.load(handle):
-                      findings.append(finding)
+                      findings.append((where, finding))
 
           if not findings:
-              print("gitleaks: no findings in the lines or the messages of the commits this change adds")
+              print("gitleaks: no findings in the lines, the messages or the tree this change adds")
               sys.exit(0)
 
-          for finding in findings:
+          for scanned_by, finding in findings:
               file = finding.get("File") or "(unknown file)"
               line = finding.get("StartLine") or 0
               rule = finding.get("RuleID") or "(unknown rule)"
               commit = (finding.get("Commit") or "")[:12]
-              in_message = False
-              if not commit:
-                  # The message dump is one file per commit, named by the commit.
-                  name = pathlib.Path(file).name
-                  if re.fullmatch(r"[0-9a-f]{40}\.txt", name):
-                      commit = name[:12]
-                      in_message = True
-              where = f"commit {commit}" if commit else "this change"
+              # The message dump is one file per commit, named by the commit, and a
+              # finding in it has no file in the checkout to point at.
+              in_message = not commit and bool(
+                  re.fullmatch(r"[0-9a-f]{40}\.txt", pathlib.Path(file).name)
+              )
               if in_message:
-                  # A finding in a message has no file in the checkout to point at:
-                  # its file is one commit's message, named by the commit.
-                  header = f"::error::gitleaks rule {rule} matched the message of {where}"
+                  commit = pathlib.Path(file).name[:12]
+                  header = f"::error::gitleaks rule {rule} matched the message of commit {commit}"
               else:
+                  where = f"commit {commit}" if commit else scanned_by
                   header = (
                       f"::error file={file},line={line}::gitleaks rule {rule} matched "
                       f"{file}:{line} in {where}"
