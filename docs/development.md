@@ -519,15 +519,19 @@ before the tag (section 5). A **tag** does not run this workflow at all; a tag
 runs `.github/workflows/release.yml`, which is the release itself and the only
 workflow here that is allowed to write to the repository (section 5).
 
-`secrets` runs gitleaks over the commits the change adds, not over the tree and
-not over the whole history: gitleaks' git mode reads a commit's added lines, so a
-change that *removes* a value cannot trip it, and a value already in history needs
-no exemption. It installs the release binary with the version and the sha256 both
-pinned in the workflow, and it fails when the scan reads no commits, because a
-scan that checked nothing and a scan that found nothing print the same `no leaks
-found`. The scanner's own rules stay on; `.gitleaks.toml` adds rules of this
-project's own as well as exemptions, and each exemption carries a reason that
-the job prints on every run.
+`secrets` runs gitleaks over the commits the change adds and over the tree the
+checkout publishes at the head, not over the whole history: gitleaks' git mode
+reads a commit's added lines, so a change that *removes* a value cannot trip
+it, and a value no file carries any more needs no exemption. The range starts
+after the commit the project's own rules landed at, which is what a promotion
+needs, because its base `main` sits behind every one of them; section 6
+(`Secrets`) owns that boundary and the tree scan beside it. It installs the
+release binary with the version and the sha256 both pinned in the workflow, and
+it fails when either scan reads nothing, because a scan that checked nothing
+and a scan that found nothing print the same `no leaks found`. The scanner's
+own rules stay on; `.gitleaks.toml` adds rules of this project's own as well as
+exemptions, and each exemption carries a reason that the job prints on every
+run.
 
 The rule that keeps it honest: **every command a contributor is expected to run
 before opening a pull request is a mode of `scripts/ci.sh` (section 3), and each
@@ -540,12 +544,12 @@ exception the rule had to name; it now runs `bash scripts/ci.sh test` like the
 rest (pull request #30, merged as `92fed1e`), so there is no exception left to
 name.
 
-**The other CI gate with no mode is a deliberate exclusion, not a gap:** `secrets`
-(gitleaks) installs a release binary and scans the commits a change adds, and a
-contributor cannot run that scanner on their machine, so there is no honest mode
-to write and none is pretended. Its consequence is stated where it belongs: `all`
-does not cover it, and section 3 lists it among the three things `all` leaves
-unproven.
+**The other CI gate with no mode is a deliberate exclusion, not a gap:**
+`secrets` (gitleaks) installs a release binary and scans the commits a change
+adds and the tree the checkout publishes, and a contributor cannot run that
+scanner on their machine, so there is no honest mode to write and none is
+pretended. Its consequence is stated where it belongs: `all` does not cover it,
+and section 3 lists it among the three things `all` leaves unproven.
 
 Caching is `Swatinem/rust-cache`, pinned like every other action here. It caches
 `~/.cargo` and `./target`, and it keys them on the job, on the rustc release and
@@ -1044,13 +1048,25 @@ against fixtures, or are marked as requiring a key and skipped when it is absent
 
 Run the scanner before you push. It is the same tool, the same config file and the
 same range the `secrets` job scans: the commits your branch adds to `development`
-(which is the branch a working branch is cut from, section 6).
+(which is the branch a working branch is cut from), and the tree the checkout
+publishes.
 
 ```sh
 git fetch origin development
 gitleaks git --config .gitleaks.toml --redact \
   --log-opts="$(git merge-base origin/development HEAD)..HEAD"
+gitleaks dir --config .gitleaks.toml --redact .
 ```
+
+The range starts after the commit the project's own rules in `.gitleaks.toml`
+landed at, not at the base the event names. A promotion pull request has base
+`main`, which is behind every one of those commits, and scanning from there
+re-judges history written before the rules existed: measured on this
+repository, 60 findings across 24 commits, none of them newer than the rules,
+against none at all from the rules' own commit. A base at or after it is used
+as the event named it, which is what a working branch's range already is, and
+the `secrets` job prints the boundary and the range it resolved on every run,
+so the resolution can be read rather than trusted.
 
 `gitleaks` is not a build dependency; take it from the project's releases (CI pins
 8.30.1, and the job verifies the release digest) or from your package manager. If
@@ -1072,11 +1088,13 @@ An exemption from the scanner's rules lives in `.gitleaks.toml`, needs a
 job on every run. An exemption a reviewer cannot see is an unwritten rule, and the
 next person widens it.
 
-The scan reads the commits, not the tree, so removing a credential in a later
-commit does not clear it: the commit that added it is still in the range and the
-job stays red. That is the job working. Rotate the credential, then drop the
-commit from the branch (`git rebase --interactive`, or `git reset`) and push the
-rewritten branch.
+Neither scan forgets. The range reads the commits, so removing a credential in
+a later commit does not clear it: the commit that added it is still in the
+range and the job stays red. That is the job working. Rotate the credential,
+then drop the commit from the branch (`git rebase --interactive`, or `git
+reset`) and push the rewritten branch. The tree scan reads the checkout at the
+head instead, so text a file still carries is red whichever commit put it
+there, including one the boundary above skips.
 
 ## 7. Local development
 
