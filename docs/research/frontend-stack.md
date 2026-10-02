@@ -400,6 +400,14 @@ dependencies (`crates/whirl-core/Cargo.toml` is `[dependencies]` and nothing
 else), so linking it adds zero crates to a frontend's graph and pulls in no
 toolkit. It compiled under this machine's rustc 1.98.1 without a change.
 
+The two Rust spikes are deliberately different binaries, so that neither claim
+borrows the other's evidence: the probe links `whirl-core` and is where this
+section's numbers come from, while the `egui` spike behind section 3's memory and
+start-up rows reaches the socket through about 25 hand-rolled lines and does not
+link it. Nothing above measures one binary that does both. Linking `whirl-core`
+adds a dependency-free rlib and no toolkit, so it does not move the numbers
+section 3 reports; that is an argument, not a measurement.
+
 ## 4. What I did not test, and what these measurements do not settle
 
 - **No real daemon.** Every socket number above is against the stub of section 2.
