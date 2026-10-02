@@ -30,7 +30,7 @@ clang -fobjc-arc -framework AppKit -framework Foundation -framework CoreGraphics
 | `raw_node.py` | [V7]: raw `LastSet` / `LastUse` for the live Space node and its display sub-nodes, from one or more snapshots, no blob decoding. Read-only. |
 | `probe-wrapper.sh` | [V7]: runs `/tmp/wp_probe` under `launchctl submit`. |
 | `set-wrapper.sh` | [V7]: runs `/tmp/wp_set` under `launchctl submit`. Pass an image that differs from the live one to see the store change. |
-| `sandbox_test.sh` | [V9]: builds `wp_set.m` with `com.apple.security.app-sandbox`, ad-hoc signs it (expected: `Trace/BPT trap: 5`), then builds the same source with no entitlement as the control. Deletes nothing; the trap leaves a crash report under `~/Library/Logs/DiagnosticReports`. |
+| `sandbox_test.sh` | [V9]: builds `wp_set.m` with `com.apple.security.app-sandbox`, ad-hoc signs it (expected: `Trace/BPT trap: 5`), then builds the same source with no entitlement as the control. The entitlements file is `$TMPDIR/sandbox.entitlements.XXXXXX` and the run prints its path. Deletes nothing; the trap leaves a crash report under `~/Library/Logs/DiagnosticReports`. |
 
 ## Recipes
 
@@ -81,10 +81,12 @@ python3 wallpaper_store.py current --holds '/System/Library/Desktop Pictures/Mac
 
 `--holds` falls back to the most recently used holder when several nodes hold the same file (dead
 Spaces keep the last picture painted into them, and this machine has 13 nodes on one deleted Spice
-temp file), which is a heuristic again. `scripts/desktop-snapshot.sh` and
-`scripts/desktop-restore.sh` are the version of this that has to be right: the restore refuses to
-write unless the store says the image on screen belongs to the Space node the snapshot names, and
-it proves itself by reading the store back afterwards.
+temp file), and it refuses when the two most recently used holders were used within the same
+second: which of them is on screen is not in the store. `scripts/desktop-snapshot.sh` can run into
+that refusal, because a snapshot has to turn the image on screen into a Space node and this is the
+only way to name one. The restore does not have to: `scripts/desktop-restore.sh` names the node by
+the uuid the snapshot carries, refuses to write unless that node holds the image on screen, and
+proves itself by reading the store back afterwards.
 
 One write, and whether the store survives in place `[V5d]`:
 
