@@ -10,14 +10,15 @@
 A reference frontend is being planned in its own repository: a tray item plus a
 settings window, macOS first. It lets a user change the settings and, where a
 source is `wallhaven`, enter an API token. Four questions the documents leave
-open are decided here, and the last section leaves a fifth open on purpose.
+open are decided here, and the last section leaves the rest open on purpose.
 Nothing in this document is implemented by writing it.
 
 The constraints every decision below has to fit:
 
 - **Section 8 is the frontend contract.** Its "must never" list already forbids
   writing a state file (item 1), calling a platform setter directly (item 2),
-  starting, stopping or restarting the daemon (item 3), spawning a worker or
+  starting, stopping or restarting the daemon (item 3, which decision 3 narrows to
+  its reason), spawning a worker or
   implementing a source (item 4), unlinking the socket (item 5), reading the
   config file and treating it as the effective plan (item 6), parsing the log as
   an interface (item 7), and polling (item 9).
@@ -282,11 +283,14 @@ The writer's contract:
   write, the frontend reads `status` and `sources` to learn what the daemon
   made of it.
 - **Bound every value to the rules of 4.3** (`schedule.interval_seconds >= 60`
-  and the rest, `docs/architecture.md:1508-1512`), because there is no offline
-  validator: the daemon's parser is reachable only by starting the daemon, and
-  `config check` needs a running one (measurement 3).
+  and the rest, `docs/architecture.md:1508-1512`). A frontend that links
+  `whirl-core` binds those bounds from `whirl_core::config` itself, which is the
+  same parser the daemon and the worker run, and must not re-derive them. A
+  frontend in another language has no offline validator at all (the parser lives
+  in the daemon, and `config check` needs a running one: measurement 3), so it
+  re-derives the bounds, and section 8 must carry that as a porting cost.
 - **Find the path in this order**: if the daemon answers, `config path`
-  (measurement 3 and 4); if it does not, the platform's default path (4.1,
+  (measurement 4); if it does not, the platform's default path (4.1,
   `crates/whirl-core/src/config.rs:1609-1611`), and say that the write is
   unconfirmed because no daemon was there to confirm it. A frontend cannot see
   `WHIRL_CONFIG` or `--config`, so a daemon started with a moved config is the
@@ -296,7 +300,8 @@ The case that decides it: **the daemon is not running, which is the normal state
 when a first-time user opens the settings window.** Every verb fails then
 (measurement 3), so verbs would give the UI nothing to call in exactly the state
 it starts in, and the UI would need the file-write path anyway. One write path
-that works in both states beats two, one of which is unvalidated by design.
+that works in both states beats two, and a frontend that links `whirl-core`
+validates its write offline before it makes it.
 
 ### 2. The frontend writes the token to the platform store and never reads it back
 
@@ -335,31 +340,56 @@ and on Linux and Windows the store arm is not implemented, so a frontend there
 can only use `WHIRL_WALLHAVEN_API_KEY` until the worker's store arm lands
 (measurement 9).
 
-### 3. The supervisor unit belongs to whirl's installation, and the frontend only reports it
+### 3. The unit is whirl's, and the frontend asks whirl to install and run it
 
-whirl's own installation installs the supervisor unit: on macOS
-`~/Library/LaunchAgents/com.guruor.whirl.plist`, the file 5.2 already specifies
-(`architecture.md:1560-1566`); the `systemd --user` unit of 5.4 on Linux; the
-per-user task of 5.3 on Windows. The daemon does not install it (the daemon is
-what the unit starts) and a frontend does not install it.
+whirl's own installation ships the supervisor unit and owns its content: on
+macOS `~/Library/LaunchAgents/com.guruor.whirl.plist`, the file 5.2 already
+specifies (`architecture.md:1560-1566`); the `systemd --user` unit of 5.4 on
+Linux; the per-user task of 5.3 on Windows. whirl also owns the documented steps
+that install the unit, uninstall it, start the job and stop it, so the unit's
+content and every platform's supervisor detail stay in one repository. The daemon
+does not install the unit (the daemon is what the unit starts).
 
 A frontend's one start-at-login control covers two facts, and separates them:
 
 - **Its own login item is the frontend's own business**, opened through its own
   platform's mechanism. Nothing in section 8 speaks to it.
-- **The daemon's supervisor unit is the product's**, and the frontend reports it
-  and does not own it. The daemon half of the switch is disabled unless the unit
-  is installed, and the window says which half is on.
+- **The daemon's unit is the product's**, and the frontend reaches it by asking
+  whirl: it may run whirl's documented install, uninstall, start and stop steps,
+  and it reports what they did. It never writes unit content, never spawns
+  `whirld`, and never calls `launchctl`, `systemctl`, `schtasks` or an equivalent
+  itself. The window says which half of the switch is on.
 
-The frontend never runs `launchctl`, `systemctl`, `schtasks` or the equivalent,
-never writes the unit file, and never starts, stops or restarts the daemon (8,
-"must never" 3; `architecture.md:1798-1800`).
+Section 8, "must never" 3, keeps its target and gains one exception. Its reason
+is "a frontend that starts one gets a second daemon, or a stale socket, and
+`daemon.lock` means the second one exits anyway"
+(`docs/architecture.md:1798-1800`). None of those three can happen when the
+request goes to a step whirl owns, or to the supervisor already running the job
+it owns: the supervisor still makes at most one daemon, it still owns the
+socket's lifetime, and the lock still arbitrates. What the rule protects is that
+**a frontend is never the supervisor**, and running the product's own step is not
+being one. **This document takes reading (b) of the three considered below**,
+because (a) still leaves the user no way to stop a daemon the switch turned on.
 
-**Consequence, plainly:** the unit is a prerequisite of the daemon half of the
-switch, not of the UI. The UI is fully usable against a hand-started daemon
-today (`docs/quickstart.md:58-64`), and its autostart switch for the daemon
-ships disabled with the reason, until whirl's install path ships the unit. The
-UI never shows a switch that lies.
+**Why this document authorizes a new step.** features.md 1.1 refused `daemon
+start|stop|restart` because "lifecycle belongs to launchd, Task Scheduler or a
+systemd user unit" and a second supervisor inside the product competes with the
+first (`features.md:69-71`). A step that installs the product's own unit and asks
+the platform's single supervisor to run the job it owns does not put a second
+supervisor in the product, which is why it is not that refusal. A new CLI verb
+needs its own ADR under `docs/development.md` section 6, and this is that ADR;
+whether the step is a CLI verb, an installer action or both is left to the change
+that implements it, and if a frontend is to reach it, the rule in 2.5.1 makes it
+a protocol verb too.
+
+**Consequence, plainly:** the switch is live as soon as the installed whirl
+carries the steps, and disabled before that, naming what it needs. The supervisor
+is not a prerequisite of the UI: a frontend against a hand-started daemon
+(`docs/quickstart.md:58-64`) is fully usable, and only the daemon half of the
+switch waits. The exception's cost is stated: "off" has to mean the supervisor's
+persistent stop, which differs per platform (launchd `bootout` with the job
+disabled, `systemctl --user disable --now`, `schtasks /Change /Disable`), and it
+lives in whirl's step for exactly that reason, not in the frontend.
 
 ### 4. Frontends live in their own repositories, and section 8 is the only contract
 
@@ -375,6 +405,13 @@ Whirl's documentation gains, in one line each:
 - the URL of the reference frontend's repository, in section 8 and in
   `docs/README.md`.
 
+A frontend may depend on `whirl-core`, which carries the protocol grammar and the
+config parser (`crates/whirl-core/src/protocol.rs`, `config.rs`), so that neither
+is ported by hand; the reference frontend is expected to, and decision 1's
+offline bounds are the reason. That dependency lives in the frontend's own
+repository and changes nothing here: section 8 stays the contract, because a
+frontend in another language has only the socket and the config file.
+
 Whirl deliberately does not gain: a frontend crate or binary in this workspace, a
 GUI toolkit in any dependency graph (3.5 and `[R2]`, `architecture.md:1276-1278`),
 a plugin or ABI surface, or CI for a repository it does not contain. The protocol
@@ -388,8 +425,8 @@ ADR, not a reason to add a crate.
 
 - **`config get` and `config set` verbs on the daemon, so validation, alias
   resolution and the atomic write live in one place (decision 1).** Lost on the
-  state that decides it: with the daemon down, the verbs do not
-  exist, and every verb fails (measurement 3), so the UI needs the file-write
+  state that decides it: with the daemon down, every verb fails (measurement 3),
+  so the UI needs the file-write
   path for its first run regardless; adding the verbs then buys a second write
   path with its own validation rather than one. It also breaks the split of
   features.md 2.0 in two directions: a `config set` on a source field would make
@@ -408,22 +445,36 @@ ADR, not a reason to add a crate.
   `schedule.interval_seconds` away, and the UI can say "next rotation in
   `next_in_s`" with the key 2.10 already defines. Lowering that latency is left
   open below rather than decided here.
-- **The UI installing the unit and calling the supervisor (decision 3).** Lost:
-  `launchctl bootstrap` and `systemctl --user enable --now` start the daemon, so
-  a frontend running them is a frontend starting the daemon, which is 8, "must
-  never" 3, and the lifetime 5.1 gives the supervisor is then owned by the UI.
+- **The strict reading of 8, "must never" 3: a frontend reports the daemon's
+  unit and never asks for it (decision 3).** Rejected, and it was this
+  document's first position. It leaves the user's requirement, one control that
+  covers the app and the daemon, as a switch that can only report, and it applies
+  the rule to a state the rule's own reason does not cover: 8, "must never" 3
+  exists because "a frontend that starts one gets a second daemon, or a stale
+  socket, and `daemon.lock` means the second one exits anyway"
+  (`architecture.md:1798-1800`), and none of those three can happen when the
+  request goes to a step whirl owns or to the supervisor already running the job.
+  What the rule protects is that a frontend is never the supervisor.
+- **Reading (a): the unit stays whirl's, and the frontend may run whirl's
+  documented install and uninstall step but never a start or a stop (decision
+  3).** Rejected as incomplete rather than wrong: it gives the on/off of start at
+  login, and still leaves the user no way to stop a daemon that the switch turned
+  on, which is half of what the control is for. It is the reading to fall back to
+  if reading (b)'s platform steps turn out to be unworkable.
+- **The frontend calling `launchctl`, `systemctl` or `schtasks` directly, and
+  writing the unit's content itself (decision 3).** Rejected: it puts three
+  platforms' supervisor detail, and the unit's content, into a repository that
+  owns neither, and it is the shape that grows into the competing supervisor 5.1
+  and features.md 1.1 warn about. The frontend asks whirl; whirl speaks to the
+  supervisor.
 - **The UI shipping its own login item that launches the daemon (decision 3).**
-  Lost: same rule, and it is worse, because the login item is invisible in the
-  product's own output and survives the UI being uninstalled.
+  Lost: a login item that spawns `whirld` is the second daemon and the stale
+  socket of 8, "must never" 3, and it is worse than the other shapes because it
+  is invisible in the product's own output and survives the UI being uninstalled.
 - **The daemon installing its own unit at first start (decision 3).** Lost: the
   daemon is what the unit starts, so the first start is the one the unit never
   made, and installing a supervisor unit is an installation action rather than a
   runtime one.
-- **A `whirl autostart enable` verb, so the UI could ask for the unit (decision
-  3).** Not rejected on its merits, deferred: no such verb exists (the nineteen
-  verbs of measurement 7), a new CLI verb needs its own ADR
-  under `docs/development.md` section 6, and if a frontend is to reach it the
-  rule in 2.5.1 makes it a protocol verb too. Left open below.
 - **`whirl config get <key>` as the daemon's own fallback parser.** It is named
   as a possible fallback in `features.md:287-288`, and it is not this decision:
   that sentence is about the daemon reading its own scalars, and it is left as
@@ -449,18 +500,21 @@ ADR, not a reason to add a crate.
   (measurement 3 and 4); the write surface is the one features.md 1.1 already
   chose; the key never enters the UI's process or `argv`; and whirl gains no
   protocol verb, no dependency and no crate for its frontend.
-- **Harder:** the daemon-not-running case makes the UI mirror 4.3's ordering
-  rules locally, and mirrored rules drift; the drift is bounded by the daemon
-  being the validator on the next start. A settings change is visible at the next
-  rotation, not at the write.
-- **Forbids:** a `config get`/`config set` verb for a settings UI; a UI that
-  starts, stops, restarts or installs the daemon or its unit; a UI that reads the
-  token back; a UI that reads the config file as the effective plan; a frontend
-  crate, binary or toolkit in this workspace.
+- **Harder:** a frontend that does not link `whirl-core` mirrors 4.3's ordering
+  rules by hand, and mirrored rules drift; a frontend that does link it binds
+  the bounds from the same parser and cannot drift from it. In both cases a
+  settings change is visible at the next rotation, not at the write.
+- **Forbids:** a `config get`/`config set` verb for a settings UI; a frontend
+  that writes a unit, spawns `whirld`, calls a supervisor's own commands, or
+  claims the supervisor's role (it may only run whirl's documented steps); a UI
+  that reads the token back; a UI that reads the config file as the effective
+  plan; a frontend crate, binary or toolkit in this workspace.
 - **Reversed when:** the daemon cannot be woken to answer a settings write at all
-  (the open question below), or a frontend needs something the socket cannot
-  carry, or the platform stores turn out to be unusable from the frontend's own
-  process. Each is a superseding ADR.
+  (the open question below), or reading (b)'s platform steps turn out to be
+  unworkable from a frontend (the fallback is reading (a), which is already
+  written down), or a frontend needs something the socket cannot carry, or the
+  platform stores turn out to be unusable from the frontend's own process. Each
+  is a superseding ADR.
 - **Enforced by:** section 8's "must never" list as a review checklist for any
   frontend, and the existing refusals this document leans on: the `bad_config`
   refusal for a key-shaped `api_key_ref` (`config.rs:1260-1289`) and the
@@ -469,7 +523,8 @@ ADR, not a reason to add a crate.
   that implements them is named below.
 - **Deliberately untouched:** the nineteen verbs and 2.5.1's table (`config path`
   stays the only way a client learns the path, and it still needs a daemon);
-  `docs/spec/features.md`, which already says what 1.1 and 2.4 needed to say;
+  `docs/spec/features.md` apart from the one sentence named below in 1.1's
+  refused-verb list, where a reader will look for the autostart step;
   the worker's two-armed key resolution; and `docs/milestones.md`.
 
 ## Implied changes
@@ -482,15 +537,20 @@ half is code.
 `docs/architecture.md`
 
 1. **section 8, "May rely on"**: add a bullet naming the config file as the write
-   surface with the writer's contract of decision 1, and a second bullet naming
-   the separate-repository rule and the reference frontend's URL of decision 4.
+   surface with the writer's contract of decision 1, including that a frontend
+   which does not link `whirl-core` re-derives the bounds of 4.3 by hand, and a
+   second bullet naming the separate-repository rule and the reference frontend's
+   URL of decision 4.
 2. **section 8, "May rely on"**: add a bullet for the one start-at-login control:
-   the frontend's own login item is its own, the daemon's unit is the product's
-   and is reported, not owned (decision 3).
+   the frontend's own login item is its own, the daemon's unit is whirl's, and the
+   frontend reaches it by running whirl's documented install, uninstall, start and
+   stop steps (decision 3).
 3. **section 8, "Must never" 6**: narrow the sentence so reading the config file
    to edit it is allowed and reading it as the effective plan is still forbidden.
-4. **section 8, "Must never" 3**: add "install the supervisor unit" to the list
-   of daemon-lifetime actions, alongside start, stop and restart.
+4. **section 8, "Must never" 3**: narrow the rule to its reason and add the
+   exception in one sentence: a frontend is never the supervisor, never writes a
+   unit's content and never spawns `whirld`; running whirl's documented step, or
+   asking the already-installed supervisor for the job it owns, is not that.
 5. **section 2.5.1**: no row changes and no verb is added; add one sentence
    after the table recording that no verb reads or writes a config value and
    that a client edits the file under section 8, so a later reader knows
@@ -505,32 +565,46 @@ half is code.
    two facts: the `0600`-file arm is not implemented, features.md 2.4 governs,
    and the Linux and Windows store arms are not implemented either, so the
    environment variable is the only arm on those platforms today.
+8. **sections 5.2, 5.3 and 5.4**: state that whirl ships the unit and the
+   documented install, uninstall, start and stop steps for it, with each
+   platform's persistent stop named, and that a frontend may run those steps
+   (decision 3).
+
+`docs/spec/features.md`
+
+9. **1.1, the refused-verb list**: add one sentence recording that
+   `daemon start|stop|restart` are refused as *runtime* verbs, and that an
+   autostart step, which installs whirl's unit and asks the platform's one
+   supervisor to run the job it owns, is not one of them because it puts no
+   second supervisor in the product.
 
 `docs/quickstart.md`
 
-8. Replace "Not implemented yet: the launchd agent..." (lines 97-99) with the
-   install step for the supervisor unit, which is whirl's installation and not
-   the daemon's, and note that the reference frontend is a separate repository.
+10. Replace "Not implemented yet: the launchd agent..." (lines 97-99) with whirl's
+    install step for the supervisor unit and its on/off, and note that the
+    reference frontend is a separate repository that reaches the unit through
+    that step.
 
 `docs/README.md`
 
-9. The `decisions/` row (line 19) names two ADRs, `0001-...` and `0002-...`.
+11. The `decisions/` row (line 19) names two ADRs, `0001-...` and `0002-...`.
 
 `docs/decisions/`
 
-10. This file, `0002-frontends-write-config-own-no-daemon.md`, and no edit to
+12. This file, `0002-frontends-write-config-own-no-daemon.md`, and no edit to
     `0001`.
 
 Code implied by the same decisions, named so the work has a home:
 
-11. The daemon re-reads the config at each rotation and emits `config_reloaded`
+13. The daemon re-reads the config at each rotation and emits `config_reloaded`
     on success, keeps the previous config on failure (4.3's promise, and the
     event `events.rs` already declares).
-12. The daemon fills the `source:` records it prints in `status` and `sources`
+14. The daemon fills the `source:` records it prints in `status` and `sources`
     with the worker's `enabled` and `reason` (4.3, measurement 6).
-13. The supervisor unit is generated and installed by whirl's installation
-    (5.2/5.3/5.4), with the documented install and uninstall step.
-14. The worker's store arm for Linux and Windows (measurement 9).
+15. whirl ships the supervisor unit and the documented install, uninstall, start
+    and stop steps (5.2/5.3/5.4), with each platform's persistent stop named; the
+    frontend invokes those steps and never the supervisor itself (decision 3).
+16. The worker's store arm for Linux and Windows (measurement 9).
 
 ## Left open
 
@@ -557,7 +631,8 @@ Two smaller questions, left open with what would settle each:
   make a settings write visible within seconds. The cost is a config read every
   slice. Settled by a change that measures the settings-change latency users
   actually tolerate against that read.
-- **Does whirl gain an install verb for the supervisor unit, so the UI may ask
-  for it?** Decision 3 says the frontend does not install it; whether the product
-  offers a command the frontend may run is a new verb and its own ADR. Settled by
-  whichever change implements the unit.
+- **Is `whirl-core` published, or taken as a git dependency?** Decisions 1 and 4
+  lean on a Rust frontend binding the parser and the protocol grammar from
+  `whirl_core`, and keep the frontend out of this workspace, so the dependency has
+  to come from somewhere. It is a distribution question rather than a protocol
+  one, and the reference frontend's first build settles it.
