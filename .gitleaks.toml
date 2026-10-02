@@ -35,6 +35,10 @@ id = "internal-work-item-reference"
 description = "A work-item marker of the shape the operator's tracker mints: a lowercase letter, an underscore, eight hexadecimal digits. It resolves for nobody reading this repository, in a comment, a document, a commit subject or a branch name."
 regex = '''\bt_[0-9a-f]{8}\b'''
 
+[[rules.allowlists]]
+description = "One commit, named by its sha, in this rule alone: a base-branch merge whose subject is the project's own branch name, minted before the branch naming stopped carrying a work-item marker. The marker is in published history and cannot be rewritten, so the promotion whose range runs through that commit would be red forever on a message no rule here can change. The exemption is the commit and not the text: the same marker in any other commit's message, and in any file, is still reported, and the step that proves the rules can fire plants both directions."
+paths = ["f8c3df54c0f2c579a096e132530dc489941656c0"]
+
 [[rules]]
 id = "private-home-directory-path"
 description = "A path under somebody's home directory, one level into a dot-directory this project does not send a reader to. It names a directory that exists on one machine, the one that ran the work, so an example config or a pasted transcript that carries it carries that machine's layout. A platform location this project cites on purpose belongs in this rule's allowlist below, with a reason."
