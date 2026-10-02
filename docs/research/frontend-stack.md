@@ -35,12 +35,13 @@ not committed, packaged or published. Its path is written as `<scratch>` below.
 |---|---|
 | **Tauri** (Rust host, system WebView) | The smallest Rust host per screen, and the only candidate whose UI is not compiled into the process. |
 | **egui/eframe with the `tray-icon` crate** (Rust, no WebView) | Rust end to end, one process, no WebView, and it can link this repository's own crate (`whirl-core`). |
-| **Swift with AppKit** (the control) | The platform's own toolkit, and the only candidate that cannot reach `whirl-core` at all. |
+| **Swift with AppKit** (the control) | The platform's own toolkit, and the only candidate that cannot link `whirl-core` directly: it reaches the crate only through a C-ABI bridge project of its own. |
 
 `iced` was not built. `egui` was chosen over it for the Rust-no-WebView slot
-because `eframe` plus `tray-icon` is the pair already used together by Tauri, so
-the tray plumbing under test is the same code in both Rust candidates and the
-comparison isolates the toolkit rather than the menu library.
+because `eframe` plus `tray-icon` is the pair already used together by Tauri (the
+same crate, one minor version apart: Tauri pins `tray-icon` 0.25, this spike uses
+0.26), so the tray plumbing under test is the same code in both Rust candidates
+and the comparison isolates the toolkit rather than the menu library.
 
 ## 2. What the prototypes are, and how the numbers were taken
 
@@ -98,14 +99,14 @@ are the same shape: tray item plus one visible window.
 | Toolkits linked | `WebKit.framework` | `AppKit`, `OpenGL` (glow) | `AppKit` |
 | Idle RSS, one process | 99,072 kB (96.8 MiB) | 113,856 kB (111.2 MiB) | **95,856 kB (93.6 MiB)** |
 | Idle RSS, whole app | 180,528 kB (176.3 MiB) | 113,856 kB (111.2 MiB) | **95,856 kB (93.6 MiB)** |
-| Binary / bundle on disk | 7,197,664 B | 6,584,160 B | **124 KiB (executable 116,688 B)** |
+| Binary / bundle on disk | 7,197,664 B (release, no `lto`/`strip`) | 6,584,160 B (`lto = "thin"`, `strip = true`) | **124 KiB, executable 116,688 B (`swiftc -O`)** |
 | Cold start, min / median | 972 / 1031 ms | 543 / 961 ms | **230 / 291 ms** |
 | Idle CPU at rest | 0.0 % | 0.0 % | 0.0 % |
 | Build time, first release build | 442 s | 375 s | **25.5 s** |
 | Unique crates in the tree | 292 | 157 | **0 third-party** |
 | `LC_BUILD_VERSION minos` | 11.0 | 11.0 | 13.0 (builds at 11.0) |
-| Can link `whirl-core` | In the Rust host only | **Yes, directly** | **No** |
-| Lines it must re-derive | protocol in JS, or a bridge | **0** | protocol + section 4.3 bounds |
+| Can link `whirl-core` | In the Rust host only | **Yes, directly** | **No, not without a C-ABI bridge project** |
+| Lines it must otherwise re-derive | protocol in JS, or a bridge | **0** | protocol + section 4.3 bounds, or none behind a C-ABI bridge |
 | Hand-written lines, this spike | 205 over 4 files, 2 languages | 262 over 2 files | 216 over 2 files |
 
 ### 3.1 Idle resident memory
@@ -146,11 +147,12 @@ $ ps -o rss= -p 87787
    99168
 ```
 
-That is 99,168 kB + 82,832 kB, and it is the number a user's Activity Monitor
-shows when they sort by memory. The same measurement on the other two candidates
-found no new WebKit process at all: both the egui run and the Swift run report
-`webkit_new_processes: {}` and `rss_kb_tree: 0` for every one of their three runs,
-so their `total` equals their single-process figure.
+That is 99,168 kB + 82,832 kB, a `ps` snapshot taken at a different moment than
+the 180,528 kB (176.3 MiB) idle run in the table, and it is the number a user's
+Activity Monitor shows when they sort by memory. The same measurement on the
+other two candidates found no new WebKit process at all: both the egui run and
+the Swift run report `webkit_new_processes: {}` and `rss_kb_tree: 0` for every
+one of their three runs, so their `total` equals their single-process figure.
 
 **This is the measurement that decides the framing of the whole comparison:** at
 rest, with the settings window open, the three stacks are 93.6, 111.2 and
@@ -384,16 +386,20 @@ That is the column that decides more than the memory numbers do:
 
 | | Can consume `whirl-core` | Lines it must otherwise reimplement |
 |---|---|---|
-| **egui/eframe + tray-icon** | Yes: `whirl-core = { git = "...", branch = "..." }` | **0** — protocol grammar and config bounds come from the crate the daemon links |
+| **egui/eframe + tray-icon** | Yes, directly: `whirl-core = { git = "...", branch = "..." }` | **0**: protocol grammar and config bounds come from the crate the daemon links |
 | **Tauri** | In the Rust host, yes; the settings form is JavaScript, so every write crosses a `#[tauri::command]` bridge or re-derives the rules in JS | the 4.3 bounds (and the framing, if the JS talks to the socket) |
-| **Swift** | No. A Rust `.a`/C ABI is possible and is its own project; the honest answer is "not without adding one" | the framing plus the 4.3 bounds: the 4,358 lines above are the measured size of the rules it would be re-deriving |
+| **Swift** | Not directly. A C-ABI bridge project (a `staticlib` wrapper around `whirl-core`) can call both parsers; without one it cannot link the crate at all | none through that bridge; without it, the 4,358 lines above are an upper bound, the full size of the two parsers `whirl-core` holds |
 
 Mirrored rules drift. ADR 0002's own consequence section says so ("the UI mirror
-4.3's ordering rules locally, and mirrored rules drift"), and 4,358 lines of
-existing, tested enforcement is the cost of that mirror. A Rust frontend links it
-instead. A Tauri frontend can half-link it and still has a JavaScript settings
-form whose values must be validated somewhere; a Swift frontend has no link at
-all.
+4.3's ordering rules locally, and mirrored rules drift"), and the 4,358 lines
+above are the upper bound of that mirror: the full size of the two parsers
+`whirl-core` holds, not a measured re-derivation cost, because a frontend needs
+the framing and 4.3's bounds and not all 4,358 of them. A Rust frontend links
+those parsers instead of mirroring them, and a Tauri frontend can half-link them
+and still has a JavaScript settings form whose values must be validated somewhere.
+A Swift frontend has two honest paths: own a C-ABI bridge project, which reaches
+both parsers and re-derives neither, at the cost of marshaling each value type
+across the boundary; or take no link at all and carry the full mirror.
 
 Note also what the git dependency did *not* need: `whirl-core` has no
 dependencies (`crates/whirl-core/Cargo.toml` is `[dependencies]` and nothing
@@ -455,10 +461,17 @@ The numbers behind it: 111.2 MiB at rest against Tauri's 176.3 MiB and Swift's
 1031 ms and Swift's 291 ms; no WebKit XPC processes at rest at all; and, on the
 axis this document did not start with, **0 lines of protocol or config code to
 re-derive** because the frontend links the same `whirl-core` the daemon links,
-measured by the probe above. It loses to Swift on footprint (93.6 MiB against
-111.2, 291 ms against 961) and that is the honest price of not being macOS-only:
-Swift's 93.6 MiB buys a second and a third implementation in two other languages,
-which ADR 0002 decision 1 makes into a second and third copy of 4.3's bounds.
+measured by the probe above. On that axis Swift is neither at 0 nor simply at
+4,358: it reaches both parsers through a C-ABI bridge project, which re-derives
+nothing but is a project of its own with a marshaling layer per value type, and
+without that bridge it faces the 4,358 lines, the upper bound of the two parsers
+`whirl-core` holds. It loses to Swift on footprint (93.6 MiB against 111.2,
+291 ms against 961) and that is the honest price of not being macOS-only: Swift's
+93.6 MiB buys a second and a third implementation in two other languages, which
+ADR 0002 decision 1 makes into a second and third copy of 4.3's bounds. The
+bridge does not remove that cost: it is a macOS path, and there is no Swift build
+at all for Windows or Linux (section 3.7), so those two platforms re-derive the
+framing and the bounds whoever owns the macOS bridge.
 Tauri is rejected by its own measurement: it is *not* the lightweight option the
 WebView story implies, because the WebView is charged to the user at runtime, not
 to the download, and 79 MiB of the 176.3 is three launchd-owned processes that
