@@ -70,7 +70,7 @@ one; and footprint, only where a source states it.
 | Settings location | A preferences window, implemented as a SwiftUI `PreferencesView`: launch at login toggle, deactivate on battery, show on all Spaces, invert colours, opacity, reload interval, display, keyboard shortcuts, custom CSS, clear website data. | [3] |
 | Launch at login | A `LaunchAtLogin.Toggle()` row in that preferences window. It covers the app itself; there is no separate background service. | [3], [4] |
 | Credential | None. Plash shows a website; any site login is handled by the website in its own web view, not by a Plash credential store. No source describes a Plash-held token. | [1], [2] |
-| Footprint | **Unverified** — no size stated on the project page or in the App Store text retrieved. | — |
+| Footprint | 5.7 MB, stated by the Mac App Store listing [2]. The lookup API for the same app id (`https://itunes.apple.com/lookup?id=1494023538`) returns `fileSizeBytes` 5695877 with version 2.17.3. Store-stated, not measured here. | [2] |
 
 Note: the repository's file layout has moved since the preferences source quoted above was written;
 the citation is pinned to the commit that contains it. The reload interval in that source defaults
@@ -97,12 +97,12 @@ official app.
 
 | Field | Finding | Source |
 |---|---|---|
-| Menu bar item | Every control lives in the status item. A dated review of the app: "The Irvue user interface is represented by a simple status bar menu that provides access to all available controls and customization options", including "rapidly load the next wallpaper in queue" and "quick information about the current wallpaper". | [9] |
+| Menu bar item | Every control lives in the status item. A dated review of the app: "The Irvue user interface is represented by a simple status bar menu that provides access to all available controls and customization options", and "The application can change the wallpaper on its own, but you can also trigger the procedure manually." | [9] |
 | Act now vs settings | Both in the one status menu; no separate window is documented. The menu acts (next, download, open author page, disable the scheduler) and configures (interval, channels, multi-display, hide-list). **Inference**, from the review's description of a single menu holding both. | [9] |
 | Settings location | The status menu itself, described as holding "all available controls and customization options". AppleScript support is exposed for automation. | [9], [10] |
 | Launch at login | **Unverified** — no source found states a start-at-login control or a login item. | — |
 | Credential | No credential is required to rotate. If the user has an Unsplash account, the app can like photos and add them to collections; how that token is stored is **unverified** — no source describes the store. | [8] |
-| Footprint | 8.7 MB (Mac App Store-adjacent listing, version 2026.3); the App Store listing text has also been reported at 5.3 MB for an earlier build. Both are store-stated, neither measured here. | [9], [8] |
+| Footprint | 5.3 MB, stated by the Mac App Store listing [8]. The lookup API for the same app id (`https://itunes.apple.com/lookup?id=1039633667`) returns `fileSizeBytes` 5271034 (5.27 MB) for version 2026.3. Store-stated, not measured here. | [8] |
 
 ### 4. Bing Wallpaper, Microsoft (Windows 10+, plus a macOS build)
 
@@ -115,12 +115,13 @@ official app.
 | Credential | None required: images come from the Bing homepage feed with no user account. Microsoft Rewards is offered separately and is not a source credential. | [11] |
 | Footprint | 218.5 MB, the Windows installer `BingWallpaperInstaller.exe` (version 1.1.460.0, published 24/08/2026) as stated on the Microsoft Download Center. The installer bundles the Bing search components, so this is not the wallpaper engine's own footprint alone. | [11] |
 
-Platform note: the current marketing page states "The Bing Wallpaper app is compatible with Windows
-10 and above only at this time" [12], yet a macOS build ships as a `.pkg` from `download.microsoft.com`
-and is distributed through the Homebrew cask `bing-wallpaper` (version 1.1.8, `depends_on macos: ">=
-:big_sur"`, `requires_rosetta`) [14]. The macOS product page (`bingwallpaper.microsoft.com/mac/...`)
-returned HTTP 500 when retrieved for this note, so the cask is the artifact cited for the macOS
-build's existence, not the marketing site.
+Platform note: the Windows requirement is stated by the download page, "Supported Operating Systems:
+Windows 10, Windows 11" [11]. A macOS build also ships: it is a `.pkg` from `download.microsoft.com`,
+distributed through the Homebrew cask `bing-wallpaper` (version 1.1.8, `depends_on macos: ">= :big_sur"`,
+`requires_rosetta`) [14]. The marketing page [12] carries no platform-restriction sentence as served
+now (it is a 2026 redesign, "Explore the world one photo at a time", that names no OS version), and the
+macOS product page (`bingwallpaper.microsoft.com/mac/...`) returned HTTP 500 when retrieved for this
+note, so the cask is the artifact cited for the macOS build's existence, not the marketing site.
 
 ### 5. Wallpaper Engine (Windows)
 
@@ -142,7 +143,7 @@ build's existence, not the marketing site.
 | Settings location | A settings dialog plus a "More Settings" dialog, with an Import/Export section backed by a file. | [21], [25] |
 | Launch at login | A dated review instructs "You'll want JBS to Start automatically when starting Windows", with an alternative "On start-up change the background then exit" [26]. An installer analysis of the older 4.x line records an HKCU Run entry, `BackgroundSwitcher.exe /next` [27]. Covers the running app; no separate background service is documented. | [26], [27] |
 | Credential | Tokens for remote sources are held in the Windows **Credential Locker**: a release note explains Google Photos was removed from "Windows 7 and below as they don't support Credential Locker" [22]. Unsplash required an account after a change, authenticated "from the Authorise button on Settings or when you open an Unsplash photo set" [23]. The credential is therefore collected by an in-app Authorise action and stored in the OS credential store, not in a JBS file. | [22], [23] |
-| Footprint | 2.3 MB installer for version 4.7, per an installer inventory [27]. A current third-party listing states 31.14 MB for version 6.1, which is an installer size read from a download site rather than a project figure; both are reported, neither measured here. | [27] |
+| Footprint | 2.3 MB installer for version 4.7, per an installer inventory [27]. Store-stated, not measured here. | [27] |
 
 Next/previous note: JBS exposes `/next` on the command line and added using it against an already
 running instance in 5.8 [24]. A next control in the tray menu itself is not stated by a source.
@@ -156,7 +157,7 @@ running instance in 5.8 [24]. A next control in the tray menu itself is not stat
 | Settings location | In-app pages (Background, Lock screen, Daily Bing picture, Daily Windows Spotlight picture, etc.), plus a UWP background-task permission that lives in Windows Settings > Apps. | [28], [29] |
 | Launch at login | The update runs as a **UWP background task**, which Windows schedules; the FAQ documents that Windows must be allowed to run the app in the background and how to fix it when it is not. This is the background piece; there is no separate UI process to launch. | [29] |
 | Credential | None for Bing or Spotlight. Synchronising settings across devices "requires a Microsoft account", which is the OS account, not a credential the app stores. | [28] |
-| Footprint | **Unverified** — the Microsoft Store listing gives no size in the text retrieved. | [28] |
+| Footprint | 41.97 Mo ("Approximate size"), stated by the app's own listing [28]. Store-stated, not measured here. | [28] |
 
 ### 8. Variety (Linux)
 
@@ -201,22 +202,22 @@ the table and the notes cannot disagree.
 | Behaviour | n of 10 | Applications that state it |
 |---|---|---|
 | Next / previous | 6 | Plash, Irvue, Bing Wallpaper, Wallpaper Engine, John's Background Switcher, Variety |
-| Pause or stop | 6 | Irvue, Wallpaper Engine, John's Background Switcher, Dynamic Theme, Variety, Komorebi |
+| Pause or stop | 5 | Irvue, Wallpaper Engine, John's Background Switcher, Dynamic Theme, Variety |
 | Pick a source or collection | 10 | all ten |
-| Refresh interval | 8 | Plash, Unsplash Wallpapers, Irvue, Bing Wallpaper, Wallpaper Engine, John's Background Switcher, Dynamic Theme, Variety |
+| Refresh interval | 7 | Plash, Unsplash Wallpapers, Irvue, Bing Wallpaper, John's Background Switcher, Dynamic Theme, Variety |
 | Launch at login | 5 | Plash, Wallpaper Engine, John's Background Switcher, Dynamic Theme, Variety |
 | History | 4 | Bing Wallpaper, John's Background Switcher, Dynamic Theme, Variety |
 | Favourite or pin | 3 | Irvue, Variety, HydraPaper |
 | Show the current image | 10 | all ten |
-| Reveal the file | 3 | Wallpaper Engine, John's Background Switcher, Variety |
+| Reveal the file | 2 | Wallpaper Engine, John's Background Switcher |
 | Quit versus hide | 3 | Plash (hide menu bar icon), Wallpaper Engine (hide tray icon), Variety (indicator icon configurable) |
-| Per-display control | 4 | Irvue, Wallpaper Engine, John's Background Switcher, HydraPaper |
+| Per-display control | 5 | Plash, Irvue, Wallpaper Engine, John's Background Switcher, HydraPaper |
 
 Reading of the table, stated as inference: the two near-universals are the abilities that define
 the category at all — choosing a source, and knowing what is currently on screen (10 of 10). The
-next tier (6 to 8 of 10) is movement and cadence: next/previous, pause/stop, refresh interval.
-The rare tier (3 to 5 of 10) is the state a wallpaper app has to keep: history, favourites,
-launch at login, reveal-the-file, quit-versus-hide, per-display. A v1 that ships the near-universals
+next tier (6 to 7 of 10) is movement and cadence: next/previous and refresh interval. The rare tier
+(2 to 5 of 10) is the state a wallpaper app has to keep: pause/stop, launch at login, per-display,
+history, favourites, quit-versus-hide, reveal-the-file. A v1 that ships the near-universals
 plus launch at login and history is at parity with most of the field; per-display and reveal-the-file
 are differentiators, not table stakes.
 
@@ -233,10 +234,10 @@ nothing that would put image work or a second scheduler in the frontend.
 |---|---|---|
 | Next wallpaper | Advance the rotation queue now. | next/previous in 6 of 10 |
 | Previous wallpaper | Step back one in the rotation, using the daemon's history, not a re-download. | same row |
-| Pause rotation / Resume rotation | One row whose label reflects current state; maps to a daemon pause flag. | 6 of 10 offer pause |
+| Pause rotation / Resume rotation | One row whose label reflects current state; maps to a daemon pause flag. | 5 of 10 offer pause |
 | Source submenu | List the configured sources and collections; picking one makes it the active source. | 10 of 10 pick a source |
 | Show current wallpaper | Open a small popover: source, collection, author or origin, and the file path of the current image. | 10 of 10 show the current image |
-| Reveal current file | Open the OS file manager at the current image. | 3 of 10 reveal the file |
+| Reveal current file | Open the OS file manager at the current image. | 2 of 10 reveal the file |
 | History submenu | Last N rotations, newest first; picking one sets it as current. | 4 of 10 keep history |
 | Favourite / Unfavourite current | Toggle a pin on the current image into a favourites collection. | 3 of 10 favourite |
 | Settings… | Open the settings window. This is the act/settings seam, matching JBS and Variety. | JBS, Variety |
@@ -252,7 +253,7 @@ the single row that crosses into the window.
 | Setting | Shape | Rows in the field that support it |
 |---|---|---|
 | Sources | Add/remove local folders; enable/disable remote sources; each remote source shows credential state by name only. | 10 of 10 |
-| Rotation interval | A numeric value plus a unit, with a sensible floor (Plash's floor is 6 s; Variety's menu spans minutes to hours). | 8 of 10 |
+| Rotation interval | A numeric value plus a unit, with a sensible floor (Plash's floor is 6 s; Variety's menu spans minutes to hours). | 7 of 10 |
 | Rotation order | Sequential vs shuffle. | Irvue (randomise), HydraPaper (random), Wallpaper Engine (playlist order) |
 | Launch at login | One toggle for the whole product. | 5 of 10 |
 | History size | How many past rotations to keep for the History submenu. | 4 of 10 keep history |
@@ -271,7 +272,7 @@ rules forbid committing one; a frontend that displayed or held the value would c
 |---|---|
 | Stop or restart the daemon | Daemon lifecycle belongs to the OS service manager, not the UI. A frontend able to leave the daemon stopped is a support burden with no upside; Wallpaper Engine's own docs warn that hiding its tray icon leaves Task Manager as the only way to stop it [16]. |
 | In-app OAuth / web sign-in | The credential belongs in the platform store by reference (architecture 6.3). Shipping a web login in the frontend is the shortest path to the frontend becoming a second credential store. JBS's in-app Authorise button is the precedent, and it is also the precedent for the wrong kind of coupling [22][23]. |
-| Per-display different images | Every source that has it treats it as a headline feature (HydraPaper is built around it; Irvue, Wallpaper Engine and JBS all support it), so it will be wanted. It is omitted from v1 only because it multiplies the rotation state machine, and the daemon's advertised model is one queue. Revisit once the daemon exposes a display target in the protocol. |
+| Per-display different images | Every source that has it treats it as a headline feature (HydraPaper is built around it; Plash, Irvue, Wallpaper Engine and JBS all support it), so it will be wanted. It is omitted from v1 only because it multiplies the rotation state machine, and the daemon's advertised model is one queue. Revisit once the daemon exposes a display target in the protocol. |
 | Image effects (sepia, borders, montages, calendars, clocks, quotes) | JBS and Variety package these; the daemon never owns pixels (architecture 9), so effects are a separate product surface, not a frontend control. |
 | Live content wallpapers (live website, live Earth, Wikipedia picture of the day) | Plash, Wallch and Variety each carry a live-content mode. Whirl rotates images from sources; a live feed is a different daemon feature and a different frontend rendering problem. |
 | Per-image blacklist / "never show again" | Variety's trash and Irvue's hide-list exist, but favourites plus history cover the common intent, and blacklisting is daemon-side filtering that the daemon does not advertise yet. |
@@ -293,7 +294,6 @@ rules forbid committing one; a frontend that displayed or held the value would c
 [10] https://irvue.tumblr.com/apple-script-support
 [11] https://www.microsoft.com/en-us/download/details.aspx?id=101202
 [12] https://bingwallpaper.microsoft.com/
-[13] https://bingwallpaper.microsoft.com/mac/en/bing/bing-wallpaper
 [14] https://github.com/Homebrew/homebrew-cask/blob/47817d96ba845ccedf309ed3f1e820076cecd0ba/Casks/b/bing-wallpaper.rb
 [15] https://learn.microsoft.com/en-us/answers/questions/2349135/how-does-the-bing-wallpaper-app-for-mac-work-i-onl
 [16] https://help.wallpaperengine.io/en/functionality/tray.html
@@ -311,7 +311,6 @@ rules forbid committing one; a frontend that displayed or held the value would c
 [28] https://apps.pinnula.ca/en/dynamic-theme/9bghzk
 [29] https://apps.pinnula.ca/en/dynamic-theme/9bghzk/faq
 [30] https://www.makeuseof.com/how-to-get-best-bing-windows-spotlight-wallpapers-with-dynamic-theme/
-[31] https://www.thewindowsclub.com/dynamic-theme-app-windowws-10
 [32] https://github.com/varietywalls/variety
 [33] https://manpages.ubuntu.com/manpages/focal/man1/variety.1.html
 [34] https://github.com/NixOS/nixpkgs/issues/402093
