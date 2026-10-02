@@ -9,12 +9,14 @@
 #
 # What it does, in order:
 #
-#   1. reads the snapshot's Space node back out of the store, with
-#      docs/research/probes/wallpaper_store.py, the one plist reader in this tree
+#   1. reads the snapshot's own Space node back out of the store by the uuid the snapshot carries,
+#      with docs/research/probes/wallpaper_store.py, the one plist reader in this tree
 #   2. asks the existing probe docs/research/probes/wp_probe.m which image is on screen, and
-#      refuses to write unless the store says that image belongs to the Space node the snapshot
-#      names. A write reaches the frontmost Space only (docs/research/macos.md section 3), so
-#      restoring from another Space would repaint the wrong one and leave a trace there
+#      refuses to write unless the snapshot's node is the node holding it. A write reaches the
+#      frontmost Space only (docs/research/macos.md section 2), so restoring from another Space
+#      would repaint the wrong one and leave a trace there. The node is named by the snapshot's own
+#      uuid rather than resolved from the image, because several store nodes can hold one file and
+#      the store does not say which of them is frontmost (docs/research/probes/README.md)
 #   3. sets the image with the harness setter, docs/research/probes/wp_set.m, built into a
 #      scratch directory. The product's own setter is crates/whirl-worker/src/backend/macos.rs
 #      (PR #14) and is not this script's business
@@ -97,7 +99,8 @@ snap_taken=$(snapshot_field taken_utc)
     exit 2
 }
 
-# 1 and 2: which Space are we on, and is it the one the snapshot names?
+# 1: what is on screen, and that it is one image across the screens. This answers "is the frontmost
+# Space the snapshot's node", not "which node holds this file": the node is named by the snapshot.
 wp_probe=$(build wp_probe)
 screens=$("$wp_probe" | sed -n 's/^  desktopImageURL: //p')
 if [ -z "$screens" ]; then
@@ -111,28 +114,36 @@ if [ "$(printf '%s\n' "$on_screen" | grep -c .)" -ne 1 ]; then
     printf '%s\n' "$on_screen" | sed 's/^/  /' >&2
     exit 1
 fi
-if ! here=$(python3 "$PROBE" current --holds "$on_screen"); then
-    echo "${0##*/}: the store does not name the Space node holding the image on screen" >&2
+
+# 2: the node to write, named by the uuid the snapshot carries, and the one question that decides
+# whether writing is safe: does that node hold the image that is on screen? The store does not say
+# which Space is frontmost, and several nodes can hold one file (a dead Space keeps the last
+# picture painted into it), so resolving the on-screen image back to a node is a guess with more
+# than one answer. Naming the node first and then asking what it holds is the same question asked
+# about the one node it is about, and it has one answer.
+if ! here=$(python3 "$PROBE" current "$snap_space"); then
+    echo "${0##*/}: Spaces[$snap_space] is not in the store, so there is no node to restore:" >&2
     echo "  the message above says why; nothing was written" >&2
     exit 1
 fi
-here_space=$(value_of space "$here")
 here_path=$(value_of path "$here")
 here_lastset=$(value_of lastset "$here")
 
-if [ "$here_space" != "$snap_space" ]; then
+if [ "$here_path" != "$on_screen" ]; then
     echo "${0##*/}: the frontmost Space is not the one the snapshot names." >&2
-    echo "  snapshot  : Spaces[$snap_space], taken $snap_taken" >&2
-    echo "  on screen : Spaces[$here_space]" >&2
+    echo "  on screen  : $on_screen" >&2
+    echo "  snapshot   : Spaces[$snap_space], taken $snap_taken, wants $snap_url" >&2
+    echo "  that node holds: $here_path" >&2
     echo "  A write reaches the frontmost Space only, so restoring here would repaint the wrong" >&2
-    echo "  Space and leave Spaces[$snap_space] holding whatever it holds now." >&2
+    echo "  Space and leave Spaces[$snap_space] holding its own image. The store cannot say which" >&2
+    echo "  node is frontmost, so this script will not guess one." >&2
     echo "  Switch to the Space the snapshot names and run this again." >&2
     exit 1
 fi
 
 if [ "$here_path" = "$snap_path" ]; then
     echo "already on the snapshot image, nothing to write"
-    echo "space    : Spaces[$here_space]"
+    echo "space    : Spaces[$snap_space]"
     echo "image    : $snap_url"
     echo "path     : $here_path"
     echo "LastSet  : $here_lastset   (UTC)"
