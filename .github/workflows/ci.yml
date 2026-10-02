@@ -39,9 +39,10 @@ name: ci
 # behind `development` and written before those rules existed, so the epoch
 # replaces it and the promotion is not judged by a rule it never had.
 #
-# The job proves its own rules can fail as well: a step in it plants one sample of
-# every shape the rules forbid, in a commit, in a file and inside a merge, so a rule
-# that stops matching the real thing, or an exemption the scanner does not read, is
+# The job proves its own rules can fail as well: a step in it plants a sample of every
+# shape the rules forbid, in a commit, in a file and inside a merge, and requires each
+# sample to fire on the line it was planted on, so a rule that stops matching the real
+# thing, one that stops reaching a shape, or an exemption the scanner does not read, is
 # a red job rather than a green one. It plants one sentence the rules must not touch
 # as well, so a rule that starts reporting ordinary prose is red too, and it plants
 # the exempted commit's message beside the same text under another commit's name, so
@@ -313,16 +314,28 @@ jobs:
           gitleaks = pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else "./gitleaks").resolve()
           config = repo / ".gitleaks.toml"
 
-          # One sample per rule, as two parts joined at run time. The samples are synthetic:
-          # a fake marker, a directory that does not exist, a handle nobody has. They are
-          # also split rather than written whole because this file is inside the range the
-          # scanner reads, and a self-test that trips its own rule would fail every pull
-          # request that adds it.
+          # One sample per shape a rule has to catch, each as parts joined at run time.
+          # The samples are synthetic: a fake marker, a directory that does not exist, a
+          # handle nobody has. They are also split rather than written whole because this
+          # file is inside the range the scanner reads, and a self-test that trips its own
+          # rule would fail every pull request that adds it.
+          #
+          # The private-home rule carries all three of its shapes, because the absolute
+          # forms are the ones the scanner's own default allowlist used to swallow: merged
+          # in by `useDefault`, it exempts a finding whose secret is a bare home path, so
+          # `/Users/` fired only on a name segment carrying a character outside `[a-z0-9]`
+          # and `/home/` never fired at all. Every sample below is required to fire on the
+          # line it was planted on, in every pass, so a rule that stops reaching one of
+          # the absolute forms is a red job rather than a green one.
           SAMPLES = {
-              "internal-work-item-reference": ("t_", "0badc0de"),
-              "private-home-directory-path": ("~/", ".fixture-state/run"),
-              "named-worktree-path": (".worktrees/", "fixture-checkout/file.txt"),
-              "agent-role-handle": ("p-", "fixture"),
+              "internal-work-item-reference": [("t_", "0badc0de")],
+              "private-home-directory-path": [
+                  ("~/", ".fixture-state/run"),
+                  ("/Users/", "someone/.private/thing"),
+                  ("/home/", "someone/.private/thing"),
+              ],
+              "named-worktree-path": [(".worktrees/", "fixture-checkout/file.txt")],
+              "agent-role-handle": [("p-", "fixture")],
           }
 
           # A path the allowlist is supposed to keep working: a location this project's own
@@ -401,11 +414,12 @@ jobs:
                   matchers[rule_id] = re.compile(rule["regex"])
               except (KeyError, re.error) as error:
                   fail(f"rule {rule_id} has no usable `regex`: {error}")
-          for rule_id, parts in SAMPLES.items():
-              sample = "".join(parts)
+          for rule_id, rule_samples in SAMPLES.items():
               matcher = matchers.get(rule_id)
-              if matcher is not None and not matcher.search(sample):
-                  fail(f"the planted sample for {rule_id} does not match that rule's regex")
+              for parts in rule_samples:
+                  sample = "".join(parts)
+                  if matcher is not None and not matcher.search(sample):
+                      fail(f"the planted sample for {rule_id} ({sample}) does not match that rule's regex")
           allowed_rule, allowed_parts = ALLOWED
           allowed_sample = "".join(allowed_parts)
           if allowed_rule not in matchers:
@@ -463,15 +477,26 @@ jobs:
           (fixture / "clean.txt").write_text("a line with no reference in it\n")
           clean_base = commit("a clean start")
 
+          # Every sample on its own line, labelled, so that a finding can be tied back to
+          # the sample it came from: gitleaks reports `StartLine` in git mode and in dir
+          # mode alike, and `--redact` hides the secret, so the line number is what a
+          # report still carries that names which sample fired. `sampled` is (rule, index,
+          # sample) so the checks below can require each shape on its own rather than
+          # accept a rule-level hit from a neighbouring sample of the same rule.
+          sampled = [
+              (rule_id, index, "".join(parts))
+              for rule_id, rule_samples in SAMPLES.items()
+              for index, parts in enumerate(rule_samples)
+          ]
+          planted_text = "".join(f"{rule_id}: {sample}\n" for rule_id, _, sample in sampled)
           # The samples as file content, one per line, labelled.
-          (fixture / "planted.txt").write_text(
-              "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in SAMPLES.items())
-          )
+          (fixture / "planted.txt").write_text(planted_text)
           # The samples as a commit message as well: a subject and a body. The message half
           # of the check reads `git log --format='%s%n%n%b'`, so the fixture's subject
           # carries one sample and its body the rest.
-          body = "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in list(SAMPLES.items()))
-          planted_head = commit(f"lines and a handle {''.join(SAMPLES['agent-role-handle'])}\n\n{body}")
+          planted_head = commit(
+              f"lines and a handle {''.join(SAMPLES['agent-role-handle'][0])}\n\n{planted_text}"
+          )
 
           # The documented location on its own, which must pass.
           (fixture / "allowed.txt").write_text(allowed_sample + "\n")
@@ -501,9 +526,7 @@ jobs:
           # which the range's base is a descendant of.
           merged_from = clean_head
           run(["git", "switch", "--quiet", "--create", "carried", merged_from], cwd=fixture)
-          (fixture / "merged.txt").write_text(
-              "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in SAMPLES.items())
-          )
+          (fixture / "merged.txt").write_text(planted_text)
           carried_head = commit("a change a merge carries")
           run(["git", "switch", "--quiet", "main"], cwd=fixture)
           merge_head = merge("carried", "a merge that carries the change above")
@@ -527,9 +550,7 @@ jobs:
           # plain directory the job scans.
           tree = work / "tree"
           tree.mkdir()
-          (tree / "planted.txt").write_text(
-              "".join(f"{rule_id}: {''.join(parts)}\n" for rule_id, parts in SAMPLES.items())
-          )
+          (tree / "planted.txt").write_text(planted_text)
           (tree / "allowed.txt").write_text(allowed_sample + "\n")
           print(f"tree:    {tree}")
 
@@ -595,6 +616,36 @@ jobs:
 
           # --- what the check must catch, and what it must not -------------------------
 
+          def sample_fired(label, findings, file_name, content):
+              """Require every planted sample to fire, on the line it was planted on.
+
+              `file_name` is the base name of the file the pass scanned and `content` is
+              what was written to it. A rule-level hit is not enough here: it is exactly
+              what hid the private-home rule's absolute forms, because the `~` sample of
+              the same rule fired for them. Each sample is located by its line, the one
+              field `--redact` leaves that still names which sample a finding came from.
+              """
+              reported = {
+                  (finding["RuleID"], pathlib.Path(finding["File"]).name, finding["StartLine"])
+                  for finding in findings
+              }
+              for rule_id, index, sample in sampled:
+                  lines = [
+                      number
+                      for number, line in enumerate(content.splitlines(), start=1)
+                      if sample in line
+                  ]
+                  if any((rule_id, file_name, number) in reported for number in lines):
+                      print(f"  {rule_id}: fired on sample {index} ({sample}) in {label}")
+                  elif not lines:
+                      fail(f"{rule_id}: sample {index} ({sample}) was not planted in {label}")
+                  else:
+                      fail(
+                          f"{rule_id} did not fire on sample {index} ({sample}) in {label}: "
+                          f"no finding at {file_name}:{lines}"
+                      )
+
+
           planted_lines = scan_range(clean_base, planted_head, work / "lines.json")
           reported = {finding["RuleID"] for finding in planted_lines}
           for rule_id in sorted(SAMPLES):
@@ -604,6 +655,7 @@ jobs:
                   fail(f"{rule_id} did not fire on its sample in the added lines")
           for rule_id in sorted(reported - set(SAMPLES)):
               notes.append(f"{rule_id} also fired in the fixture; it is not one of the rules under test")
+          sample_fired("the added lines", planted_lines, "planted.txt", planted_text)
 
           planted_messages = scan_dir(str(messages), work / "messages.json")
           reported = {finding["RuleID"] for finding in planted_messages}
@@ -614,6 +666,12 @@ jobs:
                   fail(f"{rule_id} did not fire on its sample in a commit message")
           for rule_id in sorted(reported - set(SAMPLES)):
               notes.append(f"{rule_id} also fired on the message fixture; it is not one of the rules under test")
+          sample_fired(
+              "a commit message",
+              planted_messages,
+              f"{planted_head}.txt",
+              (messages / f"{planted_head}.txt").read_text(),
+          )
 
           # The tree pass, which is the same directory mode over a plain directory of
           # files. Every sample has to fire there too, or the pass that makes the range's
@@ -627,6 +685,7 @@ jobs:
                   fail(f"{rule_id} did not fire on its sample in a file, so the tree pass does not catch it")
           for rule_id in sorted(reported - set(SAMPLES)):
               notes.append(f"{rule_id} also fired on the tree fixture; it is not one of the rules under test")
+          sample_fired("the tree pass", planted_tree, "planted.txt", planted_text)
           # And the exemption has to keep working in that mode as well, or a path this
           # project documents on purpose would fail every run of the tree pass.
           documented_tree = [
@@ -701,6 +760,7 @@ jobs:
                       f"a merge's finding for {rule_id} names {finding['File']}, and the "
                       "plant is in merged.txt"
                   )
+          sample_fired("a merge's patch", merged_lines, "merged.txt", planted_text)
 
           # And the same merge shape with nothing planted in it, which has to pass: a
           # merge is not a rule shape. This is the direction that keeps the job from
@@ -742,7 +802,7 @@ jobs:
           else:
               exempt_messages = work / "exempt-messages"
               exempt_messages.mkdir(parents=True, exist_ok=True)
-              exempt_text = "".join(SAMPLES[marker_rule]) + "\n"
+              exempt_text = "".join(SAMPLES[marker_rule][0]) + "\n"
               for sha in exempted_commits + [clean_base]:
                   (exempt_messages / f"{sha}.txt").write_text(exempt_text)
               exempt_findings = scan_dir(str(exempt_messages), work / "exempt.json")
@@ -789,11 +849,12 @@ jobs:
               sys.exit(1)
 
           print(
-              f"self-test: {len(SAMPLES)} rule(s) fired on a planted sample, in the added lines, in a "
-              "commit message, in a file and inside a merge; the allowlist kept a documented location, "
-              "dropped an ordinary sentence that carries a token of a handle's shape, and dropped the "
-              "exempted commit's message while the same marker under another commit's name was "
-              "reported; three clean inputs reported nothing, one of them a merge"
+              f"self-test: {len(SAMPLES)} rule(s), all {len(sampled)} planted sample(s) fired on the "
+              "line each was planted on, in the added lines, in a commit message, in a file and "
+              "inside a merge; the allowlist kept a documented location, dropped an ordinary "
+              "sentence that carries a token of a handle's shape, and dropped the exempted "
+              "commit's message while the same marker under another commit's name was reported; "
+              "three clean inputs reported nothing, one of them a merge"
           )
           PY
 
