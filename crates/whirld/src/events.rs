@@ -68,8 +68,8 @@ pub enum Event {
     ClockJump {
         seconds: i64,
     },
-    /// The daemon re-read the config and it parsed.
-    #[allow(dead_code)] // trigger: the rotation-time re-read (docs/architecture.md 10.5)
+    /// The daemon re-read the config and it parsed (docs/architecture.md 4.2,
+    /// 10.5): the rotation-time re-read constructs this.
     ConfigReloaded,
     /// The daemon does not know what is on screen and is protecting the whole
     /// grace window (1.7.3 step 3).

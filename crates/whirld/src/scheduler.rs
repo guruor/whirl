@@ -32,9 +32,12 @@ use whirl_core::protocol::Via;
 /// wall-clock jump and an ordinary late slot are all re-tested rather than
 /// assumed.
 pub fn run(daemon: Arc<Daemon>, started: Instant) {
-    let interval = daemon.effective.config.schedule.interval_seconds;
     let mut previous = observe(started);
     loop {
+        // 4.2 and 10.5: the interval is read every pass rather than captured
+        // once, so the re-read the last rotation did takes effect on the next
+        // slot instead of at the next daemon start.
+        let interval = daemon.effective.config().schedule.interval_seconds;
         let current = observe(started);
         step(&daemon, previous, current, interval);
         previous = current;

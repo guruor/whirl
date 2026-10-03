@@ -265,7 +265,7 @@ impl Daemon {
     /// directory is even opened, so the caller takes it.
     pub fn load(effective: Effective, worker: crate::worker::Worker, lock: DaemonLock) -> Daemon {
         let store = Store::new(&effective.state_dir);
-        let bound = effective.config.state.history_entries;
+        let bound = effective.config().state.history_entries;
         let mut state = State::new(bound);
 
         // 8.4: the probe, at start and at each rotation, not cached.
@@ -293,7 +293,7 @@ impl Daemon {
 
         // 2.10 `next_at`: the persisted deadline, or a fresh one. A first run
         // has no file to read it from.
-        let interval = effective.config.schedule.interval_seconds as i64;
+        let interval = effective.config().schedule.interval_seconds as i64;
         if state.next_at.is_none() && !state.paused {
             state.next_at = Some(unix_seconds() + interval);
         }
@@ -325,7 +325,7 @@ impl Daemon {
     /// 2.10 after the count.
     pub fn status(&self) -> Response {
         let state = self.state();
-        let config = &self.effective.config;
+        let config = self.effective.config();
         let current = state.current.as_ref();
         // 5.4's check is the definition of these totals: the files under
         // `sha256/`, measured now, against the two caps. One walk answers
@@ -583,13 +583,14 @@ impl Daemon {
 
     /// The configured source an `origin_key` names: its prefix is the source
     /// `id` (2.5). `None` for a prefix that matches no configured source, which
-    /// is the `external` image of 2.6.
-    fn source_of(&self, origin_key: &str) -> Option<&whirl_core::config::SourceConfig> {
+    /// is the `external` image of 2.6. Owned rather than borrowed: the config is
+    /// behind a lock a re-read writes, so no caller may hold a reference into it.
+    fn source_of(&self, origin_key: &str) -> Option<whirl_core::config::SourceConfig> {
         let prefix = origin_key.split_once(':').map(|(prefix, _)| prefix);
         self.effective
-            .config
+            .config()
             .sources
-            .iter()
+            .into_iter()
             .find(|source| Some(source.id.as_str()) == prefix)
     }
 
@@ -622,8 +623,13 @@ impl Daemon {
         let path = reported?;
         let referenced = self
             .source_of(origin_key)
-            .and_then(|source| source.local.as_ref())
-            .is_some_and(|local| local.mode == whirl_core::config::LocalMode::Reference);
+            .map(|source| {
+                source
+                    .local
+                    .as_ref()
+                    .is_some_and(|local| local.mode == whirl_core::config::LocalMode::Reference)
+            })
+            .unwrap_or(false);
         if referenced
             && !std::path::Path::new(path).starts_with(self.effective.cache_dir.join("sha256"))
         {
@@ -640,7 +646,7 @@ impl Daemon {
     /// daemon records it at a rotation instead of keeping a second opinion about
     /// the effective values.
     pub fn plan_line(&self) -> String {
-        protocol::plan_record(&self.effective.config.plan_pairs(self.effective.backend))
+        protocol::plan_record(&self.effective.config().plan_pairs(self.effective.backend))
     }
 
     /// 8.7's reporting half, for the one verb that reports it besides `status`:
@@ -653,7 +659,7 @@ impl Daemon {
 
     /// The deadline a worker gets: `schedule.worker_deadline_seconds` (1.7.1).
     pub fn worker_deadline(&self) -> Duration {
-        Duration::from_secs(self.effective.config.schedule.worker_deadline_seconds)
+        Duration::from_secs(self.effective.config().schedule.worker_deadline_seconds)
     }
 
     /// One rotation, in the slot `run` the caller claimed, with its outcome
@@ -665,6 +671,10 @@ impl Daemon {
     /// The worker is spawned outside the state lock (1.8), and `record_success`
     /// or `record_failure` is what clears `running` again.
     pub fn rotation(&self, run: u64, via: Via, verb: Verb, target: Option<&str>) -> Rotation {
+        // 4.2 and 10.5: the config is re-read before the worker is spawned and
+        // before the deadline below is read, so an edit to the file takes effect
+        // on this rotation rather than the next daemon start.
+        self.reconfigure();
         let deadline = self.worker_deadline();
         let mut reported = None;
         // 7.3 step 4's input for 8.8: the pid of the worker this run has reaped,
@@ -734,6 +744,48 @@ impl Daemon {
         // fallback it is what lets the sweep remove that worker's lock file (8.8).
         self.finish_rotation(reported.as_ref(), reaped);
         outcome
+    }
+
+    /// docs/architecture.md 4.2 and 10.5: the daemon re-reads the config on
+    /// every rotation, so an edit to the file takes effect at the next one. A
+    /// parse that succeeds replaces the config the daemon is running under and
+    /// emits `config_reloaded` (2.9); a parse that fails keeps the previous
+    /// config, records `last_error: bad_config` and says why in the log, and the
+    /// rotation still runs (the failure table's row 13: a running daemon with a
+    /// stale schedule beats no rotator at all).
+    ///
+    /// The two locks are taken one at a time: the config write is released
+    /// before the state lock is taken, so this cannot deadlock against a reader
+    /// that holds the state lock and asks for the config.
+    fn reconfigure(&self) {
+        let path = self.effective.config_path.as_path();
+        let parsed = std::fs::read_to_string(path)
+            .map_err(|error| format!("{}: {error}", path.display()))
+            .and_then(|text| {
+                Config::parse(&text).map_err(|error| error.with_path(path).to_string())
+            });
+        match parsed {
+            Ok(loaded) => {
+                for warning in &loaded.warnings {
+                    eprintln!("whirld: warning: {warning}");
+                }
+                *self
+                    .effective
+                    .config
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = loaded.config;
+                let mut state = self.state();
+                Self::announce(&mut state, &self.bus, Event::ConfigReloaded);
+                eprintln!("whirld: config reloaded from {}", path.display());
+            }
+            Err(message) => {
+                // The previous config stays in force; the failure is reported
+                // and nothing is adopted.
+                let mut state = self.state();
+                state.last_error = Some(ErrorCode::BadConfig);
+                eprintln!("whirld: config re-read failed, last_error: bad_config: {message}");
+            }
+        }
     }
 
     /// Spend the slot of a due rotation: the deadline advances by whole
@@ -808,7 +860,7 @@ impl Daemon {
     /// (8.8, `crate::lock::take_rotate_after_reaping`). Every other trigger
     /// passes `None`, and there is then no lock file this can take from a holder.
     fn sweep_with(&self, reaped: Option<u32>) {
-        let config = cache::CacheConfig::from(&self.effective.config.cache);
+        let config = cache::CacheConfig::from(&self.effective.config().cache);
         // Step 1: the rotation lock, non-blocking. Both roles hold it: the worker
         // for its run (7.3 step 2, `crates/whirl-worker/src/lock.rs`), so a second
         // rotation's worker exits `busy` rather than queueing, and this sweep for
@@ -950,7 +1002,7 @@ impl Daemon {
             // reads it from, so `resume` and a fresh start cannot disagree).
             // While paused `next_at` keeps its value, frozen: a suspended
             // schedule has no deadline to count down to.
-            let interval = self.effective.config.schedule.interval_seconds;
+            let interval = self.effective.config().schedule.interval_seconds;
             state.next_at = Some(crate::schedule::rearmed_from(unix_seconds(), interval));
         }
         Self::announce(
@@ -1040,7 +1092,7 @@ impl Daemon {
         if state.read_only[File::Current.index()] {
             return;
         }
-        let config: &Config = &self.effective.config;
+        let config: Config = self.effective.config();
         let file = CurrentFile {
             seq: state.seq,
             written_at: now(),
@@ -1417,6 +1469,7 @@ mod tests {
     use super::*;
     use crate::lock::{Attempt, Mode};
     use std::path::{Path, PathBuf};
+    use std::sync::RwLock;
     use whirl_core::config::{Backend, LocalMode, LocalSource, SourceConfig, SourceKind};
 
     /// 2.10's `next_in_s` row, one assertion per state it names, with `now`
@@ -1521,7 +1574,7 @@ mod tests {
             state_dir: state_dir.clone(),
             cache_dir: dir.join("cache"),
             backend: Backend::Noop,
-            config,
+            config: RwLock::new(config),
         };
         let worker = crate::worker::Worker::new(
             PathBuf::from("whirl-worker"),
@@ -1834,7 +1887,13 @@ mod tests {
         // machine: a stall that long must not be read as a passing test either.
         let mut worker: Option<u32> = None;
         for (attempt, deadline) in DEADLINES.iter().enumerate() {
-            daemon.effective.config.schedule.worker_deadline_seconds = *deadline;
+            daemon
+                .effective
+                .config
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .schedule
+                .worker_deadline_seconds = *deadline;
             let outcome = daemon.rotation(attempt as u64 + 1, Via::Source, Verb::Rotate, None);
 
             assert!(

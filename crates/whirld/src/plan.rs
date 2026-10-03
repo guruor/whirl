@@ -9,6 +9,7 @@
 //! "must never" 6).
 
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use whirl_core::config::{Backend, Config, paths};
 use whirl_core::protocol::SourceRecord;
 
@@ -54,10 +55,24 @@ pub struct Effective {
     pub state_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub backend: Backend,
-    pub config: Config,
+    /// The config this daemon is running under, behind a lock because a re-read
+    /// replaces it while the accept loop and the scheduler read it
+    /// (docs/architecture.md 4.2, 10.5). The resolved paths are not re-resolved:
+    /// a reload adopts the document's scalars, not a new socket or cache root.
+    pub config: RwLock<Config>,
 }
 
 impl Effective {
+    /// The config as it stands now. A clone rather than a guard, so no caller
+    /// holds a borrow of the config while it takes another lock, and a re-read
+    /// can replace the value without deadlocking against a reader.
+    pub fn config(&self) -> Config {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Resolve every path, read the config, and create the directories this
     /// daemon owns. A refusal here is a refusal to start (docs/architecture.md
     /// 1.5 steps 2 and 3): the message names the path and the `errno`.
@@ -109,14 +124,14 @@ impl Effective {
             state_dir,
             cache_dir,
             backend,
-            config,
+            config: RwLock::new(config),
         })
     }
 
     /// The `source:` records `status`, `sources` and `config check` report, in
     /// config order (docs/architecture.md 2.10).
     pub fn source_records(&self) -> Vec<SourceRecord> {
-        self.config
+        self.config()
             .sources
             .iter()
             .map(|source| source.record(None))
@@ -126,7 +141,7 @@ impl Effective {
     /// Enabled sources out of all configured: the number, not the ratio
     /// (docs/architecture.md 2.10).
     pub fn sources_enabled(&self) -> usize {
-        self.config
+        self.config()
             .sources
             .iter()
             .filter(|source| source.weight > 0)
