@@ -39,10 +39,24 @@ regex = '''\bt_[0-9a-f]{8}\b'''
 description = "One commit, named by its sha, in this rule alone: a base-branch merge whose subject is the project's own branch name, minted before the branch naming stopped carrying a work-item marker. The marker is in published history and cannot be rewritten, so the promotion whose range runs through that commit would be red forever on a message no rule here can change. The exemption is the commit and not the text: the same marker in any other commit's message, and in any file, is still reported, and the step that proves the rules can fire plants both directions."
 paths = ["f8c3df54c0f2c579a096e132530dc489941656c0"]
 
+# The character in front of the path is load-bearing, and not an accident of how a
+# transcript was written: gitleaks' own default allowlist, merged in by `useDefault`
+# above, exempts a finding whose secret is a bare home path. Its two home entries are
+# `^/Users/(?i)[a-z0-9]+/[\w .-/]+$` and `^/(?:bin|etc|home|opt|tmp|usr|var)/[\w .-]+$`,
+# and the scanner matches those against the finding's secret rather than against its
+# line. A match that begins with the path is therefore swallowed: measured on gitleaks
+# 8.30.1, `/Users/` fired only when the name segment carried a character outside
+# `[a-z0-9]` (so a plain name did not), and `/home/` could never fire at all. Consuming
+# the character in front of the path (the space of a pasted line, a quote, an opening
+# bracket) puts that character in the match, so the secret is no longer a bare home
+# path and the finding survives. Do not add a capture group: gitleaks would then take
+# the group as the secret, the bare path would be suppressed again, and both absolute
+# forms would go back to missing. A path that begins a line with nothing in front of it
+# is still swallowed by the scanner's own entry, which is the scanner's to change.
 [[rules]]
 id = "private-home-directory-path"
 description = "A path under somebody's home directory, one level into a dot-directory this project does not send a reader to. It names a directory that exists on one machine, the one that ran the work, so an example config or a pasted transcript that carries it carries that machine's layout. A platform location this project cites on purpose belongs in this rule's allowlist below, with a reason."
-regex = '''(?:~|\$HOME|\$\{HOME\}|\{home\}|/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+)/\.[A-Za-z0-9][A-Za-z0-9._-]*/'''
+regex = '''(?:^|[^A-Za-z0-9._/-])(?:~|\$HOME|\$\{HOME\}|\{home\}|/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+)/\.[A-Za-z0-9][A-Za-z0-9._-]*/'''
 
 [[rules.allowlists]]
 description = "The home dot-directories this project's own documentation sends a reader to, where a hit is the documentation rather than a leak: the XDG config, state and cache roots, the Rust toolchain's directory, and this project's own directory. Any other first component under a home directory is a private location, which is what the rule is for."
