@@ -318,19 +318,37 @@ fn the_usage_tells_the_two_version_answers_apart() {
         .find(|line| line.trim_start().starts_with("version "))
         .unwrap_or_else(|| panic!("no version line in {text}"));
     assert!(flag.contains("this binary's own version"), "{flag}");
-    assert!(verb.contains("asked of the daemon"), "{verb}");
+    assert!(verb.contains("then the daemon's"), "{verb}");
     assert_ne!(flag, verb);
 }
 
-/// `version` is the other answer: it asks the daemon and reports the daemon's
-/// own words, with no daemon the socket it could not reach, exactly as before.
+/// The client's own two lines of `whirl version`, built from this crate rather
+/// than written out, so a version bump cannot make the suite stale. Every case
+/// below compares against this one string, which is what proves the client's half
+/// does not depend on the daemon: no daemon, a stale socket and a reachable
+/// daemon all carry the same two lines.
+fn client_version_lines() -> String {
+    format!(
+        "client_version: whirl {}\nclient_protocol: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        whirl_core::protocol::PROTOCOL_VERSION
+    )
+}
+
+/// With no daemon at all, `whirl version` still answers about the client: its two
+/// lines on stdout, the unreachable reason on stderr, and exit 2. This is the
+/// case the command exists for, a user checking whether the pieces match.
 #[test]
-fn the_version_verb_still_asks_the_daemon() {
+fn the_version_verb_answers_about_the_client_with_no_daemon() {
     let dir = scratch("version-verb");
     let socket = dir.join("absent.sock");
     let output = run(&dir, &["version"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert_eq!(stdout(&output), "", "no daemon, no data lines");
+    assert_eq!(
+        stdout(&output),
+        client_version_lines(),
+        "the client's half is printed with no daemon"
+    );
     let errors = stderr(&output);
     assert!(
         errors.starts_with(&format!(
@@ -341,4 +359,42 @@ fn the_version_verb_still_asks_the_daemon() {
     );
     // Nothing was created on the way (2.5.1): the verb reports, it does not write.
     assert!(!socket.exists(), "the CLI must not touch the socket path");
+}
+
+/// A socket path that exists but is not a socket: the same shape as the
+/// no-daemon case, with the daemon's own reason and the stale-socket note the
+/// unreachable row adds when the path exists.
+#[test]
+fn the_version_verb_names_a_stale_socket_and_still_answers_about_the_client() {
+    let dir = scratch("version-stale");
+    let socket = dir.join("absent.sock");
+    std::fs::write(&socket, b"not a socket").expect("a decoy file at the socket path");
+    let output = run(&dir, &["version"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(stdout(&output), client_version_lines());
+    let errors = stderr(&output);
+    assert!(
+        errors.starts_with(&format!(
+            "whirl: cannot reach the daemon at {} (stale socket; the daemon is not running): ",
+            socket.display()
+        )),
+        "{errors}"
+    );
+    assert!(
+        socket.exists(),
+        "the client leaves a stale socket where it found it"
+    );
+}
+
+/// The exit code the no-daemon case uses is the one the usage text documents, so
+/// a script can tell "the client answered but the daemon did not" from a usage
+/// error while still reading the client's half.
+#[test]
+fn the_usage_documents_the_unreachable_exit_code() {
+    let dir = scratch("version-exit-code");
+    let text = stdout(&run(&dir, &["help"]));
+    assert!(
+        text.contains("2 the daemon is unreachable"),
+        "the usage text names exit 2 as the unreachable case: {text}"
+    );
 }
