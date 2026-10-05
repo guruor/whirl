@@ -177,9 +177,18 @@ do not claim to have re-run it.
 
 **Daemon.** Started at login by the supervisor and kept alive by it (macOS `KeepAlive`, Windows
 `RestartOnFailure`, Linux `Restart=always`; section 5). It never starts itself, and no client can
-start it: `whirl` reports an unreachable daemon and exits 2 `[M 13]` rather than spawning one, and
-`daemon start|stop|restart` stays out of the verb set for the reason `[D 5 §1.1]` gives, that a
-second supervisor competes with the first.
+start it: `whirl` reports an unreachable daemon and exits 2 `[M 13]` rather than spawning one.
+
+The verb set carries `whirl daemon install|uninstall|start|stop|status`, and none of the five can
+produce a second daemon. Four are steps in front of the OS supervisor and the fifth asks it a
+question: `install` writes the unit section 5 specifies and hands it to the supervisor, `uninstall`
+boots the job out and removes the unit, `start` and `stop` ask the supervisor to run or unload the
+job it already owns, and `status` reports the supervisor's own answer. `[D 5 §1.1]`'s reason for
+keeping `daemon start|stop|restart` out of the verb set is that a second supervisor competes with
+the first, and a command that asks the first one to run the job it owns is not a second one: what is
+forbidden is spawning a `whirld`, and none of the five does. Which platform has an implementation,
+and which two are still to come, is 5.2 to 5.4; a platform with none refuses in one sentence rather
+than growing half a unit.
 
 **Startup order inside the daemon** (order matters, and it is the sequence
 `[D 6 §5.5]`, `[D 6 §7.2]` and `[D 6 §8.5]` add up to):
@@ -584,6 +593,12 @@ sends it (`whirl version` maps to `version` alone, above); `close` is a clean sh
 connection, and `whirl idle` issues it itself; `subscribe` is the frontend surface, reached through
 `whirl idle`. No protocol verb exists only for the CLI, and no CLI verb needs a protocol verb of its
 own.
+
+One command is deliberately not in the table above: `whirl daemon install|uninstall|start|stop|status`
+speaks to the platform's supervisor rather than to the daemon, so there is no protocol verb behind it
+and none is added (8). It keeps the exit codes above unchanged: 0 the step was done, 1 whirl refused,
+2 there is no supervised daemon to reach or the supervisor could not be asked, 3 the command line
+was wrong.
 
 `decision:` `whirl idle` is `subscribe` plus one event, not a server-side one-shot verb.
 `[D 5 §1.1]`'s verb table wants "Block until state changes. For frontends, so none of them polls."
@@ -1574,6 +1589,20 @@ Why this and not launchd's own timer, in one line each: `StartInterval` loses th
 lid was shut, which is the common case on the machine this is for; `StartCalendarInterval` catches
 up and coalesces but cannot express "every N minutes" for an arbitrary N `[D 4 §Part 3 macOS]`.
 
+**Who writes the unit.** whirl does, and no release archive carries it: a plist is one machine's own
+absolute paths, so it cannot travel in a tarball. `whirl daemon install` builds it from the home
+directory the config module resolves and the `whirld` installed beside the running `whirl`, writes
+it to `~/Library/LaunchAgents/com.guruor.whirl.plist` with mode 0644, and registers the job with
+`launchctl bootstrap gui/$UID <plist>`. `uninstall` boots the job out and removes the unit and touches
+nothing else at all; `stop` only boots it out, which is the stop that survives a reboot. Two
+directories are created first if they are not there, `~/Library/LaunchAgents` (0755) and
+`~/Library/Logs/whirl` (0700), because launchd creates the two log files but not the directory
+holding them; an existing directory keeps the mode its owner chose. Nothing goes through `sudo`: the
+unit is the user's own, in the user's own session. A `bootout` that did not take is a refusal rather
+than a report, so a removal is never claimed while the daemon is still supervised, and a job
+`launchctl` reports as loaded from a unit outside this home directory is refused rather than stopped
+or replaced.
+
 ### 5.3 Windows
 
 One per-user task, created at logon, marked interactive-only, with
@@ -1786,6 +1815,20 @@ source, and so that the daemon can be changed without breaking them.
 7. **Exact strings for the CLI's own contract:** exit 0 success, 1 the daemon refused, 2 the daemon
    is unreachable, 3 usage error. A frontend that shells out to `whirl` can branch on those, and on
    the `ERR` code in the message.
+8. **Ask the OS supervisor for the daemon's lifecycle, through `whirl daemon …`** (1.5, 5.2). Five
+   steps are yours to make: `install` writes the unit and hands it to the supervisor, `uninstall`
+   boots it out and removes it, `start` and `stop` ask the supervisor to run or unload the job it
+   owns, and `status` reports the supervisor's own answer, on the exit codes above. This is not a
+   frontend owning a daemon, which is what the "must never" list forbids: the supervisor stays the
+   only thing that can have one, and none of the five spawns a `whirld`. Which platform has an
+   implementation is 5.2 to 5.4, and a platform with none refuses and names itself rather than
+   growing half a unit.
+9. **Keep your own user preferences in the platform's preference store.** Your "don't ask again"
+   answer, a window position, the last tab someone looked at: they are the app's own and they belong
+   where the platform keeps such things (`UserDefaults`, the registry, `GSettings`), not in the
+   daemon's state directory. The state-file rule below protects the daemon's files, and this is not
+   an exception to it: a preference of the app's own is a file the daemon never reads and never
+   writes. What each app keeps there is that app's business, and no format is promised.
 
 **Must never:**
 
@@ -1795,9 +1838,10 @@ source, and so that the daemon can be changed without breaking them.
 2. **Call a platform setter directly.** Not `gsettings`, not `swaymsg`, not `hyprctl`, not
    `osascript`, not COM. Two writers to the same wallpaper fight, and the daemon's anchor stops
    matching what is on screen.
-3. **Start, stop or restart the daemon.** The OS supervisor owns its lifetime (5.1); a frontend that
-   starts one gets a second daemon, or a stale socket, and `daemon.lock` means the second one exits
-   anyway `[D 6 §7.2]`.
+3. **Spawn a daemon of its own.** The OS supervisor owns its lifetime (5.1); a frontend that starts
+   one gets a second daemon, or a stale socket, and `daemon.lock` means the second one exits anyway
+   `[D 6 §7.2]`. Asking the supervisor to run the job it already owns is the opposite of this, and is
+   allowed, through `whirl daemon …` (above).
 4. **Spawn its own worker or implement a source.** Sources are the worker's `[D 5 §2.0]`; a second
    implementation drifts.
 5. **Unlink the socket.**

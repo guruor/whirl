@@ -66,9 +66,12 @@ not produce both went to Part 3 instead.
 - `tag`, `blacklist`, `curate`: curation is a non-goal (Part 3). Editing a tag
   list in a text file already works.
 - `schedule set`, `interval set`: writing the config file is the interface.
-- `daemon start|stop|restart`: lifecycle belongs to launchd, Task Scheduler or a
-  systemd user unit. A second supervisor inside the product competes with the
-  first one, and that is how a daemon ends up autostarted twice.
+- `daemon start|stop|restart` as *runtime* verbs: lifecycle belongs to launchd, Task Scheduler or a
+  systemd user unit. A second supervisor inside the product competes with the first one, and that is
+  how a daemon ends up autostarted twice. What whirl does own is the installation step that puts a
+  unit in front of that one supervisor and takes it back out, and asks it to run or unload the job it
+  owns (`whirl daemon install|uninstall|start|stop|status`, docs/architecture.md 1.5 and 5.2): a step
+  in front of the supervisor is not a second one.
 - `stats`, `export`, `import`: nothing consumes them yet.
 - `blur`, `effects`, `crop`: image editing, non-goal.
 - `whirl next --source x`: forcing a source is a debugging move; `whirl sources`

@@ -94,6 +94,9 @@ Ctrl-C in the daemon's terminal. Nothing else is left running.
   exported (a leftover from a test) every stage still runs except the platform setter: `whirl next`
   prints its `set:` line, the history records it, and your wallpaper never changes. `whirl config
   check` prints `backend=` in its plan line; unset it and restart the daemon.
-- Not implemented yet: the launchd agent that would start `whirld` at login and restart it. Today
-  whirl rotates only while the daemon runs (`whirl next`, or every 30 minutes on its own,
-  `schedule.interval_seconds`), and a reboot stops it until you start it again.
+- Starting at login. `whirl daemon install` writes `~/Library/LaunchAgents/com.guruor.whirl.plist`
+  and hands it to launchd, so the daemon starts at login and launchd restarts it if it dies: `whirl
+  daemon status` reports what launchd says in one line, `whirl daemon stop` stops it, and `whirl
+  daemon uninstall` removes the unit. Without that unit whirl rotates only while the daemon runs
+  (`whirl next`, or every 30 minutes on its own, `schedule.interval_seconds`), and a reboot stops it
+  until you start it again.
