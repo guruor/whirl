@@ -1603,6 +1603,12 @@ than a report, so a removal is never claimed while the daemon is still supervise
 `launchctl` reports as loaded from a unit outside this home directory is refused rather than stopped
 or replaced.
 
+**The steps, and who runs them.** whirl ships the unit above and the documented
+`whirl daemon install|uninstall|start|stop|status` steps that put it in front of launchd and take it
+back out, and a frontend reaches them by running whirl rather than by writing the unit or speaking to
+`launchctl` itself (1.5, section 8). `off` is the supervisor's own stop for the job it owns,
+`launchctl bootout` of `gui/$UID/com.guruor.whirl`, which is what `whirl daemon stop` performs.
+
 ### 5.3 Windows
 
 One per-user task, created at logon, marked interactive-only, with
@@ -1624,6 +1630,13 @@ Three keys are deliberately left at their defaults because the default is the ri
 There is no time trigger on the task, on purpose: the OS scheduler's job is that the process
 exists, not that the rotation happened.
 
+**The task, and who runs it.** whirl ships this task and the documented `whirl daemon …` steps that
+install, uninstall, start and stop it, and a frontend reaches them by running whirl rather than by
+writing the task itself. This build implements the steps on macOS only (5.2): a platform without one
+refuses and names itself rather than growing half a unit (1.5). When they land here, `off` is the
+Task Scheduler's own persistent stop, `schtasks /Change /Disable`, and it lives in whirl's step, not
+in a frontend.
+
 ### 5.4 Linux
 
 A `systemd --user` unit `whirl.service` with `Restart=always` and `RestartSec=5`, installed with
@@ -1632,6 +1645,13 @@ A `systemd --user` unit `whirl.service` with `Restart=always` and `RestartSec=5`
 required and is not recommended in v0.1: a rotation with no session has nothing to set, and the
 only thing that would benefit is housekeeping `[D 4 §Part 2]`. If housekeeping off-session is ever
 wanted, it is a second unit rather than a linger flag on this one.
+
+**The unit, and who runs it.** whirl ships this unit and the documented `whirl daemon …` steps that
+install, uninstall, start and stop it, and a frontend reaches them by running whirl rather than by
+writing the unit file itself. This build implements the steps on macOS only (5.2): a platform without
+one refuses and names itself rather than growing half a unit (1.5). When they land here, `off` is
+systemd's own persistent stop, `systemctl --user disable --now`, and it lives in whirl's step, not in
+a frontend.
 
 ### 5.5 The daemon's clock
 
@@ -1829,6 +1849,10 @@ source, and so that the daemon can be changed without breaking them.
    daemon's state directory. The state-file rule below protects the daemon's files, and this is not
    an exception to it: a preference of the app's own is a file the daemon never reads and never
    writes. What each app keeps there is that app's business, and no format is promised.
+10. **The one start-at-login control.** The frontend's own login item is the frontend's own business,
+    reached through its own platform's mechanism, and nothing here speaks to it. The daemon's unit is
+    the product's, reached by running whirl's documented install, uninstall, start and stop steps
+    (`whirl daemon …`, above), and the window says which half of the switch is on.
 
 **Must never:**
 
@@ -1838,10 +1862,13 @@ source, and so that the daemon can be changed without breaking them.
 2. **Call a platform setter directly.** Not `gsettings`, not `swaymsg`, not `hyprctl`, not
    `osascript`, not COM. Two writers to the same wallpaper fight, and the daemon's anchor stops
    matching what is on screen.
-3. **Spawn a daemon of its own.** The OS supervisor owns its lifetime (5.1); a frontend that starts
-   one gets a second daemon, or a stale socket, and `daemon.lock` means the second one exits anyway
-   `[D 6 §7.2]`. Asking the supervisor to run the job it already owns is the opposite of this, and is
-   allowed, through `whirl daemon …` (above).
+3. **Start, stop or restart the daemon, or spawn one of its own.** The OS supervisor owns its
+   lifetime (5.1); a frontend that starts one gets a second daemon, or a stale socket, and
+   `daemon.lock` means the second one exits anyway `[D 6 §7.2]`. What the rule protects is that a
+   frontend is never the supervisor: it never writes a unit's content, never spawns `whirld`, and
+   never calls `launchctl`, `systemctl`, `schtasks` or an equivalent itself. Running whirl's
+   documented step, or asking the already-installed supervisor for the job it owns, is not that, and
+   is allowed through `whirl daemon …` (above).
 4. **Spawn its own worker or implement a source.** Sources are the worker's `[D 5 §2.0]`; a second
    implementation drifts.
 5. **Unlink the socket.**
