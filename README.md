@@ -1,35 +1,140 @@
+<img src="docs/assets/whirl-icon.png" height="96" alt="Whirl">
+
 # whirl
 
-A cross-platform wallpaper manager built as a small daemon with an `mpd`-style
-line protocol, a config file instead of a settings UI, and thin clients that can
-be added later without touching the core.
+Your wallpaper changes on a schedule, from the sources you choose, and the thing
+doing it stays small.
 
-**Status: design phase.** Nothing is released. [docs/](docs/) holds the research,
-the specs, the architecture and the development guide; [prototype/](prototype/)
-holds a throwaway spike that establishes the two numbers the design rests on. The
-Cargo workspace under `crates/` is the next thing to land.
+[![build](https://github.com/guruor/whirl/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/guruor/whirl/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/guruor/whirl)](https://github.com/guruor/whirl/releases)
+[![licence](https://img.shields.io/github/license/guruor/whirl)](LICENSE)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue)
 
-## Running it
+![whirl status, the daemon's whole state](docs/assets/whirl-status.svg)
 
-[docs/quickstart.md](docs/quickstart.md): build it, point it at a folder of your
-own pictures, force a rotation. One page, hands-on, macOS.
+```text
+daemon_version: whirl 0.1.0
+protocol: 2
+platform: macos
+pid: 69202
+seq: 4
+uptime_s: 6
+rss_kb: 2064
+paused: 0
+rotating: 0
+rotation_count: 1
+interval_s: 1800
+next_at: 2026-10-05T02:25:22Z
+next_in_s: 1794
+last_digest: 835bad9b705873a1052863b98cdcf066a30202a141fcda1258bb6db2e0ca7575
+last_origin_key: pictures:11d1c525c9313c84ed7f316e7947f52b85b9a9bdc792878162c62294a25dfc7f
+last_via: source
+last_at: 2026-10-05T01:55:27Z
+last_error: -
+history_entries: 50
+history_count: 1
+favorites_count: 0
+display_mode: all
+display_mode_effective: all
+display_mode_reason: -
+anchor_digest: 835bad9b705873a1052863b98cdcf066a30202a141fcda1258bb6db2e0ca7575
+anchor_path: -
+anchor_verified: 1
+cache_dir: /tmp/whirl-demo/run/cache
+cache_root_id: 6cd1e871-81e7-46c3-9343-5c919f1c70ee
+cache_files: 0
+cache_bytes: 0
+cache_files_cap: 500
+cache_bytes_cap: 2147483648
+cache_over_cap: 0
+cache_over_reason: -
+cache_writable: 1
+sweep_deferred: 0
+lock_mode: flock
+state_dir: /tmp/whirl-demo/run/state
+state_corrupt: -
+state_quarantined: -
+state_schema_newer: 0
+history_lost: 0
+favorites_degraded: 0
+clock_jump: 0
+respect_manual_effective: 0
+sources: 1
+source: pictures local weight=1 enabled=1 last=- reason=-
+```
 
-## Why another wallpaper app
+## What it is
 
-They start small and drift. A measured example on macOS (Spice, a Go/Fyne
-wallpaper manager, 2026): **883 MB resident and still climbing**, ~1% CPU
-continuously, 354 MB of unbounded image cache, and a resident face-detection
-model it may never use. The cause is architectural, not a leak: one immortal
-process owns the UI toolkit, an in-RAM index of every image it knows about, the
-scheduler, and the image pipeline, so every feature it ever gained became a
-permanent memory floor. A single 4672x7008 wallpaper (125 MB decoded) raised the
-floor by 128 MB for the rest of the process's life, and nothing gave it back.
+whirl manages a machine's desktop wallpaper: it picks an image from the sources
+you configure, materialises it, and hands it to the platform. The decision the
+design turns on is that **the resident process owns state and never owns pixels**.
+`whirld` holds the config, the schedule, the history and the candidate list, and
+spawns one short-lived `whirl-worker` for each operation that touches image bytes.
+A frontend is optional: `whirl` is one client of the socket protocol, and the tray
+app, a TUI or a shell script that speaks it is another.
+
+That split is the measured argument for the design. On a machine where a
+comparable wallpaper app settled at 883 MB resident, the same daemon with the
+image work delegated stays flat at 1.8-2.3 MB across seven rotations, while the
+in-process version ratchets to 140 MB and never returns
+([prototype/README.md](prototype/README.md), the table and how it was measured).
+
+## Quick start
+
+macOS on Apple silicon. One command installs the daemon and the tray app; the
+installer downloads both release archives, checks each against the sha256
+published beside it, and installs only after both checks pass:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/guruor/whirl-ui/v0.1.0/install.sh | sh
+```
+
+The daemon reads one JSON config and needs a `sources` entry naming a folder of
+your pictures; it writes an annotated default config the first time it starts.
+Then, with `whirld` running:
+
+```sh
+whirl status     # everything the daemon knows, as key: value lines
+whirl next       # pick an image now and set it
+```
+
+[docs/quickstart.md](docs/quickstart.md) is the one-page walk-through, including
+building the three binaries from source instead.
+
+## What it does
+
+- **Sources are config entries, not plugins.** `local` walks a folder of your own
+  pictures and sets the file itself; `wallhaven` searches the site's API or one
+  collection. `whirl sources` lists what loaded, with its weight and last outcome.
+- **A schedule you configure, and a pause.** `schedule.interval_seconds` (1800 by
+  default) with `startup.*` for what to do at start; `whirl pause` and `whirl
+  resume` re-arm it without touching the current picture. The daemon's own timer is
+  the schedule: v0.1.0 ships no login item, so whirl rotates while `whirld` runs.
+- **A rotation is a pipeline, and it is bounded.** A candidate goes through
+  resolution, aspect ratio, size and content-type filters, two dedupe passes and
+  the cache under a content digest; history is a ring of the last 50 rotations and
+  favorites are pinned against eviction.
+- **The control surface is a unix socket, mode 0600, in a directory the daemon
+  creates 0700.** `whirl status` prints the daemon's whole state; `subscribe`
+  streams one line per state change and `whirl idle` follows them. The protocol is
+  the API, so anything that speaks it is a valid client and no frontend owns state.
+- **macOS sets the picture; the other two platforms are not done.** The worker
+  calls `NSWorkspace setDesktopImageURL:forScreen:options:error:` once per screen.
+  The Linux and Windows setters ship as stubs that refuse with a named error and
+  are labelled unverified on real hardware, so there the pipeline, the cache, the
+  state and the CLI run and `WHIRL_BACKEND=noop` exercises everything but the
+  setter.
+- **A config file only.** One JSON file, no settings window, no tray required to
+  operate. The config, socket, state and cache paths, and the backend, are
+  environment variables too, which is what makes a rotation testable without
+  touching a real desktop.
 
 ## The design rule
 
 > The resident process owns state. It never owns pixels.
 
-Consequences, all measured in the spike rather than assumed:
+The measurements below are from the throwaway spike under
+[`prototype/`](prototype/README.md), not from the released binaries:
 
 | piece | resident | binary |
 |---|---|---|
@@ -41,39 +146,24 @@ Consequences, all measured in the spike rather than assumed:
 That last row is the whole argument: the identical workload, delegated instead of
 owned, is flat forever.
 
-## Intended v0.1 scope
-
-- **Sources:** local directory and Wallhaven. Sources are data (a config entry),
-  not plugins, so adding one costs no resident memory.
-- **Config file only.** No settings window, no tray required to operate.
-- **Scheduling:** whatever the OS already does well (launchd, Task Scheduler,
-  systemd timer) or the daemon's own timer, decided per platform by the research
-  in `docs/research/`.
-- **Control:** one CLI over a unix socket (`0600`), named pipe on Windows. The
-  protocol is the API; anything that speaks it is a valid frontend.
-- **Frontends are optional and thin:** a TUI, a menu bar item, a Raycast
-  extension, a shell script. None of them own state.
-
-## Repo layout
-
-```
-crates/        the workspace: whirl-core, whirld, whirl-worker, whirl-cli (next thing to land)
-docs/          research, specs, architecture, the development guide
-prototype/     the throwaway spike: reference only, not shipped
-```
-
-## Working on it
-
-Start with [CONTRIBUTING.md](CONTRIBUTING.md) for a first pull request, and
-[docs/development.md](docs/development.md) for the repo layout, the toolchain and
-dependency policy, the test matrix, the release process, and how to run a rotation
-without changing your own wallpaper.
-
 ## Non-goals
 
-- Being a wallpaper *browser* or a gallery application.
-- Bundling a GUI toolkit into the daemon.
-- Chasing platforms or sources nobody asked for.
+- A wallpaper browser or gallery.
+- A GUI toolkit inside the daemon.
+- Platforms or sources nobody asked for.
+
+## Docs
+
+[docs/architecture.md](docs/architecture.md) is the process model, the protocol and
+the frontend contract; [docs/milestones.md](docs/milestones.md) records what shipped
+and what is left. [docs/releases/v0.1.0.md](docs/releases/v0.1.0.md) is the release
+note, including what is unverified and why.
+
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) is the short version; [docs/development.md](docs/development.md)
+is the long one: repo layout, toolchain and dependency policy, the test matrix, the
+release process. The gate is `./scripts/ci.sh all`.
 
 ## Licence
 
