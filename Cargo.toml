@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # The MSRV is edition 2024's floor, not a guess; the CI `msrv` job builds and tests
 # with exactly this toolchain. Raising it is a minor release with four steps
