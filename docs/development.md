@@ -527,11 +527,11 @@ after the commit the project's own rules landed at, which is what a promotion
 needs, because its base `main` sits behind every one of them; section 6
 (`Secrets`) owns that boundary and the tree scan beside it. It installs the
 release binary with the version and the sha256 both pinned in the workflow, and
-it fails when either scan reads nothing, because a scan that checked nothing
-and a scan that found nothing print the same `no leaks found`. The scanner's
-own rules stay on; `.gitleaks.toml` adds rules of this project's own as well as
-exemptions, and each exemption carries a reason that the job prints on every
-run.
+it fails when either scan reads nothing while there was something to read, because
+a scan that checked nothing and a scan that found nothing print the same
+`no leaks found`. The scanner's own rules stay on; `.gitleaks.toml` adds rules of
+this project's own as well as exemptions, and each exemption carries a reason that
+the job prints on every run.
 
 The rule that keeps it honest: **every command a contributor is expected to run
 before opening a pull request is a mode of `scripts/ci.sh` (section 3), and each
@@ -1047,16 +1047,25 @@ No test in the repository may need a real credential: the Wallhaven tests run
 against fixtures, or are marked as requiring a key and skipped when it is absent.
 
 Run the scanner before you push. It is the same tool, the same config file and the
-same range the `secrets` job scans: the commits your branch adds to `development`
-(which is the branch a working branch is cut from), and the tree the checkout
-publishes.
+same two passes the `secrets` job runs: the commits your branch adds to
+`development` (which is the branch a working branch is cut from), read with
+`--diff-merges=first-parent` so that what a merge introduces relative to its first
+parent is read and not skipped, and the tree the checkout publishes.
 
 ```sh
 git fetch origin development
 gitleaks git --config .gitleaks.toml --redact \
-  --log-opts="$(git merge-base origin/development HEAD)..HEAD"
+  --log-opts="--diff-merges=first-parent $(git merge-base origin/development HEAD)..HEAD"
 gitleaks dir --config .gitleaks.toml --redact .
 ```
+
+`git log -p` prints no patch for a merge unless it is asked for one, so without that
+flag a merge is the one commit whose own changes no pass reads: on this repository
+the v0.1.0 promotion merge `397a99c` carries 1,847,765 bytes of first-parent changes
+that a scan of the range reads as zero bytes, which is the whole promotion. A merge
+that introduces nothing relative to its first parent reads as nothing and passes,
+and the job's guard counts the commits in the range rather than the patches the
+scanner read, so a range of such merges is green on its own merits.
 
 The range starts after the commit the project's own rules in `.gitleaks.toml`
 landed at, not at the base the event names. A promotion pull request has base
@@ -1069,18 +1078,19 @@ the `secrets` job prints the boundary and the range it resolved on every run,
 so the resolution can be read rather than trusted.
 
 `gitleaks` is not a build dependency; take it from the project's releases (CI pins
-8.30.1, and the job verifies the release digest) or from your package manager. If
-it prints `0 commits scanned` then it read nothing, its `no leaks found` means
-nothing, and the cause is your git config: `color.ui` or `color.diff` of `always`
-makes `git log -p` colourise a pipe, and gitleaks cannot read that. The CI job
-pins both off for this reason, and the same two overrides work locally:
+8.30.1, and the job verifies the release digest) or from your package manager. If it
+prints `0 commits scanned` over a range whose patches are there, then it read
+nothing, its `no leaks found` means nothing, and the cause is your git config:
+`color.ui` or `color.diff` of `always` makes `git log -p` colourise a pipe, and
+gitleaks cannot read that. The CI job pins both off for this reason, and the same
+two overrides work locally:
 
 ```sh
 git fetch origin development
 GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false \
 GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false \
 gitleaks git --config .gitleaks.toml --redact \
-  --log-opts="$(git merge-base origin/development HEAD)..HEAD"
+  --log-opts="--diff-merges=first-parent $(git merge-base origin/development HEAD)..HEAD"
 ```
 
 An exemption from the scanner's rules lives in `.gitleaks.toml`, needs a
