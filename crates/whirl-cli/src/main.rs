@@ -14,10 +14,14 @@
 //! ask anything, and which it takes in the same precedence the daemon used:
 //! `WHIRL_SOCKET`, then the config's `socket`, then the platform default.
 //!
-//! `--version` is the one answer that is not about the daemon at all: it reports
-//! the crate's own version, compiled in, and touches neither the socket nor the
-//! config, because it is asked of a binary before any daemon has been resolved.
-//! The `version` verb is the daemon's answer, and still needs one.
+//! `--version` and the `version` verb both start from the client's own facts,
+//! compiled in. `--version` prints the bare `whirl <version>` and nothing else.
+//! `version` prints the client's version and protocol first and then the daemon's
+//! answer when it arrives, so it still answers the question it exists for when
+//! the daemon is the thing under suspicion. A `version` answer whose daemon half
+//! is missing is the unreachable row above: the client's lines are on stdout and
+//! the reason is on stderr. Neither the flag nor those two lines touch the socket
+//! or the config; only the daemon's half is resolved from them.
 
 mod daemon;
 mod render;
@@ -49,7 +53,7 @@ usage: whirl <command>
   sources              configured sources
   status               daemon status
   --version            this binary's own version, no daemon needed
-  version              protocol and daemon versions, asked of the daemon
+  version              this binary's version and protocol, then the daemon's
   config path          the config file the daemon read
   config check         parse the config and report the effective values
   pause                stop rotating
@@ -61,7 +65,9 @@ usage: whirl <command>
   daemon start         ask the supervisor to start the daemon (macOS)
   daemon stop          ask the supervisor to stop the daemon (macOS)
   daemon status        what the supervisor says about the daemon (macOS)
-  help                 this text";
+  help                 this text
+
+exit: 0 the command completed, 1 the daemon refused, 2 the daemon is unreachable, 3 the command line was wrong";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -101,6 +107,12 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    // `version` answers about the client before it asks about the daemon, and
+    // this is the one place that ordering is guaranteed: `print_client_version`
+    // reads no socket and no config, so it runs before `talk` resolves either.
+    if matches!(request, Request::Version) {
+        print_client_version();
+    }
     match talk(&request) {
         Ok(exit) => exit,
         Err(TalkError::Unreachable { path, message }) => {
@@ -130,6 +142,20 @@ fn main() -> ExitCode {
             ExitCode::from(EXIT_REFUSED)
         }
     }
+}
+
+/// The client's own half of `whirl version`, built from the crate and not from
+/// the daemon: the binary's version and the protocol version it speaks. Both are
+/// compiled in, so they are the same bytes whether or not a daemon is reachable,
+/// and a user who runs `version` because the pieces might not match gets an
+/// answer about the piece they just ran either way.
+fn print_client_version() {
+    println!(
+        "client_version: {} {}",
+        protocol::PRODUCT,
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("client_protocol: {}", protocol::PROTOCOL_VERSION);
 }
 
 /// One command line, resolved. `help` is the one entry with nothing to send: it

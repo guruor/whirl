@@ -1193,7 +1193,11 @@ fn cli_binary() -> PathBuf {
 /// One `whirl` command against the running daemon, with the five variables of
 /// docs/development.md section 7 in its environment. Bounded: a client that waits
 /// for a line the daemon will never send must fail this test, not hang the suite.
-fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
+///
+/// The three streams are kept apart: stdout and stderr are the CLI's two halves
+/// of an answer (2.5.1), and a test that merges them cannot tell a data line the
+/// CLI printed from a reason it reported.
+fn whirl_streams(daemon: &Daemon, args: &[&str]) -> (bool, String, String) {
     let mut child = Command::new(cli_binary())
         .args(args)
         .env("WHIRL_CONFIG", daemon.dir.join("config.json"))
@@ -1239,7 +1243,131 @@ fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
     }
-    (status.success(), format!("{stdout}{stderr}"))
+    (status.success(), stdout, stderr)
+}
+
+/// The same command, with its two streams as one block: what a test wants when it
+/// asserts on the answer as a whole rather than on which half carried it.
+fn whirl(daemon: &Daemon, args: &[&str]) -> (bool, String) {
+    let (ok, stdout, stderr) = whirl_streams(daemon, args);
+    (ok, format!("{stdout}{stderr}"))
+}
+
+/// The client's own half of `whirl version`, built from the workspace's shared
+/// version and the crate's protocol constant rather than written out, so neither
+/// a version bump nor a protocol bump can make the suite stale.
+fn client_version_lines() -> String {
+    format!(
+        "client_version: whirl {}\nclient_protocol: {}\n",
+        env!("CARGO_PKG_VERSION"),
+        whirl_core::protocol::PROTOCOL_VERSION
+    )
+}
+
+/// One `whirl` invocation with a caller-chosen socket path and no daemon behind
+/// it: the two daemon-less cases of the `version` tests. `HOME` and `WHIRL_CONFIG`
+/// point inside `dir`, so nothing resolves the user's own files.
+fn whirl_at(dir: &Path, socket: &Path, args: &[&str]) -> (bool, String, String) {
+    let output = Command::new(cli_binary())
+        .args(args)
+        .env("WHIRL_SOCKET", socket)
+        .env("WHIRL_CONFIG", dir.join("absent.json"))
+        .env("HOME", dir)
+        .env_remove("WHIRL_STATE_DIR")
+        .env_remove("WHIRL_CACHE_DIR")
+        .env_remove("WHIRL_BACKEND")
+        .stdin(Stdio::null())
+        .output()
+        .expect("the CLI runs");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// `whirl version` against a live daemon: the client's two lines first, then the
+/// daemon's three in the order 2.10 gives them, one `key: value` per line, exit
+/// 0 and nothing on stderr. The daemon's half is still the daemon's own words.
+#[test]
+fn the_version_verb_reports_the_client_then_the_live_daemon() {
+    let daemon = start("the_version_verb_reports_the_client_then_the_live_daemon");
+    let (ok, stdout, stderr) = whirl_streams(&daemon, &["version"]);
+    assert!(ok, "{stdout}{stderr}");
+    assert_eq!(stderr, "", "a reachable daemon has no reason to report");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        5,
+        "two client lines then three daemon lines: {stdout:?}"
+    );
+    let client_version = format!("client_version: whirl {}", env!("CARGO_PKG_VERSION"));
+    let client_protocol = format!(
+        "client_protocol: {}",
+        whirl_core::protocol::PROTOCOL_VERSION
+    );
+    assert_eq!(lines[0], client_version.as_str());
+    assert_eq!(lines[1], client_protocol.as_str());
+    assert_eq!(
+        lines[2], DAEMON_VERSION_LINE,
+        "the daemon's own `daemon_version` (2.10)"
+    );
+    assert_eq!(lines[3], "protocol: 2");
+    assert!(
+        lines[4].starts_with("platform: ")
+            && ["macos", "linux", "windows"].contains(&&lines[4]["platform: ".len()..]),
+        "the daemon's platform line: {}",
+        lines[4]
+    );
+}
+
+/// The client's half of `whirl version` is the same bytes with a daemon, without
+/// one, and over a stale socket. That is what proves it does not depend on the
+/// daemon, the socket path or the platform: the daemon's half moves between the
+/// cases, the client's two lines do not, and the exit code says which happened.
+#[test]
+fn the_client_lines_of_version_are_the_same_in_all_three_cases() {
+    let daemon = start("the_client_lines_of_version_are_the_same_in_all_three_cases");
+    let (ok, reachable, _) = whirl_streams(&daemon, &["version"]);
+    assert!(ok, "{reachable}");
+
+    // No daemon: a path inside this test's tree that nothing created.
+    let absent_dir = tree("version-absent");
+    let absent = whirl_at(
+        &absent_dir,
+        &absent_dir.join("run").join("whirl.sock"),
+        &["version"],
+    );
+
+    // A stale socket: the path exists and is not a socket.
+    let stale_dir = tree("version-stale");
+    let stale_socket = stale_dir.join("run").join("whirl.sock");
+    std::fs::create_dir_all(stale_socket.parent().expect("a parent")).expect("the run directory");
+    std::fs::write(&stale_socket, b"not a socket").expect("a decoy file at the socket path");
+    let stale = whirl_at(&stale_dir, &stale_socket, &["version"]);
+
+    let client = client_version_lines();
+    assert!(
+        reachable.starts_with(&client),
+        "the client's two lines lead the answer with a daemon: {reachable:?}"
+    );
+    assert!(!absent.0, "no daemon is not success: {}", absent.2);
+    assert_eq!(absent.1, client, "the client's half with no daemon");
+    assert!(
+        absent.2.starts_with("whirl: cannot reach the daemon at "),
+        "the reason is on stderr: {}",
+        absent.2
+    );
+    let stale_reason = stale.2.as_str();
+    assert!(!stale.0, "a stale socket is not success: {stale_reason}");
+    assert_eq!(stale.1, client, "the client's half over a stale socket");
+    assert!(
+        stale_reason.contains("(stale socket; the daemon is not running)"),
+        "the stale path is named as stale: {stale_reason}"
+    );
+
+    let _ = std::fs::remove_dir_all(&absent_dir);
+    let _ = std::fs::remove_dir_all(&stale_dir);
 }
 
 /// The quickstart's own commands, run as `docs/development.md` section 7 spells
