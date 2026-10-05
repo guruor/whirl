@@ -1,6 +1,6 @@
 # 0002. Let a frontend write the config and own no part of the daemon
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-10-02
 - **Deciders:** Guru (project owner, `guruor`)
 - **Supersedes:** nothing
