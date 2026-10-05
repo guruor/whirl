@@ -709,7 +709,7 @@ is this document's procedure in executable form:
 | build | `cargo build --workspace --release` on `ubuntu-latest`, `macos-latest` and `windows-latest`: the command the `artifacts` job runs, and the same three binaries per platform |
 | package | one archive per platform, `whirl-<tag>-<os>-<arch>.<ext>`, and the run fails if the runner's architecture is not the one the archive name claims, because a mislabelled artifact is worse than a missing one |
 | notes | `docs/releases/<tag>.md` from the tagged commit. A `vX.Y.Z-rc.N` tag with no such file is rendered from `.github/release-notes-template.md`, placeholders and all, which is what the prerelease flag says out loud. A final release with no notes file is refused, and so is a file that is missing a required section or still holds a placeholder |
-| publish | `gh release create <tag>` with the three archives attached, and `--verify-tag` so a typo cannot create a tag quietly. A tag with a prerelease suffix (`v0.2.0-rc.1`) is published as a GitHub prerelease; `vX.Y.Z` is not |
+| publish | `gh release create <tag>` with the three archives attached, each with a `<archive>.sha256` beside it, and `--verify-tag` so a typo cannot create a tag quietly. Each checksum is written in the same run from the bytes that are attached, its first field is the archive's sha256, and the run stops before this step if a checksum cannot be produced or if the archives and the checksums do not match one for one, because the frontend's installer verifies every archive against the checksum published beside it. A tag with a prerelease suffix (`v0.2.0-rc.1`) is published as a GitHub prerelease; `vX.Y.Z` is not |
 
 Three consequences worth stating:
 

@@ -27,7 +27,9 @@ name: release
 # both run the matrix, docs/development.md section 5), and is not a check this
 # workflow makes. What this workflow does do is refuse to publish a release whose
 # notes are missing, unfilled or incomplete: see the "Assemble and check the
-# release notes" step.
+# release notes" step. It also writes a sha256 beside every archive it publishes
+# and refuses a partial set, because the frontend's installer verifies each
+# archive against the checksum published beside it: see the two checksum steps.
 #
 # Rules this file obeys, from docs/development.md:
 # - every action is pinned to a full commit SHA, never a tag or a branch, so an
@@ -337,7 +339,87 @@ jobs:
                 ;;
             esac
           done
-      - name: Create the release, with the notes and the three archives attached
+      # A sha256 beside every archive, written by this same run so the next tag
+      # cannot repeat v0.1.0, which published the three archives and none of the
+      # checksums and had each one attached by hand afterwards. The frontend's
+      # installer (`install.sh` in `guruor/whirl-ui`) fetches `<archive>.sha256`,
+      # takes the first field of that file as the archive's sha256 and refuses
+      # the install when the two do not match: an archive published without its
+      # checksum is an archive no one can install.
+      #
+      # Two steps, both after the archives exist and before the release does, and
+      # both fail closed. The first writes a checksum per archive and stops if it
+      # cannot produce one; the second stops unless every archive has exactly one
+      # checksum, every checksum has an archive, and every checksum matches the
+      # bytes beside it. A release that exists with a partial set is the outcome
+      # neither step allows, which is why what is attached is checked rather than
+      # assumed.
+      - name: Write a sha256 beside every archive, and stop if one cannot be produced
+        run: |
+          set -eu
+          # sha256sum on the Linux runner, shasum (the frontend installer's own
+          # tool) everywhere else. Both print `<sha256>  <name>`, so resolving the
+          # tool once keeps the file format from drifting between machines.
+          if command -v sha256sum > /dev/null 2>&1; then
+            sum() { sha256sum "$1" | awk '{ print $1 }'; }
+          else
+            sum() { shasum -a 256 "$1" | awk '{ print $1 }'; }
+          fi
+          # Everything in dist that is not already a checksum is an archive. The
+          # exclusion is what makes a second run over the same directory rewrite
+          # the same three files instead of checksumming the checksums.
+          for archive in $(find dist -type f ! -name '*.sha256' | sort); do
+            sha=$(sum "$archive")
+            if [ -z "$sha" ]; then
+              echo "::error::cannot compute a sha256 for $archive; the release would publish an archive with no checksum beside it, so nothing is published."
+              exit 1
+            fi
+            # `<sha256>  <name>`, the first field being the archive's sha256:
+            # exactly what the installer's verify() reads, `awk 'NR==1 { print $1 }'`.
+            printf '%s  %s\n' "$sha" "$(basename "$archive")" > "$archive.sha256"
+            echo "wrote $(basename "$archive").sha256  $sha"
+          done
+      - name: Refuse a release whose archives and checksums do not match one for one
+        run: |
+          set -eu
+          # The count first, then the pairing by name: a set with more or fewer
+          # checksums than archives is caught here, an archive whose own checksum
+          # is missing is caught below, and either way the run stops before the
+          # release is created and a partial set is never published.
+          archives=$(find dist -type f ! -name '*.sha256' | sort)
+          checksums=$(find dist -type f -name '*.sha256' | sort)
+          archive_count=$(printf '%s\n' "$archives" | grep -c . || true)
+          checksum_count=$(printf '%s\n' "$checksums" | grep -c . || true)
+          if [ "$checksum_count" -ne "$archive_count" ]; then
+            echo "::error::$archive_count archive(s) and $checksum_count checksum(s) in dist: every archive is published with its checksum, so a run holding a partial set is stopped here."
+            exit 1
+          fi
+          if command -v sha256sum > /dev/null 2>&1; then
+            sum() { sha256sum "$1" | awk '{ print $1 }'; }
+          else
+            sum() { shasum -a 256 "$1" | awk '{ print $1 }'; }
+          fi
+          for archive in $archives; do
+            checksum="$archive.sha256"
+            if [ ! -f "$checksum" ]; then
+              echo "::error::$archive has no checksum beside it; refusing to publish $GITHUB_REF_NAME with an archive the installer cannot verify."
+              exit 1
+            fi
+            published=$(awk 'NR==1 { print $1 }' "$checksum")
+            case "$published" in
+              "" | *[!0-9a-fA-F]*)
+                echo "::error::$checksum does not begin with a sha256; refusing to publish an archive the installer cannot verify."
+                exit 1
+                ;;
+            esac
+            actual=$(sum "$archive")
+            if [ "$published" != "$actual" ]; then
+              echo "::error::$checksum does not match $archive: published $published, actual $actual."
+              exit 1
+            fi
+            echo "  checksum ok  $(basename "$archive")"
+          done
+      - name: Create the release, with the notes, the archives and their checksums attached
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
