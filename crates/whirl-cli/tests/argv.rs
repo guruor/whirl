@@ -150,6 +150,19 @@ fn every_command_the_usage_names_is_accepted() {
     }
 }
 
+/// This package's own binary is under `target/`, so the one lifecycle verb that
+/// writes anything refuses here rather than registering a login item that names
+/// a build tree: an accepted `daemon install` in a test run cannot change this
+/// machine. `run` also points `HOME` at a scratch directory, so no unit is
+/// written into a real home either way.
+#[test]
+fn install_is_refused_in_a_build_tree_and_writes_nothing() {
+    let dir = scratch("install");
+    let output = run(&dir, &["daemon", "install"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(!dir.join("Library").exists(), "no unit was written");
+}
+
 #[test]
 fn a_wrong_command_line_exits_three() {
     let dir = scratch("usage");

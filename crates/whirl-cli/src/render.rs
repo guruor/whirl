@@ -15,9 +15,11 @@ use whirl_core::protocol::{self, ErrorCode, LineKind};
 
 /// The verb completed (2.5.1).
 pub const EXIT_OK: u8 = 0;
-/// The daemon refused, and the `ERR` code says why. Exactly one meaning. Only
-/// the transport can see a refusal, so like it this is `cfg(unix)`.
-#[cfg(unix)]
+/// A refusal, and exactly one meaning. On the wire it is the daemon's `ERR`,
+/// which only the transport can see; it is also the code for the CLI's own
+/// refusal of something it will not do, which is what a daemon lifecycle on a
+/// platform with no supervisor implementation is. That second half is why this
+/// compiles everywhere and is not `cfg(unix)` like the transport.
 pub const EXIT_REFUSED: u8 = 1;
 /// The daemon is not reachable: nothing is listening on the socket.
 pub const EXIT_UNREACHABLE: u8 = 2;

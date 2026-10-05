@@ -5,11 +5,16 @@
 //! becomes the exit code (0 the verb completed, 1 the daemon refused, 2 the
 //! daemon is unreachable, 3 the command line was wrong).
 //!
+//! The one command that is not a protocol request is `daemon`, which asks the
+//! platform's supervisor for the daemon's lifecycle rather than asking the
+//! daemon anything (section 8, `daemon.rs`); it keeps the same four exit codes.
+//!
 //! Nothing the CLI reports about the daemon comes from a file it read itself.
 //! The one exception is the socket path, which a client must know before it can
 //! ask anything, and which it takes in the same precedence the daemon used:
 //! `WHIRL_SOCKET`, then the config's `socket`, then the platform default.
 
+mod daemon;
 mod render;
 
 #[cfg(unix)]
@@ -45,6 +50,11 @@ usage: whirl <command>
   resume               rotate again
   idle                 follow events (this daemon does not implement subscribe yet)
   ping                 is the daemon there
+  daemon install       write the login unit and load it (macOS)
+  daemon uninstall     stop the daemon and remove the login unit (macOS)
+  daemon start         ask the supervisor to start the daemon (macOS)
+  daemon stop          ask the supervisor to stop the daemon (macOS)
+  daemon status        what the supervisor says about the daemon (macOS)
   help                 this text";
 
 fn main() -> ExitCode {
@@ -67,6 +77,10 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             return ExitCode::from(EXIT_OK);
         }
+        // `daemon` is the one command that is not a protocol request: it speaks
+        // to the platform's supervisor, not to the daemon (section 8), and it
+        // prints its own report.
+        Ok(Invocation::Daemon(verb)) => return daemon::run(verb),
         Err(message) => {
             eprintln!("whirl: {message}");
             eprintln!("{USAGE}");
@@ -111,6 +125,9 @@ fn main() -> ExitCode {
 enum Invocation {
     Ask(Request),
     Help,
+    /// A lifecycle step: it never becomes a `Request`, because it is answered by
+    /// the platform's supervisor and not by the daemon.
+    Daemon(daemon::Verb),
 }
 
 /// The CLI verb table of 2.5.1, and nothing else. `set` is the one place the
@@ -153,6 +170,10 @@ fn invocation(args: &[String]) -> Result<Invocation, String> {
         ("unfavorite", [id]) => Invocation::Ask(Request::Unfavorite(id.clone())),
         ("config", [path]) if path == "path" => Invocation::Ask(Request::ConfigPath),
         ("config", [check]) if check == "check" => Invocation::Ask(Request::ConfigCheck),
+        ("daemon", [sub]) => match daemon::Verb::parse(sub) {
+            Some(verb) => Invocation::Daemon(verb),
+            None => return Err(format!("daemon: {sub} is not a subcommand")),
+        },
         ("help", []) => Invocation::Help,
         (other, _) => {
             return Err(format!(
