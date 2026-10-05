@@ -9,6 +9,11 @@
 //! The one exception is the socket path, which a client must know before it can
 //! ask anything, and which it takes in the same precedence the daemon used:
 //! `WHIRL_SOCKET`, then the config's `socket`, then the platform default.
+//!
+//! `--version` is the one answer that is not about the daemon at all: it reports
+//! the crate's own version, compiled in, and touches neither the socket nor the
+//! config, because it is asked of a binary before any daemon has been resolved.
+//! The `version` verb is the daemon's answer, and still needs one.
 
 mod render;
 
@@ -38,7 +43,8 @@ usage: whirl <command>
   unfavorite <id>      unpin
   sources              configured sources
   status               daemon status
-  version              protocol and daemon versions
+  --version            this binary's own version, no daemon needed
+  version              protocol and daemon versions, asked of the daemon
   config path          the config file the daemon read
   config check         parse the config and report the effective values
   pause                stop rotating
@@ -51,6 +57,14 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{USAGE}");
+        return ExitCode::from(EXIT_OK);
+    }
+    // `--version` is the answer to "what is this binary", and the one question
+    // asked of a binary that is only on PATH, before anything has been started:
+    // it must not need a daemon. The version is the crate's own, compiled in;
+    // nothing is read (no config, no socket) and nothing is written.
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("whirl {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::from(EXIT_OK);
     }
     if args.is_empty() {
