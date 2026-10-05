@@ -24,7 +24,8 @@ pub const PRODUCT: &str = "whirl";
 /// The build's version, from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The greeting every accepted connection opens with: `OK whirl 0.1.0 protocol 2`.
+/// The greeting every accepted connection opens with: `OK whirl <version> protocol 2`,
+/// where the version is this build's own.
 ///
 /// The name appears once and the version is bare, so a client can split on spaces
 /// and read the version from the third field (docs/architecture.md 2.4).
@@ -1315,14 +1316,16 @@ mod tests {
     #[test]
     fn the_greeting_names_the_product_once_and_carries_the_bare_version() {
         let greeting = greeting();
+        // The version is the crate's own, so a release moves the number and does
+        // not move this test: what is asserted here is the spelling, the bare
+        // version (no leading `v`) and the product name said once.
         assert_eq!(
             greeting,
             format!("OK whirl {VERSION} protocol {PROTOCOL_VERSION}")
         );
-        assert_eq!(greeting, "OK whirl 0.1.0 protocol 2");
         let parsed = parse_greeting(&greeting).expect("a greeting");
         assert_eq!(parsed.product, "whirl");
-        assert_eq!(parsed.version, "0.1.0");
+        assert_eq!(parsed.version, VERSION);
         assert_eq!(parsed.protocol, 2);
         // The two-token form belongs to `daemon_version`, never to the greeting.
         assert!(parse_greeting("OK whirl whirl 0.1.0 protocol 2").is_none());

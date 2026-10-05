@@ -13,7 +13,7 @@ doing it stays small.
 ![whirl status, the daemon's whole state](docs/assets/whirl-status.svg)
 
 ```text
-daemon_version: whirl 0.1.0
+daemon_version: whirl 0.2.0
 protocol: 2
 platform: macos
 pid: 69202
@@ -86,7 +86,7 @@ installer downloads both release archives, checks each against the sha256
 published beside it, and installs only after both checks pass:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/guruor/whirl-ui/v0.1.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/guruor/whirl-ui/v0.2.0/install.sh | sh
 ```
 
 The daemon reads one JSON config and needs a `sources` entry naming a folder of
@@ -109,7 +109,9 @@ building the three binaries from source instead.
 - **A schedule you configure, and a pause.** `schedule.interval_seconds` (1800 by
   default) with `startup.*` for what to do at start; `whirl pause` and `whirl
   resume` re-arm it without touching the current picture. The daemon's own timer is
-  the schedule: v0.1.0 ships no login item, so whirl rotates while `whirld` runs.
+  the schedule, and `whirl daemon install` (macOS) puts it in front of the
+  supervisor so it comes back after a reboot; the config is re-read on each
+  rotation, so an edit needs no restart.
 - **A rotation is a pipeline, and it is bounded.** A candidate goes through
   resolution, aspect ratio, size and content-type filters, two dedupe passes and
   the cache under a content digest; history is a ring of the last 50 rotations and
@@ -156,7 +158,7 @@ owned, is flat forever.
 
 [docs/architecture.md](docs/architecture.md) is the process model, the protocol and
 the frontend contract; [docs/milestones.md](docs/milestones.md) records what shipped
-and what is left. [docs/releases/v0.1.0.md](docs/releases/v0.1.0.md) is the release
+and what is left. [docs/releases/v0.2.0.md](docs/releases/v0.2.0.md) is the release
 note, including what is unverified and why.
 
 ## Contributing

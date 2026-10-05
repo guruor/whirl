@@ -21,6 +21,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// The greeting this build sends and the `daemon_version` line it reports: the
+/// product once, this crate's own version, the protocol.
+///
+/// Built from `CARGO_PKG_VERSION` rather than written out. A literal here is a
+/// number that has to be edited every release, and one that is forgotten fails
+/// the suite for a reason that has nothing to do with the protocol; the greeting
+/// carrying the bare crate version is the contract, so it is asserted that way.
+const GREETING: &str = concat!("OK whirl ", env!("CARGO_PKG_VERSION"), " protocol 2");
+const DAEMON_VERSION: &str = concat!("whirl ", env!("CARGO_PKG_VERSION"));
+const DAEMON_VERSION_LINE: &str = concat!("daemon_version: whirl ", env!("CARGO_PKG_VERSION"));
+const DAEMON_VERSION_LINE_NL: &str =
+    concat!("daemon_version: whirl ", env!("CARGO_PKG_VERSION"), "\n");
+
 /// The harness's own bound for every wait on the daemon, read off the spec's
 /// timeout table rather than chosen. The row that decides it is
 /// `docs/architecture.md:715` (the card that sent this work cites the same row
@@ -377,9 +390,9 @@ fn status_answers_the_stable_key_set() {
     let daemon = start("status_answers_the_stable_key_set");
     let lines = daemon.ask("status");
     assert_eq!(lines.last().map(String::as_str), Some("OK"));
-    assert_eq!(lines[0], "OK whirl 0.1.0 protocol 2", "the greeting (2.4)");
+    assert_eq!(lines[0], GREETING, "the greeting (2.4)");
     for key in [
-        "daemon_version: whirl 0.1.0",
+        DAEMON_VERSION_LINE,
         "protocol: 2",
         "paused: 0",
         "rotating: 0",
@@ -685,7 +698,7 @@ fn config_check_reports_the_sources_and_the_plan() {
         write_local_config,
     );
     let lines = daemon.ask("config check");
-    assert_eq!(lines[0], "OK whirl 0.1.0 protocol 2", "the greeting (2.4)");
+    assert_eq!(lines[0], GREETING, "the greeting (2.4)");
     assert_eq!(lines.last().map(String::as_str), Some("OK"));
     assert_eq!(
         body(&lines),
@@ -877,12 +890,12 @@ fn history_reports_the_ring_newest_first_in_the_record_form() {
 
     assert_eq!(
         daemon.ask("ping"),
-        vec!["OK whirl 0.1.0 protocol 2", "OK"],
+        vec![GREETING, "OK"],
         "`ping` is the bare terminator (2.11 A)"
     );
     assert_eq!(
         daemon.ask("history"),
-        vec!["OK whirl 0.1.0 protocol 2", "count: 0", "OK"],
+        vec![GREETING, "count: 0", "OK"],
         "an empty list is a count, never a bare `OK` (2.6)"
     );
 
@@ -1125,11 +1138,8 @@ fn refusals_name_their_code_and_the_line_protocol_holds() {
         daemon.ask("hello 1").last().map(String::as_str),
         Some("ERR bad_protocol server speaks 2, client asked for 1")
     );
-    assert_eq!(
-        daemon.ask("hello 2"),
-        vec!["OK whirl 0.1.0 protocol 2", "protocol: 2", "OK"]
-    );
-    assert_eq!(daemon.ask("close"), vec!["OK whirl 0.1.0 protocol 2", "OK"]);
+    assert_eq!(daemon.ask("hello 2"), vec![GREETING, "protocol: 2", "OK"]);
+    assert_eq!(daemon.ask("close"), vec![GREETING, "OK"]);
     let unknown = daemon.ask("frobnicate");
     assert!(
         unknown.last().expect("a terminator").starts_with("ERR "),
@@ -1248,11 +1258,11 @@ fn the_clis_quickstart_commands_answer_over_the_real_socket() {
     // The greeting is a handshake the client reads and checks, not a data line it
     // prints; the first line of output is the first key of the status block.
     assert!(
-        status.starts_with("daemon_version: whirl 0.1.0\n"),
+        status.starts_with(DAEMON_VERSION_LINE_NL),
         "the status block comes first: {status}"
     );
     for expected in [
-        "daemon_version: whirl 0.1.0",
+        DAEMON_VERSION_LINE,
         "protocol: 2",
         "paused: 0",
         "rotating: 0",
@@ -1446,7 +1456,7 @@ fn status_has_exactly_the_documented_keys_in_the_documented_order() {
     );
 
     // The types 2.10 states, for the keys where a wrong shape would still parse.
-    assert_eq!(value(&lines, "daemon_version"), "whirl 0.1.0");
+    assert_eq!(value(&lines, "daemon_version"), DAEMON_VERSION);
     assert_eq!(value(&lines, "protocol"), "2");
     assert!(["macos", "linux", "windows"].contains(&value(&lines, "platform").as_str()));
     assert!(value(&lines, "pid").parse::<u32>().is_ok());
@@ -1565,7 +1575,7 @@ fn subscribe_streams_one_event_per_state_change() {
     let mut writer = stream;
     assert_eq!(
         read_line(&mut reader),
-        "OK whirl 0.1.0 protocol 2",
+        GREETING,
         "the greeting comes first (2.4)"
     );
 
