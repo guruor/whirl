@@ -193,6 +193,25 @@ fn write_local_config(dir: &Path) {
     .expect("the test's own config");
 }
 
+/// A config whose `schedule.interval_seconds` the test chooses, over one `local`
+/// source in its own tree, written (or rewritten) so a running daemon can re-read
+/// it: 4.2's re-read tests need the file to change under a daemon they did not
+/// restart.
+fn write_config_with_interval(dir: &Path, interval: u64) {
+    let walls = dir.join("walls");
+    std::fs::create_dir_all(&walls).expect("the source's directory");
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"schedule\": {{ \"interval_seconds\": {interval} }},\n  \
+             \"sources\": [\n    {{ \"id\": \"space\", \"kind\": \"local\", \"weight\": 3, \
+             \"paths\": [\"{}\"] }}\n  ]\n}}\n",
+            walls.display()
+        ),
+    )
+    .expect("the test's own config");
+}
+
 /// The platform default config path of docs/architecture.md 4.2's `socket`
 /// comment, resolved from `home` (the rules live in
 /// `crates/whirl-core/src/config.rs::paths`).
@@ -1520,9 +1539,12 @@ fn status_reaches_the_states_its_keys_are_named_for() {
 }
 
 /// 2.9 end to end, line for line: `subscribed:`, then the exact lines a complete
-/// rotation produces (2.11 B is the contract), one event per state change with a
-/// `seq` that increases by exactly 1, a command refused inside the stream, and
-/// `close` ending it.
+/// rotation produces, one event per state change with a `seq` that increases by
+/// exactly 1, a command refused inside the stream, and `close` ending it.
+///
+/// A rotation produces four events, not 2.11 B's two: 4.2 and 10.5 add the
+/// config re-read, so `config_reloaded` sits between `rotate_start` and
+/// `rotate_ok` on every rotation whose config parses.
 ///
 /// Every line here is compared as a whole string rather than by prefix, and the
 /// `rotate_ok` fields are taken from the `set:` record the *other* connection
@@ -1594,12 +1616,18 @@ fn subscribe_streams_one_event_per_state_change() {
     );
     assert_eq!(
         read_line(&mut reader),
-        format!("event: 3 rotate_ok {digest} {origin_key} {via} {path}"),
+        "event: 3 config_reloaded",
+        "4.2 and 10.5: the rotation re-read the config and it parsed, so the \
+         stream carries `config_reloaded` (2.9) between the start and the outcome"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        format!("event: 4 rotate_ok {digest} {origin_key} {via} {path}"),
         "then the outcome: 2.6's `set:` record, field for field, after `rotate_ok`"
     );
     assert_eq!(
         read_line(&mut reader),
-        "event: 4 cache_swept 0 0 0",
+        "event: 5 cache_swept 0 0 0",
         "and 5.5's second trigger, the sweep at the end of the rotation, is the \
          next event and the last one it produces (2.9)"
     );
@@ -1616,9 +1644,9 @@ fn subscribe_streams_one_event_per_state_change() {
     // `pause` and `resume` are one event each, and 2.9 gives both an empty field
     // list: a trailing space or a field here fails on the string.
     assert_eq!(daemon.ask("pause").last().map(String::as_str), Some("OK"));
-    assert_eq!(read_line(&mut reader), "event: 5 paused");
+    assert_eq!(read_line(&mut reader), "event: 6 paused");
     assert_eq!(daemon.ask("resume").last().map(String::as_str), Some("OK"));
-    assert_eq!(read_line(&mut reader), "event: 6 resumed");
+    assert_eq!(read_line(&mut reader), "event: 7 resumed");
 
     writeln!(writer, "close").expect("the request");
     writer.flush().expect("a flush");
@@ -1714,12 +1742,18 @@ fn a_failed_rotation_is_visible_on_both_planes() {
     );
     assert_eq!(
         read_line(&mut reader),
-        format!("event: 3 rotate_failed {code} {message}"),
+        "event: 3 config_reloaded",
+        "and the re-read that precedes every rotation succeeded, so it is \
+         announced before the outcome (4.2, 10.5)"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        format!("event: 4 rotate_failed {code} {message}"),
         "and the outcome carries the same code and the same message the client got"
     );
     assert_eq!(
         read_line(&mut reader),
-        "event: 4 cache_swept 0 0 0",
+        "event: 5 cache_swept 0 0 0",
         "5.5's second trigger runs after a failed rotation too, and it is the last \
          event the attempt produces (2.9)"
     );
@@ -1744,6 +1778,147 @@ fn a_failed_rotation_is_visible_on_both_planes() {
         daemon.ask("ping").last().map(String::as_str),
         Some("OK"),
         "a failed rotation is not a broken connection (2.11 C1)"
+    );
+
+    writeln!(writer, "close").expect("the request");
+    writer.flush().expect("a flush");
+    assert_eq!(read_line(&mut reader), "OK");
+}
+
+/// docs/architecture.md 4.2 and 10.5: a rotation re-reads the config, adopts an
+/// edit to it, and announces `config_reloaded` (2.9) on the subscribe stream
+/// before the rotation's outcome. The two observations are the interval `status`
+/// reports (2.10's `interval_s`) and the event, and both are made under a daemon
+/// that was never restarted.
+///
+/// The daemon starts on `interval_seconds: 1800`; the test rewrites the file to
+/// `120` and runs one rotation. `interval_s` before the rotation is the old value
+/// and after it is the new one, which is the difference between a daemon that
+/// re-reads and one that only ever read at start.
+#[test]
+fn a_rotation_adopts_an_edited_config_and_announces_the_reload() {
+    let daemon = start_prepared(
+        "a_rotation_adopts_an_edited_config_and_announces_the_reload",
+        |dir| write_config_with_interval(dir, 1800),
+    );
+
+    let stream = UnixStream::connect(&daemon.socket).expect("a connection");
+    stream
+        .set_read_timeout(Some(CLIENT_BOUND))
+        .expect("a read timeout");
+    let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
+    let mut writer = stream;
+    assert!(read_line(&mut reader).starts_with("OK whirl "));
+    writeln!(writer, "subscribe 0").expect("the request");
+    writer.flush().expect("a flush");
+    assert_eq!(read_line(&mut reader), "subscribed: 1");
+    assert_eq!(read_line(&mut reader), "gap: 1");
+
+    assert_eq!(
+        value(&daemon.ask("status"), "interval_s"),
+        "1800",
+        "before any rotation the daemon runs the file it read at start"
+    );
+
+    write_config_with_interval(&daemon.dir, 120);
+    let failure = daemon.ask("next");
+    let terminator = failure.last().expect("a terminator");
+    assert!(
+        terminator.starts_with("ERR no_candidates "),
+        "the empty local source fails the rotation, which is not what this test \
+         is about: {terminator}"
+    );
+
+    assert_eq!(
+        read_line(&mut reader),
+        "event: 2 rotate_start 1",
+        "the start is announced first (2.9)"
+    );
+    assert_eq!(
+        read_line(&mut reader),
+        "event: 3 config_reloaded",
+        "4.2/10.5: the re-read parsed the edited file and announced it before the \
+         outcome (2.9)"
+    );
+    assert!(
+        read_line(&mut reader).starts_with("event: 4 rotate_failed "),
+        "the outcome still follows the reload on the same stream"
+    );
+    assert_eq!(read_line(&mut reader), "event: 5 cache_swept 0 0 0");
+
+    assert_eq!(
+        value(&daemon.ask("status"), "interval_s"),
+        "120",
+        "4.2: the edit took effect at the next rotation, with no restart"
+    );
+
+    writeln!(writer, "close").expect("the request");
+    writer.flush().expect("a flush");
+    assert_eq!(read_line(&mut reader), "OK");
+}
+
+/// docs/architecture.md 4.2 and the failure table's row 13: a config the parser
+/// rejects does not replace the running one. The previous config stays in force
+/// (`interval_s` is unchanged), the failure is recorded (`last_error` is
+/// `bad_config`) and written to the daemon's log, and no `config_reloaded`
+/// reaches the stream for that rotation: 2.9 emits it only when the re-read
+/// parsed.
+///
+/// The rejected file is `interval_seconds: 1`, below 4.2's floor, so this is the
+/// "out of range" row rather than an unreadable file, and the parser names the
+/// key. The worker reads the same file and fails on it too, so the rotation's own
+/// `rotate_failed bad_config` follows the start with nothing in between.
+#[test]
+fn a_config_the_parser_rejects_leaves_the_previous_config_in_force() {
+    let daemon = start_prepared(
+        "a_config_the_parser_rejects_leaves_the_previous_config_in_force",
+        |dir| write_config_with_interval(dir, 1800),
+    );
+
+    let stream = UnixStream::connect(&daemon.socket).expect("a connection");
+    stream
+        .set_read_timeout(Some(CLIENT_BOUND))
+        .expect("a read timeout");
+    let mut reader = BufReader::new(stream.try_clone().expect("a clone"));
+    let mut writer = stream;
+    assert!(read_line(&mut reader).starts_with("OK whirl "));
+    writeln!(writer, "subscribe 0").expect("the request");
+    writer.flush().expect("a flush");
+    assert_eq!(read_line(&mut reader), "subscribed: 1");
+    assert_eq!(read_line(&mut reader), "gap: 1");
+
+    write_config_with_interval(&daemon.dir, 1);
+    let failure = daemon.ask("next");
+    let terminator = failure.last().expect("a terminator");
+    assert!(
+        terminator.starts_with("ERR bad_config "),
+        "the same parser the daemon runs refuses this file: {terminator}"
+    );
+
+    assert_eq!(
+        read_line(&mut reader),
+        "event: 2 rotate_start 1",
+        "the rotation started, and the re-read happens inside it (2.9)"
+    );
+    assert!(
+        read_line(&mut reader).starts_with("event: 3 rotate_failed bad_config "),
+        "the next event is the outcome, not `config_reloaded`: a rejected config \
+         is adopted by nothing (4.2, 10.5)"
+    );
+    assert_eq!(read_line(&mut reader), "event: 4 cache_swept 0 0 0");
+
+    let status = daemon.ask("status");
+    assert_eq!(
+        value(&status, "interval_s"),
+        "1800",
+        "4.2 row 13: the previous config stays in force"
+    );
+    assert_eq!(value(&status, "last_error"), "bad_config");
+    let log = daemon.log();
+    assert!(
+        log.contains("last_error: bad_config"),
+        "the daemon says why the re-read was refused (2.10's key, named in the \
+         log): {log}"
     );
 
     writeln!(writer, "close").expect("the request");
