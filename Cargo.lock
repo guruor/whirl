@@ -4,25 +4,25 @@ version = 4
 
 [[package]]
 name = "whirl-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "whirl-core",
 ]
 
 [[package]]
 name = "whirl-core"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "whirl-worker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "whirl-core",
 ]
 
 [[package]]
 name = "whirld"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "whirl-core",
 ]
