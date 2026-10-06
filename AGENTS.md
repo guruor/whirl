@@ -55,11 +55,12 @@ named.
 
 ## 4. A second party, and evidence over claims
 
-- Nothing lands on `development` unreviewed by someone who did not write it. A claim
-  in a commit message, a pull request body or a comment is input rather than
-  evidence; evidence is the command and its output, pasted (CONTRIBUTING.md, "The
-  rules that are not negotiable"; `docs/development.md` section 6, "The review
-  rule").
+- The default branch is the integration branch: a change lands by pull request
+  reviewed by someone who did not write it, and a release is a tag. Nothing lands
+  unreviewed. A claim in a commit message, a pull request body or a comment is
+  input rather than evidence; evidence is the command and its output, pasted
+  (CONTRIBUTING.md, "The rules that are not negotiable"; `docs/development.md`
+  section 6, "The review rule").
 - Provenance in a comment is the measurement and the command that produced it,
   pasted, not a pointer to whatever tracked the work: a reader with the repository
   and not the session can only check what was printed.

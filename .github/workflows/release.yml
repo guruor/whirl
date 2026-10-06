@@ -23,7 +23,7 @@ name: release
 # What this workflow does not do, on purpose: it does not run the test suite. The
 # guard has established that the tagged commit is on `main`; that `ci.yml` has
 # already run the full matrix on that commit follows from how a commit reaches
-# `main` (the promotion pull request and the push to `main` its merge produces
+# `main` (the pull request that lands it and the push to `main` its merge produces
 # both run the matrix, docs/development.md section 5), and is not a check this
 # workflow makes. What this workflow does do is refuse to publish a release whose
 # notes are missing, unfilled or incomplete: see the "Assemble and check the
@@ -110,7 +110,7 @@ jobs:
           else
             echo "ancestry: $SHA is NOT an ancestor of origin/main, and the two share no history at all"
           fi
-          echo "::error::$TAG is not on main, so it is not a release. Nothing was built and no release will be published. A release is a tag vX.Y.Z on main (docs/development.md section 5): delete this tag, get the commit onto main through the promotion, and tag main's tip."
+          echo "::error::$TAG is not on main, so it is not a release. Nothing was built and no release will be published. A release is a tag vX.Y.Z on main (docs/development.md section 5): delete this tag, get the commit onto main by a pull request, and tag main's tip."
           exit 1
 
   build:
@@ -289,7 +289,7 @@ jobs:
               sys.exit(
                   f"no release notes for {tag}. A final release is not published on an "
                   f"unfilled template: write {written} from {template}, with the "
-                  "per-platform checklist results, land it in the promotion pull request "
+                  "per-platform checklist results, land it on `main` by a pull request "
                   "(docs/development.md section 5), and rerun this run."
               )
 
@@ -308,8 +308,8 @@ jobs:
               if leftovers:
                   sys.exit(
                       f"{where} still holds {len(leftovers)} unfilled placeholder(s), "
-                      f"starting with {leftovers[0]!r}. Fill them, land the file through "
-                      "`development` and the promotion, and rerun this run."
+                      f"starting with {leftovers[0]!r}. Fill them, land the file on "
+                      "`main` by a pull request, and rerun this run."
                   )
 
           print(f"release notes: {where}")

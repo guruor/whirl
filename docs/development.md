@@ -104,8 +104,8 @@ docs/
                             each one covers
   releases/                 one file per release: vX.Y.Z.md, the notes the tag
                             workflow publishes, written before the tag (section 5)
-.github/workflows/ci.yml    the gate: push to `main` or `development`, pull request
-                            into either, by hand (section 4)
+.github/workflows/ci.yml    the gate: push to `main`, pull request into `main`,
+                            by hand (section 4)
 .github/workflows/release.yml   a tag `v*` becomes a release: same artifacts, notes,
                                 and a GitHub Release (section 5)
 .github/release-notes-template.md   the shape of a release's notes, and the sections
@@ -519,14 +519,14 @@ not the evidence.
 `.github/workflows/ci.yml` is the gate. Eight jobs: `fmt`, `clippy` (three OS),
 `test` (three OS), `coverage` (macOS), `msrv`, `guards`, `secrets`, `artifacts`
 (three OS). It runs
-on pushes to `main` **and to `development`**, on every pull request whose base is
-either, and by hand with `workflow_dispatch`. It declares
+on pushes to `main`, on every pull request whose base is `main`, and by hand with
+`workflow_dispatch`. It declares
 `permissions: contents: read`, so a compromised step cannot write to the
 repository, and it cancels superseded runs on the same ref.
 
-The pull request whose base is `main` is a promotion, and it runs the whole
-matrix like any other change: the promotion is the last look `development` gets
-before the tag (section 5). A **tag** does not run this workflow at all; a tag
+Every change runs the whole matrix, because `main` is the integration branch and
+a release is a tag on it (section 5): the pull request is the last look before the
+tag. A **tag** does not run this workflow at all; a tag
 runs `.github/workflows/release.yml`, which is the release itself and the only
 workflow here that is allowed to write to the repository (section 5).
 
@@ -534,8 +534,8 @@ workflow here that is allowed to write to the repository (section 5).
 checkout publishes at the head, not over the whole history: gitleaks' git mode
 reads a commit's added lines, so a change that *removes* a value cannot trip
 it, and a value no file carries any more needs no exemption. The range starts
-after the commit the project's own rules landed at, which is what a promotion
-needs, because its base `main` sits behind every one of them; section 6
+after the commit the project's own rules landed at, so a base that predates them
+is not re-judged; section 6
 (`Secrets`) owns that boundary and the tree scan beside it. It installs the
 release binary with the version and the sha256 both pinned in the workflow, and
 it fails when either scan reads nothing while there was something to read, because
@@ -730,32 +730,27 @@ the number is the vendor's to change and ours to re-check.
 - **A patch release fixes; a minor release adds.** Anything that raises the MSRV,
   changes a config key's meaning or changes the protocol is a minor release.
 
-### The promotion: how a commit reaches `main`
+### How a change reaches a release
 
-`development` integrates and `main` releases, and the step between them is one
-pull request. It is the last look before the tag, so it has five parts and no
-shortcuts:
+`main` is the integration branch and a release is a tag on it, so a change
+reaches a release by landing on `main` and then being tagged. The steps before
+the tag, and no shortcuts:
 
-1. **`development` is green.** The *tip* of `development` has a green `ci.yml` run,
-   named by its run id in the pull request. "The last change was green" is a
-   different claim, and it is not the one that matters.
+1. **`main` is green.** The *tip* of `main` has a green `ci.yml` run,
+   named by its run id in the release's pull request. "The last change was green"
+   is a different claim, and it is not the one that matters.
 2. **The release-blocking checklists have been run on real hardware,** for every
    platform this release supports, by people who have that hardware. The results
    are the notes' required sections (step 3). CI green is a precondition, not the
    evidence (section 3, "What CI cannot prove").
-3. **The notes are written on `development`**, at `docs/releases/vX.Y.Z.md`, from
-   `.github/release-notes-template.md`. They travel with the promotion because the
-   tag has to point at a commit that already contains them: the workflow refuses
-   to publish a final release whose notes file is missing or still holds a
-   placeholder.
-4. **The promotion pull request is opened and merged:**
-   `gh pr create --base main --head development`. It runs the full matrix, because
-   `ci.yml` triggers on a pull request whose base is `main` as well as
-   `development` (section 4), and it is reviewed like any other pull request, by
-   someone who did not open it. Nothing else rides in it: a change that did not
-   land on `development` first does not enter `main` through the promotion.
-5. **`main` is back-merged into `development` immediately** (section 6, the
-   back-merge rule), before anything else and before the tag.
+3. **The notes are written**, at `docs/releases/vX.Y.Z.md`, from
+   `.github/release-notes-template.md`, in the same pull request as the version
+   bump. They have to be on `main` before the tag, because the tag has to point at
+   a commit that already contains them: the workflow refuses to publish a final
+   release whose notes file is missing or still holds a placeholder.
+4. **The pull request is opened and merged:** `gh pr create --base main`. It runs
+   the full matrix (section 4), and it is reviewed like any other pull request, by
+   someone who did not open it. Nothing else rides in it.
 
 Then, and only then, the tag: "Cutting a release, step by step" below.
 
@@ -776,19 +771,19 @@ Three consequences worth stating:
 
 - **The tag is the trigger, not a note to yourself.** Nothing else has to be
   clicked, run or remembered after `git push origin vX.Y.Z`.
-- **The notes are part of the promotion,** not something typed into the release
+- **The notes are part of the change,** not something typed into the release
   page afterwards, because the workflow reads them out of the tagged commit.
-- **A failed run is fixable without re-tagging.** Fix the notes, land them through
-  `development` and a promotion, then `gh run rerun <run id>`. Re-tagging means
+- **A failed run is fixable without re-tagging.** Fix the notes, land them on
+  `main` by a pull request, then `gh run rerun <run id>`. Re-tagging means
   deleting a tag that someone may already have fetched, which is the kind of
   manual repair this workflow exists to remove.
 
 The workflow does not run the test suite, and does not need to: the `guard` job
-has established that the tagged commit is on `main`, it is a promotion's merge
-commit, and `ci.yml` has already run the whole matrix on it, both on the
-promotion pull request and on the push to `main` the merge produced. The tag is
-the last step of a procedure that starts with a green `development`, not a
-substitute for it.
+has established that the tagged commit is on `main`, `ci.yml` has already run the
+whole matrix on it, both on the pull request that landed it and on the push to
+`main` the merge produced, and the release checklists are what say it is
+releasable. The tag is the last step of a procedure that starts with a green
+`main`, not a substitute for it.
 
 ### Cutting a release, step by step
 
@@ -797,13 +792,12 @@ For someone who has never done it here:
 1. **Decide the version.** SemVer (above): a patch fixes, a minor adds, and `0.x`
    holds until all three platforms have passed their checklists. The protocol
    version is not the release version and moves on its own schedule.
-2. **Bump `version` in `[workspace.package]` in `Cargo.toml`, on `development`,**
-   as its own pull request, one change per pull request, and let it go green.
-3. **Write the notes on `development`**, at `docs/releases/vX.Y.Z.md`, from
-   `.github/release-notes-template.md`, with the checklist results from step 2 of
-   the promotion. Same route: a pull request into `development`.
-4. **Promote:** the five steps above, ending with the back-merge.
-5. **Tag `main`'s tip and push it:**
+2. **Bump `version` in `[workspace.package]` in `Cargo.toml`,** as its own pull
+   request, one change per pull request, and let it go green.
+3. **Write the notes**, at `docs/releases/vX.Y.Z.md`, from
+   `.github/release-notes-template.md`, with the checklist results from the
+   release checklists above. Same route: a pull request into `main`.
+4. **Tag `main`'s tip and push it:**
 
    ```sh
    git fetch origin
@@ -814,17 +808,16 @@ For someone who has never done it here:
 
    Annotated rather than lightweight: a release has an author, a date and a
    message, and `git describe` should say what a lightweight tag cannot.
-6. **Watch the run and the release:**
+5. **Watch the run and the release:**
 
    ```sh
    gh run list --workflow release.yml --limit 1
    gh release view vX.Y.Z
    ```
 
-   If it failed on the notes gate, fix the notes, land them through `development`
-   and a promotion, and rerun the failed run. Do not delete the tag to push it
-   again.
-7. **A prerelease is the same procedure with `vX.Y.Z-rc.N`,** except that step 3 is
+   If it failed on the notes gate, fix the notes, land them on `main` by a pull
+   request, and rerun the failed run. Do not delete the tag to push it again.
+6. **A prerelease is the same procedure with `vX.Y.Z-rc.N`,** except that step 3 is
    optional and the run marks it as a prerelease. That is the only shape to use for
    a rehearsal: a tag that looks like a final release is not a rehearsal, and
    deleting one afterwards leaves a release in every clone that fetched it.
@@ -959,58 +952,35 @@ What is deliberately not supported:
 
 ## 6. Contribution flow
 
-### Branches: `development` integrates, `main` releases
+### Branches
 
-Three kinds of branch, one line each:
+Two kinds of branch, one line each:
 
-- **`development` integrates.** Every change lands here first, and it is the only
-  branch a working branch is opened against.
-- **`main` releases.** A commit reaches `main` only as a promotion (section 5), and
-  a release is a tag on it. It is always meant to be production-ready, so it never
-  carries an intermediate failure.
-- **A working branch is short-lived.** One branch per change, cut from
-  `development`, named `<area>/<short-topic>`, for example
-  `daemon/stale-socket-probe`, `worker/wallhaven-pagination`,
-  `docs/development-guide`. Delete it after its pull request merges, and never
-  reuse it after that.
+- **`main` integrates and releases.** It is the default branch: every change lands
+  on it by pull request, and a release is a tag on it (section 5). It is always
+  meant to be production-ready, so it never carries an intermediate failure.
+- **A working branch is short-lived.** One branch per change, cut from `main`,
+  named `<area>/<short-topic>`, for example `daemon/stale-socket-probe`,
+  `worker/wallhaven-pagination`, `docs/development-guide`. Delete it after its
+  pull request merges, and never reuse it after that.
 
 The rules that follow from that:
 
-- **Every change arrives as a pull request into `development`.** Open it with
-  `gh pr create --base development`. **`main` never receives a direct commit:**
-  not from a maintainer, not from an agent, and not to fix a release in a hurry.
-  A hotfix is a change like any other, so it goes through `development` and then
-  through a promotion.
-- **Cut the working branch from the tip of `development`,** and keep it there:
-  `git pull --ff-only origin development` catches it up while it has nothing of its
-  own, and `git merge origin/development` does it once it has. Rebasing to catch up
-  is the thing not to do: a reviewer has already read those commits, and rewriting
-  them changes what is under review. The one exception is a commit that leaked a
+- **Every change arrives as a pull request into `main`.** Open it with
+  `gh pr create --base main`. **`main` never receives a direct commit:** not from
+  a maintainer, not from an agent, and not to fix a release in a hurry. A hotfix is
+  a change like any other, so it is a pull request too.
+- **Cut the working branch from the tip of `main`,** and keep it there:
+  `git pull --ff-only origin main` catches it up while it has nothing of its own,
+  and `git merge origin/main` does it once it has. Rebasing to catch up is the
+  thing not to do: a reviewer has already read those commits, and rewriting them
+  changes what is under review. The one exception is a commit that leaked a
   credential, which is dropped rather than preserved for review (`Secrets` below).
-- **The back-merge rule.** Anything that reaches `main`, a promotion or a later
-  hotfix, is merged back into `development` immediately, before any other work
-  lands:
-
-  ```sh
-  git fetch origin
-  git switch development && git pull --ff-only
-  git merge --no-ff --no-edit origin/main
-  git push origin development
-  ```
-
-  **Why it exists:** it keeps `main`'s tip an ancestor of `development`, so the two
-  lines never run in opposite directions. Concretely: a working branch catches up
-  with `development` by a fast-forward or by merging `development` in, not by
-  rewriting its own commits, and a promotion pull request is a straight
-  `development` into `main` merge with nothing to reconcile, because `main` holds
-  no commit that `development` is missing. Skip the back-merge and the damage is
-  not in `main`, it is in the next branch.
 - **The rule is enforced, not remembered.** Branch protection on `main` requires
   a pull request and passing checks, so a direct commit, a force push or a merge
-  with a red pipeline is refused by the host rather than by good intentions;
-  `development` requires passing checks too, so a red tip is visible before a
-  promotion reads it. This document describes the expectation; the repository
-  owner applies the settings, because a screenshot of a setting is not a rule.
+  with a red pipeline is refused by the host rather than by good intentions. This
+  document describes the expectation; the repository owner applies the settings,
+  because a screenshot of a setting is not a rule.
 - One change per pull request. A formatting sweep and a behaviour change in the
   same diff is two pull requests.
 - The pull request body states: what changed, what you ran, what you observed, and
@@ -1109,14 +1079,14 @@ against fixtures, or are marked as requiring a key and skipped when it is absent
 
 Run the scanner before you push. It is the same tool, the same config file and the
 same two passes the `secrets` job runs: the commits your branch adds to
-`development` (which is the branch a working branch is cut from), read with
+`main` (the branch a working branch is cut from), read with
 `--diff-merges=first-parent` so that what a merge introduces relative to its first
 parent is read and not skipped, and the tree the checkout publishes.
 
 ```sh
-git fetch origin development
+git fetch origin main
 gitleaks git --config .gitleaks.toml --redact \
-  --log-opts="--diff-merges=first-parent $(git merge-base origin/development HEAD)..HEAD"
+  --log-opts="--diff-merges=first-parent $(git merge-base origin/main HEAD)..HEAD"
 gitleaks dir --config .gitleaks.toml --redact .
 ```
 
@@ -1129,9 +1099,9 @@ and the job's guard counts the commits in the range rather than the patches the
 scanner read, so a range of such merges is green on its own merits.
 
 The range starts after the commit the project's own rules in `.gitleaks.toml`
-landed at, not at the base the event names. A promotion pull request has base
-`main`, which is behind every one of those commits, and scanning from there
-re-judges history written before the rules existed: measured on this
+landed at, not at the base the event names. A base that sits behind that commit
+would re-judge history written before the rules existed, so it is replaced:
+measured on this
 repository, 60 findings across 24 commits, none of them newer than the rules,
 against none at all from the rules' own commit. A base at or after it is used
 as the event named it, which is what a working branch's range already is, and
@@ -1147,11 +1117,11 @@ gitleaks cannot read that. The CI job pins both off for this reason, and the sam
 two overrides work locally:
 
 ```sh
-git fetch origin development
+git fetch origin main
 GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=false \
 GIT_CONFIG_KEY_1=color.diff GIT_CONFIG_VALUE_1=false \
 gitleaks git --config .gitleaks.toml --redact \
-  --log-opts="--diff-merges=first-parent $(git merge-base origin/development HEAD)..HEAD"
+  --log-opts="--diff-merges=first-parent $(git merge-base origin/main HEAD)..HEAD"
 ```
 
 An exemption from the scanner's rules lives in `.gitleaks.toml`, needs a
@@ -1172,12 +1142,12 @@ there, including one the boundary above skips.
 ### From a fresh clone to a running daemon
 
 This is the sequence, verified end to end against the scaffold described in the
-status section. No daemon installed, no wallpaper touched. The clone names
-`development`, not `main`: `main` is the default branch and its macOS setter is
-still a stub, so a build from it produces a `whirl` that cannot set a wallpaper.
+status section. No daemon installed, no wallpaper touched. The clone takes the
+default branch, `main`, which is the integration branch and carries the current
+code.
 
 ```sh
-git clone --branch development https://github.com/guruor/whirl
+git clone https://github.com/guruor/whirl
 cd whirl
 cargo build --workspace
 
@@ -1287,15 +1257,13 @@ naming the directory the daemon looked in. That message is the fastest diagnosis
 of a split install, and the experiment below reproduces it.
 
 **From a checkout.** `cargo install --path` builds the release profile in the
-checkout and copies the binary out. The clone below names `--branch development`
-on purpose: `main` is the default branch, its macOS setter is still a stub, and
-an install taken from it succeeds and then fails at the first rotation with
-`ERR set_failed ... the macOS setter is not implemented yet`. One invocation
+checkout and copies the binary out. The clone below takes the default branch,
+`main`. One invocation
 takes one `--path`, so this is three commands; three in one invocation is refused
 with `error: the argument '--path <PATH>' cannot be used multiple times`.
 
 ```sh
-git clone --branch development https://github.com/guruor/whirl
+git clone https://github.com/guruor/whirl
 cd whirl
 
 cargo install --path crates/whirl-cli    --locked   # whirl

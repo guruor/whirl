@@ -4,7 +4,7 @@ The shape of a release's notes. The procedure is docs/development.md section 5.
 This file is read in two ways:
 
 - a final release, `vX.Y.Z`: copy it to `docs/releases/vX.Y.Z.md`, fill every
-  placeholder, and land that file in the promotion pull request, so the notes and
+  placeholder, and land that file on `main` by a pull request, so the notes and
   the tagged commit are the same commit. The `release` workflow refuses to publish
   a final release whose notes file is missing, unfilled, or missing a required
   section.
