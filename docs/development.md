@@ -16,7 +16,7 @@ decision.
 |---|---|
 | `docs/`, `prototype/` | exist |
 | the Cargo workspace (`crates/`) | exists on pull request #1: `whirl-core`, `whirld`, `whirl-cli`, `whirl-worker`, four members and no third-party dependency |
-| `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36240381639`, thirteen jobs, on the tip of `development`. The `coverage` job added since is the fourteenth and has not run on a runner: what was run for it is `bash scripts/ci.sh coverage` on this machine (section 4, "What has and has not been verified") |
+| `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36240381639`, thirteen jobs, on the tip of `development`. The `coverage` job added since is the fourteenth, and it has run on a runner: run `37462295465`, the whole workflow green, the coverage job's log ending in the floor holding (section 4, "What has and has not been verified") |
 | `.github/workflows/release.yml` | written here, lints clean, and **has run** three times: green once, on the throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag; and red twice since, on the throwaway guard probes `v0.0.1-rc.test-guard`, run `36156068912`, and `v0.0.1-rc.review-guard-t6d652592`, run `36157463795`, where the `guard` job failed because the tag was not on `main` and `build` and `release` were skipped, so neither probe built or published anything. No tag and no release exists on `origin` today |
 | a running daemon reachable from a checkout | yes: the section 7 sequence below, driven from a fresh clone of pull request #1 on a scratch socket, no wallpaper touched |
 | anything that sets a real wallpaper in CI | never, by design (see "What CI cannot prove") |
@@ -671,7 +671,16 @@ before it is used as a range.
   were run on the same tree and all exited 0: `cargo +1.94.0 test --workspace`
   (292 passed, 1 ignored, across 10 test targets), then `fmt` and `clippy` on the
   same pinned toolchain (`cargo +1.94.0 fmt --all -- --check` and
-  `cargo +1.94.0 clippy --workspace --all-targets -- -D warnings`).
+  `cargo +1.94.0 clippy --workspace --all-targets -- -D warnings`). The job
+  itself has run on its runner since: run `37462295465`, the whole workflow
+  green, fourteen jobs. The coverage job's check printed
+  `the floor holds; every file the baseline names is at or above it`, at 13653
+  lines, 2151 uncovered, 84.25%, against the 84.1 floor, under `rustc 1.94.0`
+  and `cargo-llvm-cov 0.9.1`, which the mode's own first line names. The runner
+  measures the same workspace as this machine, to the line. The one per-file
+  difference is inside the slack the per-file rule leaves:
+  `crates/whirld/src/worker.rs` measured 90 uncovered there and 86 here, against
+  a baseline of 87 and a slack of 6.
 - **One annotation on both runs, recorded because it is not a failure:** `Node.js
   20 is deprecated. The following actions target Node.js 20 but are being forced to
   run on Node.js 24: actions/checkout@11d5960a, actions/upload-artifact@ea165f8d`.
