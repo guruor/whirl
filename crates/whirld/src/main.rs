@@ -35,6 +35,8 @@ mod socket;
 mod state;
 #[cfg(unix)]
 mod statefile;
+#[cfg(all(test, unix))]
+mod testkit;
 #[cfg(unix)]
 mod worker;
 

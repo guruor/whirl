@@ -1551,7 +1551,12 @@ impl Run<'_> {
                 Ok(candidates) => candidates,
                 Err(reason) => {
                     eprintln!("warning: source {} is disabled: {reason}", entry.config.id);
-                    reasons.push(format!("{}: {reason}", entry.config.id));
+                    // 2.6's second form of the record: `enabled=0` with the
+                    // source's own `reason` and no counter group, because
+                    // nothing was counted. The reason is the source's own words
+                    // and free-form prose, which is why 2.6 makes it the
+                    // record's last field: it takes the rest of the line.
+                    reasons.push(disabled_record(&entry.config, reason));
                     continue;
                 }
             };
@@ -1562,10 +1567,24 @@ impl Run<'_> {
                 // nothing is set and the reason carries the counters. The
                 // daemon has already spent the slot, and 1711's row 3 keeps it
                 // that way rather than inventing a retry.
-                reasons.push(format!(
-                    "{}: {:?} candidates, {:?} admitted",
-                    entry.config.id, filtered.counters.candidates, filtered.counters.admitted
-                ));
+                //
+                // The reason is 2.6's `source:` record and not a sentence about
+                // it, because the per-stage counts live in exactly one place:
+                // "23 candidates, 0 admitted" is true and useless, since it
+                // cannot say whether resolution, ratio, size, type or the recent
+                // window refused them. `whirl config check` prints this same
+                // record for the same source and is 1.4's diagnostic, but a
+                // client that only ever calls `next` never sees it, so the
+                // failure it receives carries the counters instead. The numbers
+                // are the same numbers `check` prints because this is the same
+                // builder, which is what lets a reader put the two lines side by
+                // side.
+                reasons.push(
+                    filtered
+                        .counters
+                        .record(&entry.config, entry.config.weight > 0, None)
+                        .line(),
+                );
                 continue;
             }
             for seeking in filtered.kept {

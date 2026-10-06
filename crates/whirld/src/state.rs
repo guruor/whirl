@@ -1468,8 +1468,8 @@ pub fn favorite_state(path: Option<&str>) -> FavoriteState {
 mod tests {
     use super::*;
     use crate::lock::{Attempt, Mode};
-    use std::path::{Path, PathBuf};
-    use std::sync::RwLock;
+    use crate::testkit::Scratch;
+    use std::path::Path;
     use whirl_core::config::{Backend, LocalMode, LocalSource, SourceConfig, SourceKind};
 
     /// 2.10's `next_in_s` row, one assertion per state it names, with `now`
@@ -1538,6 +1538,154 @@ mod tests {
         );
     }
 
+    /// 6.4 steps 1 and 2: a `current.json` this build cannot parse is moved
+    /// aside and the daemon starts from it rather than refusing to. `status`
+    /// reports both halves, and the file is still on disk under the quarantine
+    /// name, because 6.4 step 1 moves and never deletes.
+    #[test]
+    fn a_current_file_that_cannot_be_parsed_is_quarantined_and_the_daemon_starts() {
+        let scratch = Scratch::new("state-corrupt-current");
+        let state_dir = scratch.join("state");
+        std::fs::create_dir_all(&state_dir).expect("a state directory");
+        std::fs::write(state_dir.join("current.json"), r#"{"schema": "#).expect("a truncated file");
+
+        let daemon = daemon(scratch.path(), Attempt::Acquired);
+
+        let state = daemon.state();
+        assert_eq!(state.state_corrupt.as_deref(), Some("current.json"));
+        let quarantined = state
+            .state_quarantined
+            .clone()
+            .expect("the quarantine path");
+        assert!(
+            quarantined.contains("current.json.corrupt-"),
+            "{quarantined}"
+        );
+        assert!(
+            state.next_at.is_some(),
+            "1.7.3: a quarantined anchor is a first run, and the deadline is armed"
+        );
+        drop(state);
+
+        assert!(
+            Path::new(&quarantined).exists(),
+            "6.4 step 1: moved aside, never deleted"
+        );
+        assert_eq!(kv(&daemon.status(), "state_corrupt"), "current.json");
+        assert_eq!(kv(&daemon.status(), "state_quarantined"), quarantined);
+    }
+
+    /// 6.4 step 4: a file written by a newer schema is left exactly as it is and
+    /// becomes read-only for this daemon. All three files are the same case, and
+    /// a pause is a state change the daemon would otherwise write, so the files
+    /// having not moved is the assertion.
+    #[test]
+    fn a_file_from_a_newer_schema_is_left_alone_and_becomes_read_only() {
+        const NEWER: &str = r#"{"schema": 2, "seq": 1}"#;
+        const FILES: [&str; 3] = ["current.json", "history.json", "favorites.json"];
+        let scratch = Scratch::new("state-schema-newer");
+        let state_dir = scratch.join("state");
+        std::fs::create_dir_all(&state_dir).expect("a state directory");
+        for name in FILES {
+            std::fs::write(state_dir.join(name), NEWER).expect("a newer file");
+        }
+
+        let daemon = daemon(scratch.path(), Attempt::Acquired);
+
+        {
+            let state = daemon.state();
+            assert!(state.state_schema_newer, "2.10's row");
+            assert_eq!(
+                state.read_only,
+                [true, true, true],
+                "6.4 step 4: every file of a newer schema is read-only"
+            );
+        }
+
+        daemon.set_paused(true);
+        for name in FILES {
+            assert_eq!(
+                std::fs::read_to_string(state_dir.join(name)).expect("the file"),
+                NEWER,
+                "{name}: left exactly as it is"
+            );
+        }
+        assert_eq!(kv(&daemon.status(), "state_schema_newer"), "1");
+    }
+
+    /// 1.7.3 and 6.2: with no `current.json` at all, the newest history entry is
+    /// what the daemon reports as displayed -- and `anchor_verified` stays false,
+    /// because nothing was read back from the platform in this run.
+    #[test]
+    fn a_missing_anchor_is_rebuilt_from_history_and_is_not_verified() {
+        let scratch = Scratch::new("state-rebuild-anchor");
+        let state_dir = scratch.join("state");
+        std::fs::create_dir_all(&state_dir).expect("a state directory");
+        let digest = crate::testkit::digest('1');
+        std::fs::write(
+            state_dir.join("history.json"),
+            format!(
+                "{{\n  \"schema\": 1,\n  \"seq\": 4,\n  \"written_at\": \"2026-09-25T07:41:12Z\",\n  \
+                 \"entries\": [\n    {{\n      \"kind\": \"local\",\n      \"origin_key\": \"pictures:one\",\n      \
+                 \"digest\": \"{digest}\",\n      \"cached_path\": \"/cache/sha256/aa/aa/aa.jpg\",\n      \
+                 \"set_at\": \"2026-09-25T07:40:00Z\",\n      \"via\": \"source\"\n    }}\n  ]\n}}\n"
+            ),
+        )
+        .expect("a history file");
+
+        let daemon = daemon(scratch.path(), Attempt::Acquired);
+
+        {
+            let state = daemon.state();
+            assert_eq!(state.history.iter().count(), 1);
+            let current = state.current.as_ref().expect("rebuilt from history");
+            assert_eq!(current.digest, digest);
+            assert_eq!(current.origin_key.as_deref(), Some("pictures:one"));
+            assert_eq!(current.path.as_deref(), Some("/cache/sha256/aa/aa/aa.jpg"));
+            assert!(
+                !state.anchor_verified,
+                "1.7.3: nothing was read back from the platform"
+            );
+        }
+
+        assert_eq!(kv(&daemon.status(), "last_digest"), digest);
+        assert_eq!(kv(&daemon.status(), "anchor_verified"), "0");
+    }
+
+    /// 6.4: a directory where a state file belongs is one of the shapes the
+    /// reader has to survive. It is quarantined like a corrupt file, and the ring
+    /// that vanished says so: `history_lost` is the record that history is empty
+    /// because it could not be read, not because there was none.
+    #[test]
+    fn a_directory_where_a_state_file_belongs_is_quarantined_and_history_is_reported_lost() {
+        let scratch = Scratch::new("state-directory");
+        let state_dir = scratch.join("state");
+        std::fs::create_dir_all(state_dir.join("history.json")).expect("a directory in the way");
+
+        let daemon = daemon(scratch.path(), Attempt::Acquired);
+
+        {
+            let state = daemon.state();
+            assert_eq!(state.state_corrupt.as_deref(), Some("history.json"));
+            assert!(
+                state.history_lost,
+                "6.4 step 2: an empty ring that is not a first run"
+            );
+            assert_eq!(state.history.iter().count(), 0);
+        }
+
+        assert_eq!(kv(&daemon.status(), "history_lost"), "1");
+        let quarantined = kv(&daemon.status(), "state_quarantined");
+        assert!(
+            quarantined.contains("history.json.corrupt-"),
+            "{quarantined}"
+        );
+        assert!(
+            Path::new(&quarantined).is_dir(),
+            "the directory was moved, not deleted"
+        );
+    }
+
     /// The `lock_mode` value of a `status` response (2.10).
     fn lock_mode(daemon: &Daemon) -> String {
         daemon
@@ -1566,25 +1714,13 @@ mod tests {
     /// direction the real probe is left in place, because it is the one this
     /// machine can answer -- including the `EWOULDBLOCK` that says a holder is
     /// live, which a supplied `Acquired` would erase.
+    ///
+    /// The builder itself is `crate::testkit`'s, which is where the daemon's
+    /// unit tests get one; `daemon_holding` is the spelling without a
+    /// `config.json`, because these tests' rotations are about the rotation and
+    /// not about a config document being re-readable.
     fn daemon_with(dir: &Path, attempt: Attempt, config: Config) -> Daemon {
-        let state_dir = dir.join("state");
-        let effective = Effective {
-            config_path: dir.join("config.json"),
-            socket_path: dir.join("whirl.sock"),
-            state_dir: state_dir.clone(),
-            cache_dir: dir.join("cache"),
-            backend: Backend::Noop,
-            config: RwLock::new(config),
-        };
-        let worker = crate::worker::Worker::new(
-            PathBuf::from("whirl-worker"),
-            effective.config_path.clone(),
-            Backend::Noop,
-            effective.state_dir.clone(),
-            effective.cache_dir.clone(),
-        );
-        let lock = crate::lock::take_as(&state_dir, attempt).expect("the lock is taken");
-        let mut daemon = Daemon::load(effective, worker, lock);
+        let mut daemon = crate::testkit::daemon_holding(dir, attempt, config);
         if attempt == Attempt::Unsupported {
             daemon.rotate_attempt = Some(Attempt::Unsupported);
         }

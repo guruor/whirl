@@ -168,6 +168,19 @@ impl Bus {
         &self.subscribers
     }
 
+    /// How many connections are on the stream. The daemon has no use for this —
+    /// `broadcast` is the whole of its side — but a test of 2.9's "the only
+    /// failure a subscriber can cause, and it is confined to that subscriber"
+    /// needs to know when the bus let go of one, and the alternative is guessing
+    /// how much traffic fills a socket buffer.
+    #[cfg(test)]
+    pub(crate) fn subscriber_count(&self) -> usize {
+        self.subscribers()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     /// Send one line to every subscriber and restart the quiet period. Never
     /// blocks and never fails the caller: a subscriber whose queue is full is
     /// removed, and its connection ends when it notices the channel is gone.
