@@ -16,7 +16,7 @@ decision.
 |---|---|
 | `docs/`, `prototype/` | exist |
 | the Cargo workspace (`crates/`) | exists on pull request #1: `whirl-core`, `whirld`, `whirl-cli`, `whirl-worker`, four members and no third-party dependency |
-| `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36240381639`, thirteen jobs, on the tip of `development` |
+| `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36240381639`, thirteen jobs, on the tip of `development`. The `coverage` job added since is the fourteenth, and it has run on a runner: run `37462295465`, the whole workflow green, the coverage job's log ending in the floor holding (section 4, "What has and has not been verified") |
 | `.github/workflows/release.yml` | written here, lints clean, and **has run** three times: green once, on the throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag; and red twice since, on the throwaway guard probes `v0.0.1-rc.test-guard`, run `36156068912`, and `v0.0.1-rc.review-guard-t6d652592`, run `36157463795`, where the `guard` job failed because the tag was not on `main` and `build` and `release` were skipped, so neither probe built or published anything. No tag and no release exists on `origin` today |
 | a running daemon reachable from a checkout | yes: the section 7 sequence below, driven from a fresh clone of pull request #1 on a scratch socket, no wallpaper touched |
 | anything that sets a real wallpaper in CI | never, by design (see "What CI cannot prove") |
@@ -304,6 +304,7 @@ What each CI job exercises, and how to run the same thing locally.
 | `fmt` | ubuntu | `bash scripts/ci.sh fmt` | formatting only |
 | `clippy` | ubuntu, macos, windows | `bash scripts/ci.sh clippy` | all three `cfg` paths compile clean, including the three transports and the Windows named-pipe code |
 | `test` | ubuntu, macos, windows | `bash scripts/ci.sh test` | unit tests plus the integration tests; `WHIRL_BACKEND=noop` |
+| `coverage` | macos | `bash scripts/ci.sh coverage` plus `upload-artifact` | the same suite under `cargo-llvm-cov`, the per-file table it prints, and the floor and per-file baseline in `.config/coverage-baseline.json` |
 | `msrv` | ubuntu | `bash scripts/ci.sh msrv` | the declared MSRV is real |
 | `guards` | ubuntu | `bash scripts/ci.sh guards` | zero third-party dependencies, and the binary size caps |
 | `artifacts` | ubuntu, macos, windows | `bash scripts/ci.sh artifacts` plus `upload-artifact` | the release build produces `whirld`, `whirl`, `whirl-worker` on every platform |
@@ -357,6 +358,7 @@ proves:
 | `fmt` | formatting, and nothing else |
 | `clippy` | every `cfg` path compiles clean under `-D warnings` |
 | `test` | the suite with one process per test (cargo-nextest), then the doctests, which nextest does not run. The whole workspace is built first, which the integration tests need because they spawn the worker binary |
+| `coverage` | the same suite under `cargo-llvm-cov`, the per-file table `cargo llvm-cov report` prints from the profile the run left, and the two rules `scripts/coverage-check.py` applies to them: the workspace total against the floor in `.config/coverage-baseline.json`, and every file that baseline names against its own uncovered-line count. It removes the profile files the spawned worker leaves in a crate directory (the spawner hands the worker a fresh environment, so it never sees `LLVM_PROFILE_FILE`), so the checkout is as clean after it as before. Not part of `local` or `all`: it is the slowest mode, and it needs `cargo-llvm-cov` and the pinned toolchain's LLVM tools, which no other mode uses |
 | `msrv` | 1.85.0 accepts the code, so `rust-version` is a fact and not a claim |
 | `guards` | zero third-party dependencies, and the release binaries fit the caps in `docs/architecture.md` R2 |
 | `artifacts` | the release build produces the three binaries |
@@ -369,6 +371,12 @@ proves:
 - **the `secrets` job.** No mode covers gitleaks: the scanner is a CI-only binary
   a contributor cannot run, so its absence is deliberate (section 4). `all` says
   nothing about it, and a green `all` is not evidence that the scan would pass.
+- **coverage.** `coverage` is a mode but not part of `local` or `all`: it is the
+  slowest of them (measured on this machine, arm64: 2m19s from a cold instrumented
+  build, 82s warm) and it needs `cargo-llvm-cov` and the pinned toolchain's LLVM
+  tools, which nothing else in the gate uses. Run `./scripts/ci.sh coverage` when a
+  change moves tests or code, and know that a green `all` says nothing about the
+  floor in `.config/coverage-baseline.json`.
 - **Windows execution.** `windows` compiles for the Windows target and runs
   nothing; `test (windows-latest)` on a Windows runner is the only thing that runs
   Windows code, and it is not something this machine can do (below).
@@ -384,9 +392,11 @@ proves:
 for the whole of `test` and for `msrv`'s test step, so a new test cannot forget
 it. A mode that cannot run says why and exits 2, naming what is missing:
 `cargo-nextest` 0.9.146 for `test` (pinned in `.config/nextest.toml`), Docker for
-the container modes, the 1.85.0 toolchain for `msrv`. There is no fallback from
-`test` to `cargo test`: the two commands prove different things, and the gate does
-not guess.
+the container modes, the 1.85.0 toolchain for `msrv`, and `cargo-llvm-cov` for
+`coverage`, which needs the pinned toolchain's LLVM tools with it
+(`rustup component add llvm-tools-preview`: the `coverage` job installs both, and
+no other mode wants either). There is no fallback from `test` to `cargo test`:
+the two commands prove different things, and the gate does not guess.
 
 **From a fresh clone to `./scripts/ci.sh all`, in four prerequisites.** The
 toolchain comes from `rust-toolchain.toml` (rustup installs `1.94.0` on the first
@@ -506,8 +516,9 @@ not the evidence.
 
 ## 4. Continuous integration
 
-`.github/workflows/ci.yml` is the gate. Seven jobs: `fmt`, `clippy` (three OS),
-`test` (three OS), `msrv`, `guards`, `secrets`, `artifacts` (three OS). It runs
+`.github/workflows/ci.yml` is the gate. Eight jobs: `fmt`, `clippy` (three OS),
+`test` (three OS), `coverage` (macOS), `msrv`, `guards`, `secrets`, `artifacts`
+(three OS). It runs
 on pushes to `main` **and to `development`**, on every pull request whose base is
 either, and by hand with `workflow_dispatch`. It declares
 `permissions: contents: read`, so a compromised step cannot write to the
@@ -533,6 +544,26 @@ a scan that checked nothing and a scan that found nothing print the same
 this project's own as well as exemptions, and each exemption carries a reason that
 the job prints on every run.
 
+`coverage` is the job that measures rather than checks, and the reason it is one
+platform is in the workflow above it. It runs the same suite as `test` under
+`cargo-llvm-cov` on the pinned toolchain, prints the per-file table, and reads two
+rules out of `.config/coverage-baseline.json`: the workspace's total line coverage
+against the floor, and every file the baseline names against its own uncovered-line
+count. The floor is set from the measurement that file records (84.24% at
+`a7e56c7` on 2026-10-06) and sits under it at 84.1, because the same tree and the
+same suite vary by a few lines between runs and a floor set at the measurement is
+a red job on a green tree: seven runs of it are recorded in
+`scripts/coverage-check.py`, and the room that noise needs is `slack_lines` in the
+same file. The per-file rule is the half the floor cannot express: the total is a
+sum, so one file can slide while another's gain pays for it and the total sits
+still, and a slide that stays inside the floor's own room is under it. A file at
+15% is what the rule is for, and `crates/whirld/src/socket.rs` (440 lines) is that
+file here. `scripts/coverage-check.py` is the
+comparison, and its header is the reasoning for both rules, including why the rule
+counts uncovered lines per file and why a slack sits under it, and where the two
+rules overlap and where the hole between them is. The report is uploaded whether
+the job passes or fails, because a red run is what it is read for.
+
 The rule that keeps it honest: **every command a contributor is expected to run
 before opening a pull request is a mode of `scripts/ci.sh` (section 3), and each
 mode is the matching job's command, verbatim.** A check that is not a mode of the
@@ -549,7 +580,7 @@ name.
 adds and the tree the checkout publishes, and a contributor cannot run that
 scanner on their machine, so there is no honest mode to write and none is
 pretended. Its consequence is stated where it belongs: `all` does not cover it,
-and section 3 lists it among the three things `all` leaves unproven.
+and section 3 lists it among the four things `all` leaves unproven.
 
 Caching is `Swatinem/rust-cache`, pinned like every other action here. It caches
 `~/.cargo` and `./target`, and it keys them on the job, on the rustc release and
@@ -570,8 +601,9 @@ before it is used as a range.
 ### What has and has not been verified about the workflows
 
 - **Verified on this machine:** `actionlint` (1.7.11) reports no problems for this
-  file and for `.github/workflows/release.yml`, and a real YAML parse finds 7 jobs
-  and the three triggers here, and the 2 jobs of the release workflow with its one
+  file and for `.github/workflows/release.yml`, and a real YAML parse finds 8 jobs
+  and the three triggers here (7 when this list landed: `coverage` is the eighth),
+  and the 2 jobs of the release workflow with its one
   trigger. Both commands and their output are in the pull request that added
   this list (pull request #5, "What I ran, and what it said").
 - **Verified when this guide was written, and now superseded:** `gh run list -R
@@ -621,6 +653,34 @@ before it is used as a range.
   left (fails, naming it), and a tag that is not release-shaped (fails). The probe,
   its output and the case list are in the pull request that added this bullet
   (pull request #5, "What I ran, and what it said").
+- **The `coverage` job's two rules were made to fail before they were trusted**, on
+  scratch copies of this tree rather than on a branch, because the mode and the
+  baseline are new with the job. Deleting `crates/whirld/tests/control_socket.rs`
+  (the integration test that drives the daemon) took the workspace to 83.42%
+  against its 84.1 floor and pushed five files past their baselines, the soft spot
+  `crates/whirld/src/socket.rs` (373 in the baseline, 389 measured) among them: the
+  check exited 1 and its six `::error::coverage` lines name each file. The same
+  mode on the tree as it stands is green on all seven runs recorded in
+  `scripts/coverage-check.py`, and a fixture built from one of those exports (one
+  file's covered count lowered by ten lines, nothing else) shows the per-file rule
+  failing while the floor holds, so the second rule is not a restatement of the
+  first. `actionlint` was not run over the eighth job here: the `actionlint` on
+  this machine is a mise shim with no version pinned, so running it would install
+  one. A YAML parse (`yaml.safe_load`: 8 jobs, the triggers, and the coverage job's
+  steps) is what checked this file. The three commands the neighbouring jobs run
+  were run on the same tree and all exited 0: `cargo +1.94.0 test --workspace`
+  (292 passed, 1 ignored, across 10 test targets), then `fmt` and `clippy` on the
+  same pinned toolchain (`cargo +1.94.0 fmt --all -- --check` and
+  `cargo +1.94.0 clippy --workspace --all-targets -- -D warnings`). The job
+  itself has run on its runner since: run `37462295465`, the whole workflow
+  green, fourteen jobs. The coverage job's check printed
+  `the floor holds; every file the baseline names is at or above it`, at 13653
+  lines, 2151 uncovered, 84.25%, against the 84.1 floor, under `rustc 1.94.0`
+  and `cargo-llvm-cov 0.9.1`, which the mode's own first line names. The runner
+  measures the same workspace as this machine, to the line. The one per-file
+  difference is inside the slack the per-file rule leaves:
+  `crates/whirld/src/worker.rs` measured 90 uncovered there and 86 here, against
+  a baseline of 87 and a slack of 6.
 - **One annotation on both runs, recorded because it is not a failure:** `Node.js
   20 is deprecated. The following actions target Node.js 20 but are being forced to
   run on Node.js 24: actions/checkout@11d5960a, actions/upload-artifact@ea165f8d`.
@@ -638,6 +698,7 @@ does not repeat the value anywhere else:
 | the toolchain version | `rust-toolchain.toml` | a one-line pull request; CI picks it up through `rustup show` |
 | the MSRV | `rust-version` in the workspace manifest, plus the `msrv` job | the four steps above, in one commit |
 | the pinned action versions, and the gitleaks version and its digest | `.github/workflows/ci.yml` and `.github/workflows/release.yml` | Dependabot or a deliberate pull request. An action added from now on is pinned to a full commit SHA, never to a tag or a branch: a tag can be moved under the repository between two runs |
+| the coverage floor, the per-file baseline and the slack under them | `.config/coverage-baseline.json` | raise `floor.lines_percent` by hand, to `as_measured_percent`, when a change earns it; `--update` re-measures the per-file numbers and never touches the floor (`scripts/coverage-check.py`) |
 | the two vendor prices and their URLs | the Sources list at the end of this document, each with its retrieval date | re-fetch, and correct the date, before repeating the number as a fact |
 | the platform facts | `docs/research/*`, each with its own retrieval date and provenance | a research note, not an edit here |
 

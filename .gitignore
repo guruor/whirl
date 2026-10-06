@@ -1,5 +1,11 @@
 # Rust
 target/
+# llvm-cov profile droppings. The `coverage` mode removes these; this is the
+# second line of defence, for a worker that is still writing one as the run
+# finishes. They do not land in `target/` with the rest of the build output
+# because the spawner hands the worker a fresh environment, so it never sees the
+# `LLVM_PROFILE_FILE` cargo-llvm-cov sets.
+default_*.profraw
 **/*.rs.bk
 Cargo.lock.bak
 

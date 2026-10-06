@@ -9,10 +9,18 @@ name: ci
 # contributor runs before opening a pull request lives in `scripts/ci.sh`, which
 # is the only copy of them. Each job below calls one mode of that file, so a
 # local run and this workflow cannot drift: `bash scripts/ci.sh fmt`, `clippy`,
-# `test`, `msrv`, `guards`, `artifacts`. The one job this file still owns is
-# `secrets`: a developer cannot run gitleaks' pinned binary by hand. The one step
-# it still owns is the `guards` job's R2 dependency check: it reads a dependency
-# edge rather than running a command, and `guards` is already a mode.
+# `test`, `coverage`, `msrv`, `guards`, `artifacts`. The one job this file still
+# owns is `secrets`: a developer cannot run gitleaks' pinned binary by hand. The
+# one step it still owns is the `guards` job's R2 dependency check: it reads a
+# dependency edge rather than running a command, and `guards` is already a mode.
+#
+# `coverage` is the eighth job and the second half of this file's own work: it
+# installs `cargo-llvm-cov` (pinned, from its released binary, the way `test`
+# installs cargo-nextest) and `llvm-tools-preview` for the pinned toolchain, runs
+# `bash scripts/ci.sh coverage`, and uploads the report the mode wrote. The floor
+# it enforces, and the per-file baseline beside it, are in
+# `.config/coverage-baseline.json`; `scripts/coverage-check.py` is the comparison;
+# the job above the `msrv` job below says why it is one platform.
 # `bash scripts/ci.sh windows` is the one check here that is not a job: it
 # compiles the #[cfg(windows)] code on a laptop, and it cannot replace
 # `test (windows-latest)`, which runs it.
@@ -124,6 +132,53 @@ jobs:
       - name: the test suite, then the doctests
         run: bash scripts/ci.sh test
         shell: bash
+
+  # One platform, and macOS. Line coverage is the compiler's output and the
+  # platform backends, the transports and their `cfg` gates differ per operating
+  # system, so a floor can only be enforced against the platform it was measured
+  # on: `.config/coverage-baseline.json` names the platform it was measured on and
+  # `scripts/coverage-check.py` refuses to compare another one. That measurement is
+  # macOS, so a macos-latest runner is the only place the number in this repository
+  # is produced, and the gate's own container mode is where a Linux measurement
+  # would be taken. The suite itself is the same on all three platforms
+  # (docs/development.md section 3), so a second and third runner would add the
+  # same measurement three times and disagree about it.
+  coverage:
+    name: coverage (macos-latest)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install the pinned toolchain and its components
+        run: rustup show
+      # The coverage run needs the LLVM tools for the pinned toolchain. The
+      # component is not in rust-toolchain.toml because no other job uses it and
+      # every other job would then download it. `rustup` resolves the toolchain
+      # from the checkout's rust-toolchain.toml here, exactly as `rustup show`
+      # above does.
+      - name: Install the pinned toolchain's llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+      # Installed from its released binary through the same pinned action the
+      # `test` job uses for cargo-nextest, at the version this machine measured
+      # with: the prebuilt asset, not a build, so the job adds no compile minutes
+      # for its own tooling.
+      - name: Install the coverage tool, pinned
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the suite under coverage, the per-file table, and the floor
+        run: bash scripts/ci.sh coverage
+        shell: bash
+      # The report is what a red run is read for, so it is uploaded whether the
+      # step above passed or failed. A report that was never written is not a
+      # second failure of the same run: the failing step above already named the
+      # reason.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: coverage-${{ runner.os }}-${{ github.sha }}
+          path: target/coverage/
+          if-no-files-found: warn
 
   msrv:
     name: msrv (1.85.0)
