@@ -12,6 +12,11 @@
 //! interpreter: the same binary they are verifying writes the report. Nothing
 //! here opens a socket, reads a config, or reaches the network.
 //!
+//! The platform a run is reported for is the host's, decided at the command's
+//! edge ([`run`]) and passed down as a plain value ([`build`]). No flag, no
+//! environment variable and no file lets a caller report a run for a machine
+//! nobody ran; a test, which is not a caller, pins the platform it means.
+//!
 //! The rule that decides every judgement call ([`run`]): **verdicts come from
 //! the run, and an item the run did not exercise is not a pass.** An item with
 //! no observation is reported `not-run`; an observation that claims a verdict
@@ -308,6 +313,10 @@ const CHECKLISTS: &[&Checklist] = &[&MACOS, &WINDOWS, &LINUX];
 /// The checklist that belongs to the platform this binary was built for.
 /// `None` on a platform whirl does not ship a setter for, which is the same
 /// refusal as asking for another platform's checklist.
+///
+/// Only [`run`], the command's edge, calls this. Everything below takes the
+/// platform as a value, so a test can pin the platform it means instead of
+/// inheriting whichever machine it happens to run on.
 fn platform_checklist() -> Option<&'static Checklist> {
     match std::env::consts::OS {
         "macos" => Some(&MACOS),
@@ -389,8 +398,21 @@ struct Run {
 }
 
 /// `whirl report`. The argument list is everything after the verb.
+///
+/// The platform is decided here, at the command's edge, from the machine this
+/// binary is running on, and handed to [`build`] as a value. That split is the
+/// point: a row is a claim about a machine, so nothing a caller can type moves
+/// the platform, and everything below this line is ordinary code the tests can
+/// drive with the platform they mean.
 pub fn run(args: &[String]) -> ExitCode {
-    match build(args) {
+    let Some(platform) = platform_checklist() else {
+        eprintln!(
+            "whirl: report: this build has no checklist for the platform it runs on ({}); whirl ships a setter for macOS, Windows and Linux only",
+            std::env::consts::OS
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    };
+    match build(args, platform) {
         Ok(run) => match write(&run) {
             Ok(()) => {
                 let counts = run.counts();
@@ -497,7 +519,14 @@ impl Flags {
     }
 }
 
-fn build(args: &[String]) -> Result<Run, Refusal> {
+/// Build the run the arguments describe, reported for `platform`.
+///
+/// `platform` is the platform the run happened on, taken as a value rather than
+/// looked up here: [`run`] passes the host's, and a test passes the platform it
+/// means, so what a test proves does not depend on the machine it is compiled
+/// on. `--checklist` must name that platform's checklist; another platform's is
+/// refused, because this binary runs on the machine under test.
+fn build(args: &[String], platform: &'static Checklist) -> Result<Run, Refusal> {
     let mut flags = Flags::parse(args)?;
 
     let checklist_name = flags.require_text("checklist")?;
@@ -511,25 +540,15 @@ fn build(args: &[String]) -> Result<Run, Refusal> {
                 .join(", ")
         ))
     })?;
-    // The emitter runs on the machine under test, so the checklist it is asked
-    // for is the platform it is on. Asking for another platform's checklist is a
-    // refusal rather than a report full of fields this machine has no value for.
-    match platform_checklist() {
-        Some(platform) if platform.name == checklist.name => {}
-        Some(platform) => {
-            return Err(Refusal::Run(format!(
-                "the {} checklist cannot be reported from a {} machine; this binary is on {}",
-                checklist.name,
-                std::env::consts::OS,
-                platform.name
-            )));
-        }
-        None => {
-            return Err(Refusal::Run(format!(
-                "this build has no checklist for the platform it runs on ({}); whirl ships a setter for macOS, Windows and Linux only",
-                std::env::consts::OS
-            )));
-        }
+    // The run is reported for the platform it happened on, and `--checklist`
+    // must name that platform's own checklist. Asking for another platform's is
+    // a refusal rather than a report full of fields this machine has no value
+    // for, and the refusal names the checklist that was asked for.
+    if checklist.name != platform.name {
+        return Err(Refusal::Run(format!(
+            "the {} checklist cannot be reported from a {} machine; this binary is on {}",
+            checklist.name, platform.name, platform.name
+        )));
     }
 
     let observations = flags.require_text("observations")?;
@@ -614,7 +633,7 @@ fn build(args: &[String]) -> Result<Run, Refusal> {
 
     Ok(Run {
         checklist,
-        platform: std::env::consts::OS,
+        platform: platform.name,
         build_version,
         build_commit,
         backend,
@@ -1229,8 +1248,10 @@ mod tests {
         }
     }
 
-    fn args(fixture: &Fixture, extra: &[&str]) -> Vec<String> {
-        let platform = platform_checklist().expect("a checklist for this platform");
+    /// The command line for one run, reported for `platform`. The extra bullet
+    /// the platform's section needs beyond the run line is added here, so a test
+    /// that pins a platform gets the flags that platform's row requires.
+    fn args(fixture: &Fixture, platform: &Checklist, extra: &[&str]) -> Vec<String> {
         let mut args: Vec<String> = [
             "--checklist",
             platform.name,
@@ -1269,8 +1290,8 @@ mod tests {
         for value in extra {
             args.push((*value).to_string());
         }
-        // macOS and Windows both need their extra bullet's flag; this test's
-        // platform is whichever one it is compiled on.
+        // macOS and Windows both need their extra bullet's flag, and the
+        // platform is the one the test pinned, not the one it runs on.
         match platform.extra {
             Extra::Macos => {
                 args.push("--signed".to_string());
@@ -1287,66 +1308,90 @@ mod tests {
         args
     }
 
-    fn build_from(fixture: &Fixture, extra: &[&str]) -> Result<Run, Refusal> {
-        build(&args(fixture, extra))
+    fn build_from(
+        fixture: &Fixture,
+        platform: &'static Checklist,
+        extra: &[&str],
+    ) -> Result<Run, Refusal> {
+        build(&args(fixture, platform, extra), platform)
+    }
+
+    /// A JSON string literal, escaped by the writer the report itself uses, so a
+    /// test can build an observations document around an item's own `what` text
+    /// without escaping it by hand.
+    fn quoted(value: &str) -> String {
+        let mut out = String::new();
+        write_json_string(&mut out, value);
+        out
     }
 
     #[test]
     fn a_run_with_no_observations_for_an_item_reports_it_not_run() {
         // One item observed and passing; the checklist's other items are
         // supplied by no observation at all, and the rule is that they are not
-        // passes: they are not-run.
-        let fixture = fixture(
-            "not-run",
-            r#"{ "items": [ { "item": "U6", "verdict": "pass", "evidence": "observed" } ] }"#,
-        );
-        let run = build_from(&fixture, &[]).expect("a run with one observation");
-        let unobserved = run
-            .items
-            .iter()
-            .find(|item| item.item.id == "V1")
-            .expect("V1 is in the checklist");
-        assert_eq!(unobserved.verdict, Verdict::NotRun);
-        assert_eq!(unobserved.evidence, None);
-        let observed = run
-            .items
-            .iter()
-            .find(|item| item.item.id == "U6")
-            .expect("U6 is in the checklist");
-        assert_eq!(observed.verdict, Verdict::Pass);
-        // The count is the checklist's size, not the observations' size.
-        let counts = run.counts();
-        assert_eq!(counts.total, run.checklist.items.len());
-        assert_eq!(counts.pass, 1);
-        assert_eq!(counts.not_run, run.checklist.items.len() - 1);
+        // passes: they are not-run. Rendered for every platform the release
+        // notes carry a row for, so the rule is not proven on the author's
+        // machine alone.
+        for platform in CHECKLISTS.iter().copied() {
+            let observed_id = platform.items[0].id;
+            let unobserved_id = platform.items[1].id;
+            let observations = format!(
+                r#"{{ "items": [ {{ "item": "{observed_id}", "verdict": "pass", "evidence": "observed" }} ] }}"#
+            );
+            let fixture = fixture(&format!("not-run-{}", platform.name), &observations);
+            let run = build_from(&fixture, platform, &[]).expect("a run with one observation");
+            let unobserved = run
+                .items
+                .iter()
+                .find(|item| item.item.id == unobserved_id)
+                .expect("the unobserved item is in the checklist");
+            assert_eq!(unobserved.verdict, Verdict::NotRun);
+            assert_eq!(unobserved.evidence, None);
+            let observed = run
+                .items
+                .iter()
+                .find(|item| item.item.id == observed_id)
+                .expect("the observed item is in the checklist");
+            assert_eq!(observed.verdict, Verdict::Pass);
+            // The count is the checklist's size, not the observations' size.
+            let counts = run.counts();
+            assert_eq!(counts.total, run.checklist.items.len());
+            assert_eq!(counts.pass, 1);
+            assert_eq!(counts.not_run, run.checklist.items.len() - 1);
+        }
     }
 
     #[test]
     fn a_verdict_with_no_evidence_is_refused_rather_than_printed() {
-        let fixture = fixture(
-            "no-evidence",
-            r#"{ "items": [ { "item": "V1", "verdict": "pass" } ] }"#,
-        );
-        match build_from(&fixture, &[]) {
-            Err(Refusal::Run(message)) => {
-                assert!(message.contains("V1"), "{message}");
-                assert!(message.contains("no evidence"), "{message}");
+        for platform in CHECKLISTS.iter().copied() {
+            let id = platform.items[0].id;
+            let observations =
+                format!(r#"{{ "items": [ {{ "item": "{id}", "verdict": "pass" }} ] }}"#);
+            let fixture = fixture(&format!("no-evidence-{}", platform.name), &observations);
+            match build_from(&fixture, platform, &[]) {
+                Err(Refusal::Run(message)) => {
+                    assert!(message.contains(id), "{message}");
+                    assert!(message.contains("no evidence"), "{message}");
+                }
+                other => panic!("expected a refusal naming the missing evidence: {other:?}"),
             }
-            other => panic!("expected a refusal naming the missing evidence: {other:?}"),
         }
     }
 
     #[test]
     fn a_missing_build_identity_is_refused_and_named() {
+        // A run is reported for a pinned platform here; this test is about the
+        // missing flag, and macOS is the checklist whose row asks for the most.
+        let platform = &MACOS;
         let fixture = fixture("no-build", r#"{ "items": [] }"#);
-        let mut args = args(&fixture, &[]);
+        let mut args = args(&fixture, platform, &[]);
         // Drop `--build-commit <sha>`, and its value with it.
         let position = args
             .iter()
             .position(|arg| arg == "--build-commit")
             .expect("the flag is in the fixture");
         args.drain(position..position + 2);
-        match build(&args) {
+        match build(&args, platform) {
             Err(Refusal::Run(message)) => {
                 assert!(message.contains("--build-commit"), "{message}");
             }
@@ -1356,174 +1401,221 @@ mod tests {
 
     #[test]
     fn an_unknown_checklist_item_is_refused_and_named() {
-        let fixture = fixture(
-            "unknown-item",
-            r#"{ "items": [ { "item": "V99", "verdict": "pass", "evidence": "x" } ] }"#,
-        );
-        match build_from(&fixture, &[]) {
-            Err(Refusal::Run(message)) => {
-                assert!(message.contains("V99"), "{message}");
-                assert!(message.contains("not in the"), "{message}");
+        // An item id is known only in its own checklist. A run reported for one
+        // platform whose observations name another platform's item is refused,
+        // and the message names the checklist that does not hold it. This is the
+        // refusal a Linux or Windows host hit by accident while the emitter's
+        // tests were written for macOS.
+        for platform in CHECKLISTS.iter().copied() {
+            let foreign = CHECKLISTS
+                .iter()
+                .copied()
+                .find(|list| list.name != platform.name)
+                .expect("another platform's checklist")
+                .items[0]
+                .id;
+            let observations = format!(
+                r#"{{ "items": [ {{ "item": "{foreign}", "verdict": "pass", "evidence": "x" }} ] }}"#
+            );
+            let fixture = fixture(&format!("unknown-item-{}", platform.name), &observations);
+            match build_from(&fixture, platform, &[]) {
+                Err(Refusal::Run(message)) => {
+                    assert!(message.contains(foreign), "{message}");
+                    assert!(
+                        message.contains(platform.name),
+                        "the message names the checklist that does not hold it: {message}"
+                    );
+                    assert!(message.contains("not in the"), "{message}");
+                }
+                other => panic!("expected a refusal naming the unknown item: {other:?}"),
             }
-            other => panic!("expected a refusal naming the unknown item: {other:?}"),
         }
     }
 
     #[test]
     fn the_other_platform_s_checklist_is_refused() {
-        let fixture = fixture("other-platform", r#"{ "items": [] }"#);
-        let other = CHECKLISTS
-            .iter()
-            .find(|list| list.name != platform_checklist().expect("a checklist").name)
-            .expect("a checklist that is not this platform's");
-        let mut args = args(&fixture, &[]);
-        let position = args
-            .iter()
-            .position(|arg| arg == "--checklist")
-            .expect("the flag is in the fixture");
-        args[position + 1] = other.name.to_string();
-        match build(&args) {
-            Err(Refusal::Run(message)) => {
-                assert!(message.contains(other.name), "{message}");
+        // Every platform refuses every other platform's checklist, in both
+        // directions, rather than reporting a run for a machine nobody ran.
+        for platform in CHECKLISTS.iter().copied() {
+            let other = CHECKLISTS
+                .iter()
+                .copied()
+                .find(|list| list.name != platform.name)
+                .expect("a checklist that is not this platform's");
+            let fixture = fixture(
+                &format!("other-platform-{}", platform.name),
+                r#"{ "items": [] }"#,
+            );
+            let mut args = args(&fixture, platform, &[]);
+            let position = args
+                .iter()
+                .position(|arg| arg == "--checklist")
+                .expect("the flag is in the fixture");
+            args[position + 1] = other.name.to_string();
+            match build(&args, platform) {
+                Err(Refusal::Run(message)) => {
+                    assert!(message.contains(other.name), "{message}");
+                }
+                other => {
+                    panic!("expected a refusal for the wrong platform's checklist: {other:?}")
+                }
             }
-            other => panic!("expected a refusal for the wrong platform's checklist: {other:?}"),
         }
     }
 
     #[test]
     fn a_correction_and_a_caveat_reach_both_outputs() {
-        let fixture = fixture(
-            "annotations",
-            r#"{ "items": [
-                { "item": "V1", "verdict": "pass", "evidence": "ran",
-                  "correction": "the probe's template ended in the wrong place",
-                  "caveat": "this proves the route, not the placement" }
-            ] }"#,
-        );
-        let run = build_from(&fixture, &[]).expect("a run");
-        let report = run.report_json();
-        assert!(
-            report.contains("the probe's template ended in the wrong place"),
-            "{report}"
-        );
-        assert!(
-            report.contains("this proves the route, not the placement"),
-            "{report}"
-        );
-        let markdown = run.row_markdown();
-        assert!(
-            markdown.contains("Correction to this item's probe:"),
-            "{markdown}"
-        );
-        assert!(
-            markdown.contains("the probe's template ended in the wrong place"),
-            "{markdown}"
-        );
-        assert!(
-            markdown.contains("Caveat: this proves the route, not the placement"),
-            "{markdown}"
-        );
+        for platform in CHECKLISTS.iter().copied() {
+            let id = platform.items[0].id;
+            let observations = format!(
+                r#"{{ "items": [
+                    {{ "item": "{id}", "verdict": "pass", "evidence": "ran",
+                      "correction": "the probe's template ended in the wrong place",
+                      "caveat": "this proves the route, not the placement" }}
+                ] }}"#
+            );
+            let fixture = fixture(&format!("annotations-{}", platform.name), &observations);
+            let run = build_from(&fixture, platform, &[]).expect("a run");
+            let report = run.report_json();
+            assert!(
+                report.contains("the probe's template ended in the wrong place"),
+                "{report}"
+            );
+            assert!(
+                report.contains("this proves the route, not the placement"),
+                "{report}"
+            );
+            let markdown = run.row_markdown();
+            assert!(
+                markdown.contains("Correction to this item's probe:"),
+                "{markdown}"
+            );
+            assert!(
+                markdown.contains("the probe's template ended in the wrong place"),
+                "{markdown}"
+            );
+            assert!(
+                markdown.contains("Caveat: this proves the route, not the placement"),
+                "{markdown}"
+            );
+        }
     }
 
     #[test]
     fn the_row_carries_the_platform_s_heading_and_no_placeholder() {
-        let fixture = fixture(
-            "row",
-            r#"{ "items": [ { "item": "V1", "verdict": "pass", "evidence": "ran" } ] }"#,
-        );
-        let run = build_from(&fixture, &[]).expect("a run");
-        let markdown = run.row_markdown();
-        let platform = platform_checklist().expect("a checklist");
-        assert!(
-            markdown.starts_with(&format!("### {}\n", platform_heading(platform.name))),
-            "{markdown}"
-        );
-        assert!(markdown.contains("- checklist: "), "{markdown}");
-        assert!(markdown.contains(&run.by), "{markdown}");
-        assert!(
-            markdown.contains("not run, with the reason for each"),
-            "{markdown}"
-        );
-        // The release workflow refuses a final release whose notes still hold a
-        // `<...>` placeholder. The row introduces none.
-        assert!(
-            !markdown.contains('<'),
-            "the row carries no placeholder: {markdown}"
-        );
-        assert!(
-            !markdown.contains('>'),
-            "the row carries no placeholder: {markdown}"
-        );
+        // The heading is the checklist's, and every platform's row is rendered
+        // here rather than only the one the test happens to run on.
+        for platform in CHECKLISTS.iter().copied() {
+            let observations = format!(
+                r#"{{ "items": [ {{ "item": "{}", "verdict": "pass", "evidence": "ran" }} ] }}"#,
+                platform.items[0].id
+            );
+            let fixture = fixture(&format!("row-{}", platform.name), &observations);
+            let run = build_from(&fixture, platform, &[]).expect("a run");
+            let markdown = run.row_markdown();
+            assert_eq!(run.platform, platform.name, "{markdown}");
+            assert!(
+                markdown.starts_with(&format!("### {}\n", platform_heading(platform.name))),
+                "{markdown}"
+            );
+            assert!(markdown.contains("- checklist: "), "{markdown}");
+            assert!(markdown.contains(&run.by), "{markdown}");
+            assert!(
+                markdown.contains("not run, with the reason for each"),
+                "{markdown}"
+            );
+            // The release workflow refuses a final release whose notes still hold
+            // a `<...>` placeholder. The row introduces none.
+            assert!(
+                !markdown.contains('<'),
+                "the row carries no placeholder: {markdown}"
+            );
+            assert!(
+                !markdown.contains('>'),
+                "the row carries no placeholder: {markdown}"
+            );
+        }
     }
 
     #[test]
     fn an_existing_output_is_refused_rather_than_overwritten() {
-        let fixture = fixture("exists", r#"{ "items": [] }"#);
-        std::fs::write(fixture.dir.join("report.json"), b"an earlier report")
-            .expect("a decoy report");
-        let args = args(&fixture, &[]);
-        match build(&args) {
-            Ok(run) => match write(&run) {
-                Err(message) => {
-                    assert!(message.contains("report.json"), "{message}");
-                    assert!(message.contains("exists"), "{message}");
-                }
-                Ok(()) => panic!("expected the existing report to be refused"),
-            },
-            Err(other) => panic!("expected the run to build: {other:?}"),
+        for platform in CHECKLISTS.iter().copied() {
+            let fixture = fixture(&format!("exists-{}", platform.name), r#"{ "items": [] }"#);
+            std::fs::write(fixture.dir.join("report.json"), b"an earlier report")
+                .expect("a decoy report");
+            let args = args(&fixture, platform, &[]);
+            match build(&args, platform) {
+                Ok(run) => match write(&run) {
+                    Err(message) => {
+                        assert!(message.contains("report.json"), "{message}");
+                        assert!(message.contains("exists"), "{message}");
+                    }
+                    Ok(()) => panic!("expected the existing report to be refused"),
+                },
+                Err(other) => panic!("expected the run to build: {other:?}"),
+            }
+            // The decoy is left exactly as it was, and no row was written.
+            assert_eq!(
+                std::fs::read_to_string(fixture.dir.join("report.json")).expect("the decoy"),
+                "an earlier report"
+            );
+            assert!(!fixture.dir.join("row.md").exists(), "no row was written");
         }
-        // The decoy is left exactly as it was, and no row was written.
-        assert_eq!(
-            std::fs::read_to_string(fixture.dir.join("report.json")).expect("the decoy"),
-            "an earlier report"
-        );
-        assert!(!fixture.dir.join("row.md").exists(), "no row was written");
     }
 
     #[test]
     fn a_completed_run_writes_both_files_and_the_counts_read_back() {
-        let fixture = fixture(
-            "complete",
-            r#"{ "items": [ { "item": "V1", "verdict": "pass", "evidence": "ran" } ] }"#,
-        );
-        let args = args(&fixture, &[]);
-        let run = build(&args).expect("a run");
-        write(&run).expect("both files are written");
+        for platform in CHECKLISTS.iter().copied() {
+            let observations = format!(
+                r#"{{ "items": [ {{ "item": "{}", "verdict": "pass", "evidence": "ran" }} ] }}"#,
+                platform.items[0].id
+            );
+            let fixture = fixture(&format!("complete-{}", platform.name), &observations);
+            let args = args(&fixture, platform, &[]);
+            let run = build(&args, platform).expect("a run");
+            write(&run).expect("both files are written");
 
-        let report = std::fs::read_to_string(fixture.dir.join("report.json")).expect("the report");
-        let parsed = json::parse(&report).expect("the report is JSON");
-        let counts = parsed
-            .as_object()
-            .expect("an object")
-            .iter()
-            .find(|(key, _)| key == "counts")
-            .map(|(_, node)| node)
-            .expect("a counts object");
-        let count_of = |key: &str| {
-            counts
+            let report =
+                std::fs::read_to_string(fixture.dir.join("report.json")).expect("the report");
+            assert!(
+                report.contains(&format!("\"platform\": \"{}\"", platform.name)),
+                "the report names the platform the run was reported for: {report}"
+            );
+            let parsed = json::parse(&report).expect("the report is JSON");
+            let counts = parsed
                 .as_object()
                 .expect("an object")
                 .iter()
-                .find(|(name, _)| name == key)
-                .and_then(|(_, node)| node.as_num())
-                .expect("a count")
-        };
-        assert_eq!(count_of("pass"), 1.0);
-        assert_eq!(count_of("fail"), 0.0);
-        assert_eq!(
-            count_of("not_run") + count_of("pass") + count_of("fail"),
-            count_of("total")
-        );
-        assert!(
-            fixture.dir.join("row.md").exists(),
-            "the row is written too"
-        );
+                .find(|(key, _)| key == "counts")
+                .map(|(_, node)| node)
+                .expect("a counts object");
+            let count_of = |key: &str| {
+                counts
+                    .as_object()
+                    .expect("an object")
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .and_then(|(_, node)| node.as_num())
+                    .expect("a count")
+            };
+            assert_eq!(count_of("pass"), 1.0);
+            assert_eq!(count_of("fail"), 0.0);
+            assert_eq!(
+                count_of("not_run") + count_of("pass") + count_of("fail"),
+                count_of("total")
+            );
+            assert!(
+                fixture.dir.join("row.md").exists(),
+                "the row is written too"
+            );
+        }
     }
 
     #[test]
     fn a_log_that_cannot_be_read_is_refused() {
+        let platform = &MACOS;
         let fixture = fixture("no-log", r#"{ "items": [] }"#);
-        let mut args = args(&fixture, &[]);
+        let mut args = args(&fixture, platform, &[]);
         let position = args
             .iter()
             .position(|arg| arg == "--log")
@@ -1533,7 +1625,7 @@ mod tests {
             .join("does-not-exist.log")
             .to_string_lossy()
             .into_owned();
-        match build(&args) {
+        match build(&args, platform) {
             Err(Refusal::Run(message)) => {
                 assert!(message.contains("cannot be read"), "{message}");
             }
@@ -1544,7 +1636,7 @@ mod tests {
     #[test]
     fn the_digest_is_the_log_s_own_bytes() {
         let fixture = fixture("digest", r#"{ "items": [] }"#);
-        let run = build_from(&fixture, &[]).expect("a run");
+        let run = build_from(&fixture, &MACOS, &[]).expect("a run");
         let mut hasher = Sha256::new();
         hasher.update(b"one probe's output\n");
         assert_eq!(run.log_sha256, hasher.hex());
@@ -1555,61 +1647,76 @@ mod tests {
     fn evidence_that_is_the_item_s_own_name_is_printed_once() {
         // The existing handwritten rows name an item and say no more about it
         // where the run has nothing to add (`[V1] the filesystem probes`). An
-        // evidence string that is the item's own name prints the same way.
-        let fixture = fixture(
-            "print-once",
-            r#"{ "items": [ { "item": "V1", "verdict": "pass", "evidence": "the filesystem probes" } ] }"#,
-        );
-        let run = build_from(&fixture, &[]).expect("a run");
-        let markdown = run.row_markdown();
-        assert!(
-            markdown.contains("    - [V1] the filesystem probes\n"),
-            "the row names the item once: {markdown}"
-        );
-        assert!(
-            !markdown.contains("the filesystem probes: the filesystem probes"),
-            "{markdown}"
-        );
-        // The report still carries the evidence as its own field.
-        assert!(
-            run.report_json()
-                .contains("\"evidence\": \"the filesystem probes\""),
-            "the report keeps the evidence it was given"
-        );
+        // evidence string that is the item's own name prints the same way, on
+        // every platform's row.
+        for platform in CHECKLISTS.iter().copied() {
+            let item = &platform.items[0];
+            let observations = format!(
+                r#"{{ "items": [ {{ "item": {}, "verdict": "pass", "evidence": {} }} ] }}"#,
+                quoted(item.id),
+                quoted(item.what)
+            );
+            let fixture = fixture(&format!("print-once-{}", platform.name), &observations);
+            let run = build_from(&fixture, platform, &[]).expect("a run");
+            let markdown = run.row_markdown();
+            assert!(
+                markdown.contains(&format!("    - [{}] {}\n", item.id, item.what)),
+                "the row names the item once: {markdown}"
+            );
+            assert!(
+                !markdown.contains(&format!("{}: {}", item.what, item.what)),
+                "{markdown}"
+            );
+            // The report still carries the evidence as its own field.
+            assert!(
+                run.report_json()
+                    .contains(&format!("\"evidence\": {}", quoted(item.what))),
+                "the report keeps the evidence it was given"
+            );
+        }
     }
 
     #[test]
     fn a_failed_item_is_named_in_the_row_with_its_evidence() {
-        let fixture = fixture(
-            "failed",
-            r#"{ "items": [ { "item": "V1", "verdict": "fail", "evidence": "the write returned an error the probe could not explain" } ] }"#,
-        );
-        let run = build_from(&fixture, &[]).expect("a run");
-        let markdown = run.row_markdown();
-        assert!(markdown.contains("  - failed:\n"), "{markdown}");
-        assert!(
-            markdown.contains("[V1] the filesystem probes: the write returned an error the probe could not explain"),
-            "{markdown}"
-        );
-        assert_eq!(run.counts().fail, 1);
+        for platform in CHECKLISTS.iter().copied() {
+            let item = &platform.items[0];
+            let observations = format!(
+                r#"{{ "items": [ {{ "item": "{}", "verdict": "fail", "evidence": "the write returned an error the probe could not explain" }} ] }}"#,
+                item.id
+            );
+            let fixture = fixture(&format!("failed-{}", platform.name), &observations);
+            let run = build_from(&fixture, platform, &[]).expect("a run");
+            let markdown = run.row_markdown();
+            assert!(markdown.contains("  - failed:\n"), "{markdown}");
+            assert!(
+                markdown.contains(&format!(
+                    "[{}] {}: the write returned an error the probe could not explain",
+                    item.id, item.what
+                )),
+                "{markdown}"
+            );
+            assert_eq!(run.counts().fail, 1);
+        }
     }
 
     #[test]
     fn the_row_names_the_log_and_the_report_carries_its_path() {
-        let fixture = fixture("log-name", r#"{ "items": [] }"#);
-        let run = build_from(&fixture, &[]).expect("a run");
-        let markdown = run.row_markdown();
-        assert!(
-            markdown.contains(&format!("Log: `run.log` (sha256 `{}`)", run.log_sha256)),
-            "the row names the log by name: {markdown}"
-        );
-        assert!(
-            !markdown.contains(&fixture.dir.to_string_lossy().to_string()),
-            "the public row carries no absolute path: {markdown}"
-        );
-        assert!(
-            run.report_json().contains(&fixture.log),
-            "the report keeps the path the caller named"
-        );
+        for platform in CHECKLISTS.iter().copied() {
+            let fixture = fixture(&format!("log-name-{}", platform.name), r#"{ "items": [] }"#);
+            let run = build_from(&fixture, platform, &[]).expect("a run");
+            let markdown = run.row_markdown();
+            assert!(
+                markdown.contains(&format!("Log: `run.log` (sha256 `{}`)", run.log_sha256)),
+                "the row names the log by name: {markdown}"
+            );
+            assert!(
+                !markdown.contains(&fixture.dir.to_string_lossy().to_string()),
+                "the public row carries no absolute path: {markdown}"
+            );
+            assert!(
+                run.report_json().contains(&fixture.log),
+                "the report keeps the path the caller named"
+            );
+        }
     }
 }
