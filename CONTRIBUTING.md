@@ -12,7 +12,8 @@ run a rotation without touching your own wallpaper.
 ```
 
 That is one script whose modes are the commands CI's jobs run: `fmt`, `clippy`,
-`test`, `msrv`, `guards` and `artifacts`, plus the container modes and `windows`.
+`test`, `coverage`, `msrv`, `guards` and `artifacts`, plus the container modes and
+`windows`.
 `docs/development.md` section 3 is the full picture, including what `all` leaves
 unproven. If a check is not a mode of that script it is a preference rather than a
 gate: adding one means adding the mode and the job that calls it, in the same pull

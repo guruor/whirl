@@ -25,6 +25,7 @@
 #   ./scripts/ci.sh fmt          cargo fmt --all -- --check
 #   ./scripts/ci.sh clippy       cargo clippy --workspace --all-targets -- -D warnings
 #   ./scripts/ci.sh test         the test suite, one process per test, then the doctests
+#   ./scripts/ci.sh coverage     the suite under cargo-llvm-cov, the per-file table, and the floor
 #   ./scripts/ci.sh msrv         the declared MSRV, 1.85.0: check and test
 #   ./scripts/ci.sh guards       no third-party dependencies, and the binary size caps
 #   ./scripts/ci.sh artifacts    cargo build --workspace --release
@@ -191,6 +192,61 @@ test_suite() {
   # because of limitations in stable Rust. For now, run doctests in a separate
   # step with `cargo test --doc`." (https://nexte.st/, 2026-09-26)
   cargo test --workspace --doc
+}
+
+coverage() {
+  # The suite under instrumentation, the per-file table, and the floor. Everything
+  # about the numbers lives in two files this repository owns: the floor and the
+  # per-file baseline are `.config/coverage-baseline.json`, and the comparison is
+  # `scripts/coverage-check.py`, whose own header is the reasoning for the shape of
+  # both (a total floor for the workspace, an uncovered-line count per file for the
+  # soft spots a total cannot see, and the slack between them).
+  #
+  # Measured on this machine 2026-10-06, arm64, at a7e56c7 on `main`: 13653 lines,
+  # 2152 uncovered, 84.24% (84.84% regions, 83.45% functions). The same tree and the
+  # same suite gave 2152 uncovered at the worst of seven runs and 2148 at the best,
+  # every bit of it in three files (`whirl-cli/src/daemon/macos.rs` by up to four
+  # lines), which is why the floor in `.config/coverage-baseline.json` sits at 84.1
+  # rather than at the measurement, and why the per-file slack is 6: the noise is
+  # measured, and a floor or a slack set at the measurement is a red job on a green
+  # tree. Cost: 2m19s from a cold instrumented build, 82s with the build warm, and
+  # the table under a second, because `cargo llvm-cov report` reads the profile the
+  # run left rather than running the suite a second time. The numbers, the floor and
+  # the report all stay in this repository and on this machine: `<target>/coverage/`
+  # is inside `target/`, which git ignores, and no part of this is a third-party
+  # service.
+  #
+  # `--workspace` is not decoration: the integration tests spawn the worker binary,
+  # and a package-scoped run does not build it, which is why `cargo test -p whirld`
+  # fails in this repository (the `test` mode's comment says the same thing).
+  need python3 coverage
+  need cargo-llvm-cov coverage "docs/development.md, \"The gate\", has the install: the released binary, or cargo install"
+  # A test that rotates must never reach a real desktop; CI sets this for the
+  # whole job so that a new test cannot forget it, and so does this file.
+  export WHIRL_BACKEND=noop
+  out="${CARGO_TARGET_DIR:-target}/coverage"
+  rm -rf "$out"
+  mkdir -p "$out"
+  # The daemon reaches the worker through launchd, which hands it a fresh
+  # environment: that is what the backend is for, and one consequence is that the
+  # worker never sees the `LLVM_PROFILE_FILE` cargo-llvm-cov sets, so its profile
+  # lands in the crate directory under llvm's own default name rather than in
+  # `<target>/llvm-cov-target`. Those files are not merged into the report -- the
+  # report is what the run below wrote and this is not in it -- and without this
+  # line a contributor finds hundreds of them and a dirty `git status` (560 after
+  # one run on 2026-10-06), each run adding its own. The trap and not a trailing
+  # command, because a failed run leaves them too. `.gitignore` names the pattern
+  # as well, for a worker that writes one while this is finishing.
+  trap 'rm -f crates/*/default_*.profraw default_*.profraw' EXIT
+  # The toolchain, printed because the numbers in the baseline are its output, and a
+  # run under another rustc is the one way this comparison could look right and be
+  # wrong (section 2 names the toolchain managers that export RUSTUP_TOOLCHAIN).
+  printf 'ci.sh: coverage on %s, %s\n' "$(rustc --version)" "$(cargo llvm-cov --version)"
+  cargo llvm-cov --workspace --json --summary-only --output-path "$out/llvm-cov.json"
+  cargo llvm-cov report --summary-only > "$out/llvm-cov.txt"
+  sed -n '1,$p' "$out/llvm-cov.txt"
+  python3 scripts/coverage-check.py \
+    --baseline .config/coverage-baseline.json --report "$out/llvm-cov.json" --root .
 }
 
 msrv() {
@@ -371,6 +427,7 @@ case "${1:-}" in
   fmt)       fmt ;;
   clippy)    clippy ;;
   test)      test_suite ;;
+  coverage)  coverage ;;
   msrv)      msrv ;;
   guards)    guards ;;
   artifacts) artifacts ;;

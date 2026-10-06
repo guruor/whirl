@@ -1,0 +1,56 @@
+{
+  "what": [
+    "The coverage floor `scripts/ci.sh coverage` fails under, and the per-file baseline it compares every file against. `scripts/coverage-check.py` reads both, and compares an uncovered line count per file because a line count is an integer and a slide is what this file is for; the sentences above that file's main() are the reasoning.",
+    "`floor` is moved by hand, one line at a time: raise `lines_percent` to `as_measured_percent` when a change earns it, and leave the four provenance fields naming the measurement it was set from. `--update` deliberately does not touch it.",
+    "`baseline` is measured: `python3 scripts/coverage-check.py --update --baseline .config/coverage-baseline.json --report <export.json>` rewrites it (and only it) from an llvm-cov export. A deliberate slide, a rename, a split or a file that stopped being compiled is a pull request that runs that command and says why.",
+    "`slack_lines` is the per-file room the environment needs, not a policy. Seven runs of the same suite over the same tree on 2026-10-06 said 84.2379, 84.2379, 84.2672, 84.2599, 84.2672, 84.2672 and 84.2672% of lines -- 2152 uncovered at the worst, 2148 at the best -- and three files of 29 account for all of it: `crates/whirl-cli/src/daemon/macos.rs` (91 uncovered in five runs, 95 in two), `crates/whirld/src/worker.rs` (86 or 87), `crates/whirld/src/plan.rs` (52 or 53). It is set to the widest per-file swing seen, 4 lines, plus two: it is what keeps this job from being red on a green change, and a slide is wider than it.",
+    "The floor sits under the measured number for the same reason, and the two rules are layered: 84.1 leaves 18 uncovered lines of room over the 2152 measured, above the per-file slack (6), so a slide inside one file past its slack trips the per-file rule while the total still holds, and a slide spread thin across the workspace trips the floor while no file does. A few lines spread over several files are under both and are not caught; that is the size of the hole."
+  ],
+  "floor": {
+    "lines_percent": 84.1,
+    "as_measured_percent": 84.24,
+    "measured_on": "2026-10-06",
+    "measured_commit": "a7e56c78d669c112f3edf7dcee2f12d43e67f185"
+  },
+  "slack_lines": 6,
+  "baseline": {
+    "measured_on": "2026-10-06",
+    "measured_commit": "a7e56c78d669c112f3edf7dcee2f12d43e67f185",
+    "measured_platform": "Darwin arm64",
+    "measured_with": "cargo llvm-cov --workspace --json --summary-only",
+    "total_lines": 13653,
+    "total_uncovered": 2152,
+    "total_lines_percent": 84.24,
+    "files": {
+      "crates/whirl-cli/src/daemon.rs": 0,
+      "crates/whirl-cli/src/daemon/macos.rs": 95,
+      "crates/whirl-cli/src/main.rs": 50,
+      "crates/whirl-cli/src/render.rs": 14,
+      "crates/whirl-core/src/config.rs": 216,
+      "crates/whirl-core/src/protocol.rs": 51,
+      "crates/whirl-core/src/source.rs": 11,
+      "crates/whirl-core/src/state.rs": 62,
+      "crates/whirl-worker/src/backend/macos.rs": 62,
+      "crates/whirl-worker/src/backend/mod.rs": 12,
+      "crates/whirl-worker/src/backend/noop.rs": 3,
+      "crates/whirl-worker/src/http.rs": 92,
+      "crates/whirl-worker/src/lock.rs": 17,
+      "crates/whirl-worker/src/main.rs": 25,
+      "crates/whirl-worker/src/pipeline.rs": 182,
+      "crates/whirl-worker/src/sources/local.rs": 33,
+      "crates/whirl-worker/src/sources/mod.rs": 0,
+      "crates/whirl-worker/src/sources/wallhaven.rs": 50,
+      "crates/whirld/src/cache.rs": 100,
+      "crates/whirld/src/events.rs": 8,
+      "crates/whirld/src/lock.rs": 48,
+      "crates/whirld/src/main.rs": 16,
+      "crates/whirld/src/plan.rs": 52,
+      "crates/whirld/src/schedule.rs": 1,
+      "crates/whirld/src/scheduler.rs": 53,
+      "crates/whirld/src/socket.rs": 373,
+      "crates/whirld/src/state.rs": 422,
+      "crates/whirld/src/statefile.rs": 17,
+      "crates/whirld/src/worker.rs": 87
+    }
+  }
+}
