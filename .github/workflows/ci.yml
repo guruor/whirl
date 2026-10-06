@@ -34,10 +34,9 @@ name: ci
 # branch that merged its base branch in afterwards would otherwise read every
 # commit it merged as one of its own. A head with no second parent is not a test
 # merge and the event's base is used. The base is then held to the commit the
-# project's own rules landed at (`GITLEAKS_EPOCH`, the job's env below): a
-# promotion pull request resolves to `main`'s tip, which is hundreds of commits
-# behind `development` and written before those rules existed, so the epoch
-# replaces it and the promotion is not judged by a rule it never had.
+# project's own rules landed at (`GITLEAKS_EPOCH`, the job's env below): a base
+# that predates those rules is replaced by the epoch, so a change is not judged
+# by a rule it never had.
 #
 # The job proves its own rules can fail as well: a step in it plants a sample of every
 # shape the rules forbid, in a commit, in a file and inside a merge, and requires each
@@ -50,11 +49,10 @@ name: ci
 # is red too. The resolution of the range is proved the same way, on a fixture,
 # before the scan trusts it.
 #
-# Triggers (docs/development.md section 6): `development` integrates, `main`
-# releases. So this workflow runs for a push to either branch, and for a pull
-# request whose base is either. The pull request whose base is `main` is a
-# promotion, and it runs the full matrix like any other change: the promotion is
-# the last look between `development` and the tag.
+# Triggers (docs/development.md section 6): `main` is the integration branch, and
+# a release is a tag on it. So this workflow runs for a push to `main`, and for a
+# pull request whose base is `main`, which is every change: the pull request is
+# the last look before the tag.
 #
 # A tag is not a trigger here. A tag runs `.github/workflows/release.yml`, which
 # is the release and needs to write to the repository; this file builds and
@@ -62,9 +60,9 @@ name: ci
 
 on:
   push:
-    branches: [main, development]
+    branches: [main]
   pull_request:
-    branches: [main, development]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:

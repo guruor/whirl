@@ -9,7 +9,7 @@ paragraph under the install block) so a replayer's run does not.
 ## 1. Install it
 
 ```sh
-git clone --branch development https://github.com/guruor/whirl
+git clone https://github.com/guruor/whirl
 cd whirl
 cargo install --path crates/whirl-cli    --locked
 cargo install --path crates/whirld       --locked
@@ -19,7 +19,7 @@ cargo install --path crates/whirl-worker --locked
 The `cargo install` lines above need Rust on your `PATH`; if `cargo` is missing, install it from
 <https://rustup.rs>.
 
-`development` and not `main`, which cannot set a wallpaper yet. The three binaries land in
+`main` is the default branch. The three binaries land in
 `$CARGO_HOME/bin`, the `CARGO_HOME` your shell exported: on a stock install that is `~/.cargo/bin`
 and it is already on your `PATH`, and on this machine `CARGO_HOME` is `~/.local/share/cargo`, so they
 land in `~/.local/share/cargo/bin`. Keep the three in one directory either way, because `whirld`
