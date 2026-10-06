@@ -594,11 +594,15 @@ connection, and `whirl idle` issues it itself; `subscribe` is the frontend surfa
 `whirl idle`. No protocol verb exists only for the CLI, and no CLI verb needs a protocol verb of its
 own.
 
-One command is deliberately not in the table above: `whirl daemon install|uninstall|start|stop|status`
-speaks to the platform's supervisor rather than to the daemon, so there is no protocol verb behind it
-and none is added (8). It keeps the exit codes above unchanged: 0 the step was done, 1 whirl refused,
-2 there is no supervised daemon to reach or the supervisor could not be asked, 3 the command line
-was wrong.
+Two commands are deliberately not in the table above: `whirl daemon
+install|uninstall|start|stop|status` speaks to the platform's supervisor rather than to the daemon, so
+there is no protocol verb behind it and none is added (8); and `whirl report` writes two files on the
+machine a release checklist ran on and reaches neither the daemon, the supervisor nor the network, for
+the same reason: writing the run down is not something a resident service or a setter lock has any part
+in (`docs/decisions/0003-checklist-run-reports-itself.md`). Both take their exit codes from the set
+above and add none: 0 the step was done, 1 whirl refused, 3 the command line was wrong. `whirl daemon`
+also answers 2 there, for the supervisor it could not ask; `whirl report` never answers 2, because it
+reaches no supervisor and no socket.
 
 `decision:` `whirl idle` is `subscribe` plus one event, not a server-side one-shot verb.
 `[D 5 §1.1]`'s verb table wants "Block until state changes. For frontends, so none of them polls."

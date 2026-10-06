@@ -25,6 +25,7 @@
 
 mod daemon;
 mod render;
+mod report;
 
 #[cfg(unix)]
 use render::EXIT_REFUSED;
@@ -65,6 +66,7 @@ usage: whirl <command>
   daemon start         ask the supervisor to start the daemon (macOS)
   daemon stop          ask the supervisor to stop the daemon (macOS)
   daemon status        what the supervisor says about the daemon (macOS)
+  report <flags>       one checklist run becomes a report and a release row
   help                 this text
 
 exit: 0 the command completed, 1 the daemon refused, 2 the daemon is unreachable, 3 the command line was wrong";
@@ -101,6 +103,10 @@ fn main() -> ExitCode {
         // to the platform's supervisor, not to the daemon (section 8), and it
         // prints its own report.
         Ok(Invocation::Daemon(verb)) => return daemon::run(verb),
+        // `report` is the second command that is not a protocol request: it
+        // reads a run the caller supplies and writes two files, and it never
+        // touches the socket (section 2.5.1's exception, like `daemon`).
+        Ok(Invocation::Report(args)) => return report::run(&args),
         Err(message) => {
             eprintln!("whirl: {message}");
             eprintln!("{USAGE}");
@@ -168,6 +174,9 @@ enum Invocation {
     /// A lifecycle step: it never becomes a `Request`, because it is answered by
     /// the platform's supervisor and not by the daemon.
     Daemon(daemon::Verb),
+    /// The whole `report` command line: it is answered by the filesystem, not by
+    /// the daemon, and its flags are the run's.
+    Report(Vec<String>),
 }
 
 /// The CLI verb table of 2.5.1, and nothing else. `set` is the one place the
@@ -215,6 +224,9 @@ fn invocation(args: &[String]) -> Result<Invocation, String> {
             None => return Err(format!("daemon: {sub} is not a subcommand")),
         },
         ("help", []) => Invocation::Help,
+        // `report` is not a protocol verb: its arguments are the run's flags,
+        // and `report::run` is where they are checked (2.5.1's CLI-only arms).
+        ("report", rest) => Invocation::Report(rest.to_vec()),
         (other, _) => {
             return Err(format!(
                 "{other} is not a command, or it has the wrong number of arguments"

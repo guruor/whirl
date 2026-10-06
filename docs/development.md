@@ -514,6 +514,17 @@ each platform it supports has been run on real hardware by someone who has that
 hardware, and the release notes record who ran it.** CI green is a precondition,
 not the evidence.
 
+The row is written by the binary under test rather than by hand. `whirl report`
+takes one run's observations and the run's own facts as flags and writes two files
+the caller names: a machine-readable report, and the platform's section of
+`docs/releases/vX.Y.Z.md` as `.github/release-notes-template.md` requires it
+(`docs/decisions/0003-checklist-run-reports-itself.md`). It runs on the machine
+under test and needs no checkout, no toolchain and no interpreter. It refuses to
+fill a field it has no value for: an item with no evidence is reported as not run,
+and a run that is missing its build identity, or that names an item which is not in
+the checklist, is a refusal naming what is missing rather than a report with a
+blank in it.
+
 ## 4. Continuous integration
 
 `.github/workflows/ci.yml` is the gate. Eight jobs: `fmt`, `clippy` (three OS),
@@ -796,7 +807,10 @@ For someone who has never done it here:
    request, one change per pull request, and let it go green.
 3. **Write the notes**, at `docs/releases/vX.Y.Z.md`, from
    `.github/release-notes-template.md`, with the checklist results from the
-   release checklists above. Same route: a pull request into `main`.
+   release checklists above. Each platform's section comes from `whirl report`
+   on the machine that ran that platform's checklist (section 3): one run
+   produces the row and the machine-readable report, and the row goes into the
+   notes as it is. Same route: a pull request into `main`.
 4. **Tag `main`'s tip and push it:**
 
    ```sh
