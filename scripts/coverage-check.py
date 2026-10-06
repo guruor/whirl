@@ -55,7 +55,13 @@ a line would be a number nobody raises deliberately, and raising it is a
 one-line edit of `floor.lines_percent`.
 
 Exit codes: 0 the floor and every baseline hold, 1 one of them was crossed, 2
-the check could not be made (unreadable input, or another platform's baseline).
+the check could not be made. The difference is the sentence above it: 1 is a
+verdict about coverage and 2 never is. 2 is a report or a baseline that is
+missing, unreadable, not an export, or not the platform this run is on, and
+every refusal prints its reason, because a reader has the log and not this file.
+`scripts/ci.sh` exits 2 for the same thing (its `die`), so the mode and this
+check agree, and a job that reads 2 knows the check did not run rather than that
+coverage fell.
 """
 
 import argparse
@@ -64,6 +70,19 @@ import os
 import platform
 import subprocess
 import sys
+
+
+def refuse(message):
+    """The check could not be made: this is not a verdict about coverage.
+
+    Exit 2 rather than 1, and the reason on stderr rather than the code alone:
+    a run that never measured anything used to be indistinguishable from a
+    floor that was crossed, which is how a refused check came to be read as a
+    slide. The code is the one `scripts/ci.sh` uses for a mode that cannot run,
+    so the gate and this check answer "not run" the same way.
+    """
+    print(message, file=sys.stderr)
+    sys.exit(2)
 
 
 def relative_to_root(filename, root):
@@ -99,7 +118,7 @@ def read_export(path, root):
         counted["count"],
         counted["covered"],
     ):
-        raise SystemExit(
+        refuse(
             f"coverage-check: the export's total ({totals['count']} lines, "
             f"{totals['covered']} covered) is not the sum of its files "
             f"({counted['count']}, {counted['covered']}): refusing to check either"
@@ -160,12 +179,12 @@ def main():
     root = os.path.abspath(args.root)
 
     if not os.path.exists(args.report):
-        sys.exit(f"coverage-check: {args.report} does not exist: nothing was measured to check")
+        refuse(f"coverage-check: {args.report} does not exist: nothing was measured to check")
     files, counted = read_export(args.report, root)
 
     if args.update:
         if not os.path.exists(args.baseline):
-            sys.exit(
+            refuse(
                 f"coverage-check: {args.baseline} does not exist. Write its `what`, its `floor` "
                 "(lines_percent, as_measured_percent, measured_on, measured_commit) and its "
                 "`slack_lines` first: --update measures the per-file baseline and does not choose "
@@ -194,7 +213,7 @@ def main():
         with open(args.baseline) as handle:
             baseline = json.load(handle)
     except FileNotFoundError:
-        sys.exit(f"coverage-check: {args.baseline} does not exist: there is no floor to check")
+        refuse(f"coverage-check: {args.baseline} does not exist: there is no floor to check")
 
     floor = baseline["floor"]
     slack = baseline["slack_lines"]
@@ -202,7 +221,7 @@ def main():
     measured_here = here()
 
     if measured_here.split()[0] != expected["measured_platform"].split()[0]:
-        sys.exit(
+        refuse(
             f"coverage-check: the baseline in {args.baseline} was measured on "
             f"{expected['measured_platform']}, and this run is on {measured_here}. The numbers are "
             "the compiler's and the platform backends are cfg-gated, so another operating system's "
@@ -268,4 +287,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        # Anything that stops the check short of a verdict is a refusal, and a
+        # refusal must not wear the code a slide wears: without this, an input
+        # that is not an export at all (or a baseline missing a key) left the
+        # interpreter with a traceback and status 1, which is the answer "the
+        # floor was crossed". The paths above print their own message; this is
+        # the backstop for the ones nobody wrote.
+        refuse(f"coverage-check: the check could not be made: {type(error).__name__}: {error}")
