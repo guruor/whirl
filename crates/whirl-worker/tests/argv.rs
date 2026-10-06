@@ -117,8 +117,13 @@ fn an_empty_directory_reports_no_candidates_with_the_reason_the_spec_names() {
         "the sentence 2.7's table and 4.5's name for the case: {errors}"
     );
     assert!(
-        errors.contains("pictures: 0 candidates, 0 admitted"),
-        "the reason names the source and what it yielded: {errors}"
+        errors.contains(
+            "source: pictures local weight=1 enabled=1 last=- candidates=0 admitted=0 \
+             rejected_resolution=0 rejected_ratio=0 rejected_size=0 rejected_type=0 \
+             rejected_dedupe=0 reason=-"
+        ),
+        "the reason is 2.6's `source:` record, so it says which filter removed what \
+         and what the source itself reported: {errors}"
     );
 }
 
@@ -169,6 +174,138 @@ fn a_path_that_does_not_exist_is_no_candidates_and_names_the_path() {
     assert!(
         errors.contains(&why),
         "and so is the reason it failed ({why}): {errors}"
+    );
+}
+
+/// A rotation whose one source cannot even be asked is `no_candidates` too, and
+/// the reason is that source's own record: 2.6's second form, `enabled=0` with
+/// the source's `reason` and no counter group, because nothing was counted. The
+/// reason is free-form prose, which is why 2.6 makes it the record's last field.
+#[test]
+fn a_rotation_whose_source_cannot_be_asked_carries_that_source_s_own_reason() {
+    let dir = scratch("disabled-source");
+    std::fs::create_dir_all(dir.join("pictures")).expect("the source's directory");
+    let absent = dir.join("pictures").join("gone");
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"backend\": \"noop\",\n  \"sources\": [\n    \
+             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"paths\": [{}] }}\n  ]\n}}\n",
+            json_string(&absent.display().to_string())
+        ),
+    )
+    .expect("the config is written");
+
+    let output = run(&config, &["--verb", "rotate", "--run", "7"]);
+    let errors = stderr(&output);
+    assert!(
+        errors.contains("source: pictures local weight=1 enabled=0 last=- reason="),
+        "the reason is 2.6's record, with the source's own words after `reason=`: {errors}"
+    );
+    assert!(
+        errors.contains(&absent.display().to_string()),
+        "and those words name the path that failed: {errors}"
+    );
+}
+
+/// A PNG header the sniffer measures, padded to `size` bytes: the pipeline
+/// validates a header and never decodes (features.md 1.4), which is what lets a
+/// fixture this small stand in for a wallpaper.
+fn png(width: u32, height: u32, size: usize) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(&13u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    assert!(bytes.len() <= size, "the header fits in the fixture");
+    bytes.resize(size, 0);
+    bytes
+}
+
+/// A rotation that admits nothing names the filter that refused each candidate,
+/// in the failure line itself and not only in `whirl config check`.
+///
+/// Five files, each refused by exactly one stage of features.md 2.5's Layer 2, in
+/// the pipeline's own order: 8x8 is under the 16x16 floor, 1000x1000 misses the
+/// 16:9 target, 4000 bytes is over `filters.max_bytes`, `.php` names a type the
+/// platform does not display, and the fifth is in the recent window. "5
+/// candidates, 0 admitted" is true of all five and tells a reader nothing; the
+/// counters are what say which stage to look at, and they are the same numbers
+/// `whirl config check` prints for the same source, because 2.6's record has one
+/// builder. A client that only ever calls `next` never runs the check, which is
+/// why the failure carries them.
+#[test]
+fn a_rotation_that_admits_nothing_names_the_filter_that_refused_each_candidate() {
+    let dir = scratch("refusals");
+    let walls = dir.join("walls");
+    std::fs::create_dir_all(&walls).expect("the source's directory");
+    for (name, bytes) in [
+        ("small.png", png(8, 8, 64)),
+        ("square.png", png(1000, 1000, 64)),
+        ("fat.png", png(1600, 900, 4000)),
+        ("script.php", png(1600, 900, 64)),
+        ("known.png", png(1600, 900, 64)),
+    ] {
+        std::fs::write(walls.join(name), bytes).expect("a fixture image");
+    }
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"backend\": \"noop\",\n  \"min_width\": 16,\n  \
+             \"min_height\": 16,\n  \"filters\": {{ \"max_bytes\": 1000, \
+             \"ratio_tolerance\": 0.02, \"target_ratio\": 1.7777777777777777 }},\n  \
+             \"sources\": [ {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \
+             \"paths\": [{}], \"include\": [\"*\"] }} ]\n}}\n",
+            json_string(&walls.display().to_string())
+        ),
+    )
+    .expect("the config is written");
+    // The recent window of 4.1, as the daemon leaves it: the ring holds the
+    // origin_key of a rotation that already set `known.png`. It is written by
+    // hand because no daemon runs here, and it is the file the worker really
+    // reads, through `Window::load`.
+    let identity =
+        whirl_core::protocol::sha256_hex(walls.join("known.png").display().to_string().as_bytes());
+    let state = dir.join("state");
+    std::fs::create_dir_all(&state).expect("the state directory");
+    std::fs::write(
+        state.join("history.json"),
+        format!(
+            "{{\n  \"schema\": 1,\n  \"seq\": 2,\n  \"written_at\": \"2026-10-06T00:00:00Z\",\n  \
+             \"entries\": [\n    {{ \"kind\": \"local\", \"origin_key\": \"pictures:{identity}\", \
+             \"digest\": \"{}\", \"cached_path\": null, \"set_at\": \"2026-10-06T00:00:00Z\", \
+             \"via\": \"source\" }}\n  ]\n}}\n",
+            "f".repeat(64)
+        ),
+    )
+    .expect("the history ring is written");
+
+    let output = run(&config, &["--verb", "rotate", "--run", "1"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let errors = stderr(&output);
+    assert!(
+        errors.contains(
+            "candidates=5 admitted=0 rejected_resolution=1 rejected_ratio=1 rejected_size=1 \
+             rejected_type=1 rejected_dedupe=1"
+        ),
+        "each refusal names itself, from the failure line alone: {errors}"
+    );
+
+    // The same numbers through the tool 1.4 names as the diagnostic, for the
+    // same source over the same files: the failure's reason is that record.
+    let check = run(&config, &["--verb", "check", "--run", "1"]);
+    let line = stdout(&check)
+        .lines()
+        .find(|line| line.starts_with("source: "))
+        .expect("the source record")
+        .to_string();
+    assert!(
+        errors.contains(&line),
+        "the failure carries the record `config check` prints:\n  {line}\n  {errors}"
     );
 }
 
