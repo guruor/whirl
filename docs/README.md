@@ -16,7 +16,7 @@ evidence and said so, in `reviews/`.
 | `spec/state-and-cache.md` | reviewed | per-OS state and cache locations, eviction policy, atomic writes, corruption recovery |
 | `architecture.md` | reviewed | process model, protocol specification, failure modes, security model, versioning, the frontend contract |
 | `development.md` | reviewed | repo layout, build and test matrix, release process, contribution workflow |
-| `decisions/` | two ADRs recorded: `0001-macos-artifacts-ship-unsigned-in-v0.1.0.md` and `0002-frontends-write-config-own-no-daemon.md` | one ADR per decision that changes the architecture; template in `0000-template.md` |
+| `decisions/` | three ADRs recorded: `0001-macos-artifacts-ship-unsigned-in-v0.1.0.md`, `0002-frontends-write-config-own-no-daemon.md` and `0003-checklist-run-reports-itself.md` | one ADR per decision that changes the architecture; template in `0000-template.md` |
 | `reviews/` | four reports: the pack in two rounds, the architecture set in two rounds | one report per reviewed **pack**, not one per document: `research-spec-review.md` and its round 2 cover the six-document research and spec pack, `architecture-review.md` and its round 2 cover the two architecture documents; each says what the reviewer ran, what they observed, what they could not check |
 
 ## Reading order
