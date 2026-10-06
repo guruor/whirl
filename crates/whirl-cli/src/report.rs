@@ -1316,9 +1316,10 @@ mod tests {
         build(&args(fixture, platform, extra), platform)
     }
 
-    /// A JSON string literal, escaped by the writer the report itself uses, so a
-    /// test can build an observations document around an item's own `what` text
-    /// without escaping it by hand.
+    /// A JSON string literal, escaped by the writer the report itself uses. A test
+    /// that has to compare against text the report carries (an item's own `what`,
+    /// or a path whose separator the writer escapes) gets it from here rather
+    /// than escaping it by hand and getting it wrong on another platform.
     fn quoted(value: &str) -> String {
         let mut out = String::new();
         write_json_string(&mut out, value);
@@ -1714,8 +1715,9 @@ mod tests {
                 "the public row carries no absolute path: {markdown}"
             );
             assert!(
-                run.report_json().contains(&fixture.log),
-                "the report keeps the path the caller named"
+                run.report_json().contains(&quoted(&fixture.log)),
+                "the report keeps the path the caller named: {}",
+                run.report_json()
             );
         }
     }
