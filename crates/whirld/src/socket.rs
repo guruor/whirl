@@ -789,6 +789,743 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     }
+
+    // -----------------------------------------------------------------------
+    // The connection itself (docs/architecture.md 2.2, 2.3, 2.4, 2.9)
+    //
+    // `handle`, `dispatch` and `subscribe` are private to this module, so a unit
+    // test can drive the daemon's real connection code without a listener: a
+    // `UnixStream` pair is one connected socket, and every framing decision,
+    // timeout and answer below is the daemon's own. The client half carries a
+    // read timeout so a missing line fails the test instead of hanging it.
+    // -----------------------------------------------------------------------
+
+    use crate::testkit::{Scratch, daemon, daemon_with_a_set, digest};
+
+    const ORIGIN_KEY: &str = "pictures:one";
+
+    /// One in-process connection: the client half, and the thread running the
+    /// daemon's `handle` on the other half of the same socket.
+    struct Peer {
+        client: UnixStream,
+        reader: BufReader<UnixStream>,
+        handler: Option<std::thread::JoinHandle<io::Result<()>>>,
+    }
+
+    impl Peer {
+        fn connect(daemon: &Arc<Daemon>) -> Peer {
+            let (client, server) = UnixStream::pair().expect("a socket pair");
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("a read timeout");
+            let daemon = Arc::clone(daemon);
+            let handler = std::thread::spawn(move || handle(server, &daemon));
+            let mut reader = BufReader::new(client.try_clone().expect("a client clone"));
+            let greeting = read_line(&mut reader);
+            assert!(
+                greeting.starts_with("OK whirl ") && greeting.ends_with(" protocol 2"),
+                "2.4's greeting: {greeting:?}"
+            );
+            Peer {
+                client,
+                reader,
+                handler: Some(handler),
+            }
+        }
+
+        fn send(&mut self, line: &str) {
+            self.send_raw(format!("{line}\n").as_bytes());
+        }
+
+        fn send_raw(&mut self, bytes: &[u8]) {
+            self.client.write_all(bytes).expect("a write");
+            self.client.flush().expect("a flush");
+        }
+
+        fn line(&mut self) -> String {
+            read_line(&mut self.reader)
+        }
+
+        /// Every line up to and including the terminator of 2.2.
+        fn answer(&mut self) -> Vec<String> {
+            let mut lines = Vec::new();
+            loop {
+                let line = self.line();
+                let last = line == "OK" || line.starts_with("ERR ");
+                lines.push(line);
+                if last {
+                    return lines;
+                }
+            }
+        }
+
+        /// The single line of a response that cannot be more than one: `OK`, or
+        /// one `ERR`.
+        fn one(&mut self) -> String {
+            let lines = self.answer();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            lines.into_iter().next().expect("a line")
+        }
+
+        /// Drop the client half and join the handler. The join is the assertion
+        /// that no thread is left behind: every test ends here.
+        fn close(mut self) -> io::Result<()> {
+            drop(self.reader);
+            drop(self.client);
+            self.handler
+                .take()
+                .expect("a handler")
+                .join()
+                .expect("the handler did not panic")
+        }
+    }
+
+    fn read_line(reader: &mut BufReader<UnixStream>) -> String {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("a line");
+        line.strip_suffix('\n').unwrap_or(&line).to_string()
+    }
+
+    /// A daemon whose worker reports a successful `set:` of a fixed digest.
+    fn set_daemon(scratch: &Scratch) -> (Arc<Daemon>, String) {
+        let digest = digest('a');
+        let daemon = daemon_with_a_set(
+            scratch.path(),
+            whirl_core::config::Config::default(),
+            &digest,
+            ORIGIN_KEY,
+            "/cache/sha256/aa/aa/aa.jpg",
+        );
+        (Arc::new(daemon), digest)
+    }
+
+    /// The verbs that read and answer without a worker (2.5), over one
+    /// connection: the framing of each answer, and that a connection is reused
+    /// rather than reopened.
+    #[test]
+    fn the_read_only_verbs_answer_and_the_connection_is_reused() {
+        let scratch = Scratch::new("socket-read-only");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send("hello 2");
+        assert_eq!(
+            peer.answer(),
+            vec!["protocol: 2".to_string(), "OK".to_string()]
+        );
+
+        peer.send("ping");
+        assert_eq!(peer.one(), "OK");
+
+        peer.send("version");
+        let version = peer.answer();
+        assert!(
+            version[0].starts_with("daemon_version: whirl "),
+            "{version:?}"
+        );
+        assert_eq!(version[1], "protocol: 2");
+        assert_eq!(version.last().map(String::as_str), Some("OK"));
+
+        peer.send("status");
+        let status = peer.answer();
+        assert!(
+            status[0].starts_with("daemon_version: "),
+            "2.10's first row: {status:?}"
+        );
+        assert!(status.iter().any(|line| line == "paused: 0"), "{status:?}");
+        assert!(
+            status.iter().any(|line| line == "history_count: 0"),
+            "{status:?}"
+        );
+        assert_eq!(status.last().map(String::as_str), Some("OK"));
+
+        peer.send("sources");
+        let sources = peer.answer();
+        assert!(sources[0].starts_with("count: "), "{sources:?}");
+        assert_eq!(sources.last().map(String::as_str), Some("OK"));
+
+        peer.send("config path");
+        let config = peer.answer();
+        assert!(config[0].starts_with("config: "), "{config:?}");
+
+        peer.send("history");
+        assert_eq!(
+            peer.answer(),
+            vec!["count: 0".to_string(), "OK".to_string()]
+        );
+
+        peer.send("favorites");
+        assert_eq!(
+            peer.answer(),
+            vec!["count: 0".to_string(), "OK".to_string()]
+        );
+
+        // `favorite` with no argument pins what is on screen, and there is
+        // nothing on screen yet: 2.5's `not_found`.
+        peer.send("favorite");
+        assert!(peer.one().starts_with("ERR not_found "));
+
+        peer.send("unfavorite deadbeef");
+        assert!(peer.one().starts_with("ERR not_found "));
+
+        // No history, so 2.7's `no_prev` rather than an empty `prev`.
+        peer.send("prev");
+        assert!(peer.one().starts_with("ERR no_prev "));
+
+        peer.send("close");
+        assert_eq!(peer.one(), "OK");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// The verbs that spawn a worker (2.5's `next`, the two `set` forms), and
+    /// the interim `queued` line that reaches the client before the daemon
+    /// blocks (2.6).
+    #[test]
+    fn the_rotation_verbs_report_the_set_the_worker_made() {
+        let scratch = Scratch::new("socket-rotate");
+        let (daemon, digest) = set_daemon(&scratch);
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send("next");
+        let next = peer.answer();
+        assert_eq!(next[0], "queued");
+        assert_eq!(
+            next[1],
+            format!("set: {digest} {ORIGIN_KEY} source /cache/sha256/aa/aa/aa.jpg")
+        );
+        assert_eq!(next.last().map(String::as_str), Some("OK"));
+
+        // The state change is visible on the next request, on the same
+        // connection: the worker's set became the anchor and a history entry.
+        peer.send("status");
+        let status = peer.answer();
+        assert!(
+            status
+                .iter()
+                .any(|line| line == &format!("last_digest: {digest}")),
+            "{status:?}"
+        );
+        assert!(
+            status.iter().any(|line| line == "last_via: source"),
+            "{status:?}"
+        );
+        assert!(
+            status.iter().any(|line| line == "history_count: 1"),
+            "{status:?}"
+        );
+
+        peer.send("history 1");
+        let history = peer.answer();
+        assert_eq!(history[0], "count: 1");
+        assert!(history[1].starts_with("entry: "), "{history:?}");
+
+        // The pin verbs, against the anchor that is now on screen.
+        peer.send("favorite");
+        let favorited = peer.answer();
+        assert_eq!(favorited[0], format!("favorited: {digest} {ORIGIN_KEY}"));
+        assert_eq!(favorited[1], "already: 0");
+        assert_eq!(favorited.last().map(String::as_str), Some("OK"));
+
+        peer.send("favorite");
+        let again = peer.answer();
+        assert_eq!(again[1], "already: 1", "6.4's `already` flag");
+
+        peer.send("favorites");
+        assert_eq!(peer.answer()[0], "count: 1");
+
+        peer.send("unfavorite pictures:one");
+        let unfavorited = peer.answer();
+        assert_eq!(unfavorited[0], format!("unfavorited: {digest}"));
+
+        peer.send("favorites");
+        assert_eq!(peer.answer()[0], "count: 0");
+
+        // `set id` resolves an `origin_key` through history (2.5's order).
+        peer.send("set id pictures:one");
+        let set_id = peer.answer();
+        assert_eq!(set_id[0], "queued");
+        assert!(set_id[1].starts_with("set: "), "{set_id:?}");
+
+        // `set path` refuses a path that is not absolute, and one that does not
+        // exist, before any worker is spawned.
+        peer.send("set path relative/file.jpg");
+        assert!(peer.one().starts_with("ERR bad_args "));
+        peer.send("set path /no/such/file/whirl.jpg");
+        assert!(peer.one().starts_with("ERR not_found "));
+
+        peer.send("close");
+        assert_eq!(peer.one(), "OK");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// `prev` sets an earlier entry again (2.5): the second rotation uses a
+    /// different digest, so history has two entries and `prev` has somewhere to
+    /// go. What the daemon chose is visible in the worker's arguments -- 2.5 has
+    /// `prev` hand the worker the earlier entry's path -- and the `via` of the
+    /// record is `prev`, which is what a client branches on.
+    ///
+    /// The reported path is under `cache/sha256/`, which is what makes it a path
+    /// the entry keeps: 6.1 blanks the path of a `reference`-mode local source,
+    /// and a blanked one falls back to the `origin_key` as the target.
+    #[test]
+    fn prev_sets_the_earlier_entry_again() {
+        let scratch = Scratch::new("socket-prev");
+        let first = digest('b');
+        let second = digest('c');
+        let cached = scratch.join("cache/sha256/aa/aa/aa.jpg");
+        let cached = cached.display().to_string();
+        let program = crate::testkit::script(
+            scratch.path(),
+            "worker-set.sh",
+            &format!("#!/bin/sh\nprintf '%s\\n' 'set: {first} {ORIGIN_KEY} {cached}'\n"),
+        );
+        let daemon = Arc::new(crate::testkit::daemon(
+            scratch.path(),
+            whirl_core::config::Config::default(),
+            program,
+        ));
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send("next");
+        assert_eq!(
+            peer.answer()[1],
+            format!("set: {first} {ORIGIN_KEY} source {cached}")
+        );
+
+        // Give the daemon a different worker for the rest of the test: it reports
+        // its own digest and writes down the arguments the daemon handed it, so
+        // the entry `prev` chose is readable from outside the daemon.
+        let argv = scratch.join("worker-argv.txt");
+        crate::testkit::script(
+            scratch.path(),
+            "worker-set.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' 'set: {second} {ORIGIN_KEY} /cache/second.jpg'\n",
+                argv.display()
+            ),
+        );
+        peer.send("next");
+        assert!(peer.answer()[1].starts_with(&format!("set: {second} ")));
+
+        peer.send("prev");
+        let previous = peer.answer();
+        assert_eq!(previous[0], "queued");
+        assert_eq!(
+            previous[1],
+            format!("set: {second} {ORIGIN_KEY} prev /cache/second.jpg"),
+            "2.6's record carries the via the daemon decided, not the worker's"
+        );
+        assert_eq!(previous.last().map(String::as_str), Some("OK"));
+
+        let arguments = std::fs::read_to_string(&argv).expect("the worker's arguments");
+        assert!(
+            arguments.contains(&format!("--target {cached}")),
+            "2.5: `prev` hands the worker the earlier entry's path, not the current one's: {arguments:?}"
+        );
+
+        peer.send("close");
+        assert_eq!(peer.one(), "OK");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// `config check` is the only verb whose body is the worker's own lines (2.5),
+    /// and `Verb::Check` is the only verb the worker answers that way: a rotation
+    /// needs a `set:` line, so the same worker cannot serve both and the rotation
+    /// that asks anyway is `worker_failed` (2.7) rather than a body no rule
+    /// describes.
+    #[test]
+    fn config_check_prints_the_workers_lines_and_a_rotation_cannot() {
+        let scratch = Scratch::new("socket-check");
+        let program = crate::testkit::script(
+            scratch.path(),
+            "worker-check.sh",
+            "#!/bin/sh\nprintf '%s\\n' 'source: pictures local weight=1 enabled=1 last=- candidates=3 reason=-'\nprintf '%s\\n' 'plan: schedule.interval_seconds=1800 backend=noop sources=1'\n",
+        );
+        let daemon = Arc::new(daemon(
+            scratch.path(),
+            whirl_core::config::Config::default(),
+            program,
+        ));
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send("config check");
+        let check = peer.answer();
+        assert_eq!(check[0], "queued");
+        assert_eq!(
+            check[1],
+            "source: pictures local weight=1 enabled=1 last=- candidates=3 reason=-"
+        );
+        assert_eq!(
+            check[2],
+            "plan: schedule.interval_seconds=1800 backend=noop sources=1"
+        );
+        assert_eq!(check.last().map(String::as_str), Some("OK"));
+
+        peer.send("next");
+        let refused = peer.answer();
+        assert_eq!(refused[0], "queued");
+        assert_eq!(
+            refused[1],
+            "ERR worker_failed the worker exited 0 without a set: line; last line was \
+             \"plan: schedule.interval_seconds=1800 backend=noop sources=1\"",
+            "a rotation with no set: line has no answer to give (2.7)"
+        );
+
+        peer.send("close");
+        assert_eq!(peer.one(), "OK");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// 2.3 rule 4: the client died mid-frame. A partial line is not a request
+    /// and not an error: the connection ends and nothing is written.
+    #[test]
+    fn a_peer_that_disconnects_mid_frame_ends_the_connection_without_an_error() {
+        let scratch = Scratch::new("socket-mid-frame");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut peer = Peer::connect(&daemon);
+        peer.send_raw(b"stat");
+
+        // Nothing more arrives, and the socket is closed: `read_request_line`
+        // sees EOF rather than a broken frame.
+        peer.client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("a half close");
+        assert_eq!(peer.line(), "", "EOF, not an answer");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// 2.2: a request line longer than `MAX_REQUEST_LINE` is `too_long`, and the
+    /// error closes the connection.
+    #[test]
+    fn a_request_longer_than_the_frame_is_refused_and_closes() {
+        let scratch = Scratch::new("socket-long");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut peer = Peer::connect(&daemon);
+
+        let mut overlong = vec![b'x'; protocol::MAX_REQUEST_LINE + 1];
+        overlong.push(b'\n');
+        peer.send_raw(&overlong);
+
+        assert_eq!(
+            peer.one(),
+            format!(
+                "ERR too_long request line exceeds {} bytes",
+                protocol::MAX_REQUEST_LINE
+            )
+        );
+        assert_eq!(peer.line(), "", "the error closed the connection");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// 2.2: a request line that is not UTF-8 is `bad_framing`, and that closes
+    /// the connection too, because the framing is out of step from there on.
+    #[test]
+    fn a_request_that_is_not_utf8_is_refused_as_bad_framing() {
+        let scratch = Scratch::new("socket-utf8");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send_raw(&[0xff, 0xfe, b'\n']);
+
+        assert_eq!(
+            peer.one(),
+            "ERR bad_framing request line is not UTF-8".to_string()
+        );
+        assert_eq!(peer.line(), "", "the error closed the connection");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// 2.4: one protocol version exists, so a `hello` for another one is a
+    /// client guessing at a grammar nobody implemented: refuse and close.
+    #[test]
+    fn a_hello_for_another_protocol_is_refused_and_closes() {
+        let scratch = Scratch::new("socket-protocol");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send("hello 3");
+        assert_eq!(
+            peer.one(),
+            format!(
+                "ERR bad_protocol server speaks {}, client asked for 3",
+                protocol::PROTOCOL_VERSION
+            )
+        );
+        assert_eq!(peer.line(), "", "the refusal closed the connection");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// 2.5 and 2.7: an unknown verb is one `ERR`, and the connection is *not*
+    /// closed, because nothing about the framing is in doubt. The `ping` after it
+    /// is the assertion that matters.
+    #[test]
+    fn a_request_the_protocol_does_not_know_is_refused_and_the_connection_survives() {
+        let scratch = Scratch::new("socket-unknown");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send("frobnicate");
+        assert_eq!(
+            peer.one(),
+            "ERR unknown_verb unknown command \"frobnicate\"".to_string()
+        );
+        peer.send("ping");
+        assert_eq!(peer.one(), "OK", "a refusal is not a close (2.7)");
+
+        peer.send("close");
+        assert_eq!(peer.one(), "OK");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// 2.3: two connections are two threads on one daemon. The second client's
+    /// state change is the first client's event, and neither answer is the
+    /// other's.
+    #[test]
+    fn two_clients_at_once_are_answered_independently() {
+        let scratch = Scratch::new("socket-two");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut subscriber = Peer::connect(&daemon);
+        let mut client = Peer::connect(&daemon);
+
+        subscriber.send("subscribe");
+        let subscribed = subscriber.line();
+        assert!(subscribed.starts_with("subscribed: "), "{subscribed:?}");
+        let seq: u64 = subscribed
+            .strip_prefix("subscribed: ")
+            .expect("the prefix")
+            .parse()
+            .expect("a sequence number");
+
+        client.send("pause");
+        assert_eq!(client.one(), "OK");
+        assert_eq!(
+            subscriber.line(),
+            format!("event: {} paused", seq + 1),
+            "2.9: one state change, one event, one seq"
+        );
+
+        client.send("status");
+        let status = client.answer();
+        assert!(status.iter().any(|line| line == "paused: 1"), "{status:?}");
+        assert!(status.iter().any(|line| line == "seq: 1"), "{status:?}");
+
+        client.send("resume");
+        assert_eq!(client.one(), "OK");
+        assert_eq!(subscriber.line(), format!("event: {} resumed", seq + 2));
+
+        subscriber.send("close");
+        assert_eq!(subscriber.one(), "OK");
+        assert_eq!(subscriber.close().expect("the handler ended"), ());
+
+        client.send("close");
+        assert_eq!(client.one(), "OK");
+        assert_eq!(client.close().expect("the handler ended"), ());
+    }
+
+    /// 2.9: the daemon keeps no event history, so the only thing `since` can
+    /// produce is the size of the gap.
+    #[test]
+    fn subscribing_after_the_stream_moved_reports_the_gap() {
+        let scratch = Scratch::new("socket-gap");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut client = Peer::connect(&daemon);
+        for _ in 0..3 {
+            client.send("pause");
+            assert_eq!(client.one(), "OK");
+            client.send("resume");
+            assert_eq!(client.one(), "OK");
+        }
+        client.send("status");
+        let seq: u64 = client
+            .answer()
+            .iter()
+            .find_map(|line| line.strip_prefix("seq: ").map(str::to_string))
+            .expect("the seq row")
+            .parse()
+            .expect("a number");
+        assert_eq!(seq, 6, "six state changes, six events");
+
+        let mut subscriber = Peer::connect(&daemon);
+        subscriber.send("subscribe 1");
+        let stream = [subscriber.line(), subscriber.line()];
+        assert_eq!(stream[0], "subscribed: 6");
+        assert_eq!(stream[1], "gap: 5", "6 - 1: the events this client missed");
+
+        // A `since` at or ahead of the current seq is not a gap.
+        subscriber.send("close");
+        assert_eq!(subscriber.one(), "OK");
+        assert_eq!(subscriber.close().expect("the handler ended"), ());
+
+        client.send("close");
+        assert_eq!(client.one(), "OK");
+        assert_eq!(client.close().expect("the handler ended"), ());
+    }
+
+    /// 2.9: once `subscribe` has taken the connection, every request but `close`
+    /// is refused with one `ERR` and the stream continues, which is what lets a
+    /// client keep exactly one connection open and still see its own errors.
+    #[test]
+    fn a_subscribed_connection_refuses_another_request_but_honours_close() {
+        let scratch = Scratch::new("socket-handover");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send("subscribe");
+        assert!(peer.line().starts_with("subscribed: "));
+
+        peer.send("status");
+        assert_eq!(
+            peer.line(),
+            "ERR bad_args subscribe takes over this connection"
+        );
+        // The stream is still a stream: a state change reaches it.
+        let mut client = Peer::connect(&daemon);
+        client.send("pause");
+        assert_eq!(client.one(), "OK");
+        assert!(peer.line().starts_with("event: "));
+
+        peer.send("close");
+        assert_eq!(peer.line(), "OK");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+
+        client.send("resume");
+        assert_eq!(client.one(), "OK");
+        client.send("close");
+        assert_eq!(client.one(), "OK");
+        assert_eq!(client.close().expect("the handler ended"), ());
+    }
+
+    /// 2.9 and R4: a subscriber that stops reading fills its bounded queue and is
+    /// dropped from the bus — "the only failure a subscriber can cause, and it is
+    /// confined to that subscriber". The daemon never blocks on it: the other
+    /// client is answered throughout. When the subscriber reads again it drains
+    /// what it was owed and the stream ends, which is the observable proof that
+    /// the bus let go of it; a daemon that had queued without bound would still
+    /// be streaming here.
+    ///
+    /// This is the one test that has to generate enough traffic to fill a socket
+    /// buffer *and* the queue: the loop runs until the bus reports the drop, so
+    /// no fixed number of events is baked in.
+    #[test]
+    fn a_subscriber_that_stops_reading_is_dropped_and_its_stream_ends() {
+        let scratch = Scratch::new("socket-stuck");
+        let (daemon, _) = set_daemon(&scratch);
+        let mut stuck = Peer::connect(&daemon);
+        let mut driver = Peer::connect(&daemon);
+
+        stuck.send("subscribe");
+        assert!(stuck.line().starts_with("subscribed: "));
+
+        let mut events = 0u64;
+        while daemon.bus.subscriber_count() > 0 {
+            driver.send("pause");
+            assert_eq!(driver.one(), "OK", "the daemon keeps answering");
+            driver.send("resume");
+            assert_eq!(driver.one(), "OK", "the daemon keeps answering");
+            events += 2;
+            assert!(
+                events < 50_000,
+                "the bus never dropped the stuck subscriber"
+            );
+        }
+        assert_eq!(
+            daemon.bus.subscriber_count(),
+            0,
+            "the queue filled and the subscriber was dropped (2.9)"
+        );
+        assert!(events > 256, "the queue is bounded at 256 lines");
+
+        driver.send("status");
+        let status = driver.answer();
+        assert!(
+            status.last().map(String::as_str) == Some("OK"),
+            "{status:?}"
+        );
+
+        // Draining the stuck client now terminates: the bus is gone, so the
+        // remaining lines end in EOF.
+        let mut drained = 0u64;
+        loop {
+            let line = stuck.line();
+            if line.is_empty() {
+                break;
+            }
+            assert!(line.starts_with("event: "), "{line:?}");
+            drained += 1;
+        }
+        assert!(
+            drained >= 256,
+            "the bounded queue is what a reader gets: {drained}"
+        );
+        assert_eq!(stuck.close().expect("the handler ended"), ());
+
+        driver.send("close");
+        assert_eq!(driver.one(), "OK");
+        assert_eq!(driver.close().expect("the handler ended"), ());
+    }
+
+    /// 6.4 step 3 and 2.5: while `favorites.json` is degraded, pin-changing verbs
+    /// are refused and the message names the quarantine, because writing a pin
+    /// over a set the daemon could not read would lose it.
+    #[test]
+    fn a_degraded_pin_set_refuses_a_pin_and_names_the_quarantine() {
+        let scratch = Scratch::new("socket-degraded");
+        let state_dir = scratch.join("state");
+        std::fs::create_dir_all(&state_dir).expect("a state directory");
+        std::fs::write(state_dir.join("favorites.json"), "not json at all")
+            .expect("a corrupt pin file");
+        let daemon = Arc::new(daemon_with_a_set(
+            scratch.path(),
+            whirl_core::config::Config::default(),
+            &digest('d'),
+            ORIGIN_KEY,
+            "/cache/one.jpg",
+        ));
+        assert!(
+            daemon.state().favorites_degraded,
+            "a corrupt pin file is not an empty pin set"
+        );
+        let mut peer = Peer::connect(&daemon);
+
+        peer.send("favorite");
+        let refused = peer.one();
+        assert!(
+            refused.starts_with("ERR favorites_degraded "),
+            "{refused:?}"
+        );
+        assert!(
+            refused.contains("favorites.json.corrupt-"),
+            "the message names the quarantine: {refused:?}"
+        );
+
+        peer.send("unfavorite pictures:one");
+        assert!(peer.one().starts_with("ERR favorites_degraded "));
+
+        peer.send("status");
+        let status = peer.answer();
+        assert!(
+            status.iter().any(|line| line == "favorites_degraded: 1"),
+            "2.10's row: {status:?}"
+        );
+
+        peer.send("close");
+        assert_eq!(peer.one(), "OK");
+        assert_eq!(peer.close().expect("the handler ended"), ());
+    }
+
+    /// 2.1: a path the kernel cannot address is refused before anything is bound,
+    /// and the message names the length and the limit. The refusal is the reason
+    /// `bind` can be tested at all in this binary: it returns before
+    /// `with_socket_umask`, which nothing in a test binary may call.
+    #[test]
+    fn bind_refuses_a_path_the_kernel_cannot_address() {
+        let overlong = "x".repeat(SUN_PATH_LIMIT);
+        let error = bind(Path::new(&overlong)).expect_err("a path past sun_path cannot bind");
+        assert!(
+            error.contains(&format!("the limit is {SUN_PATH_LIMIT}")),
+            "{error}"
+        );
+    }
 }
 
 /// The mask's own test. It is named `socket_mode_tests` rather than the
