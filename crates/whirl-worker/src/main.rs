@@ -143,8 +143,9 @@ fn main() -> ExitCode {
         Ok(cache) => cache,
         Err(failure) => return failure.report(),
     };
-    // The recent window is the history ring plus the index, read and never
-    // written: the daemon owns both files (4.1, 7.2).
+    // The window is both of the daemon's files, the history ring and the cache
+    // index, read and never written (4.1, 7.2). They are not the same half of
+    // the dedupe: the ring is what is rejected, the index is what is served.
     let window = match pipeline::state_directory() {
         Some(state_dir) => pipeline::Window::load(
             &state_dir,
