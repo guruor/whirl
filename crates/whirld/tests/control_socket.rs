@@ -724,7 +724,7 @@ fn config_check_reports_the_sources_and_the_plan() {
 /// collection looked smaller than it is.
 ///
 /// The fixture is dropped with no permission involved, and it is the case
-/// `crates/whirl-worker/src/pipeline.rs`'s `HEIC_WINDOW` is about: an
+/// `crates/whirl-worker/src/pipeline.rs`'s `WIDE_WINDOW` is about: an
 /// `ftyp(heic)` whose `meta` box declares 200000 bytes, in a file whose length
 /// makes that declaration true. `sniff_heic` can only walk inside a `meta` box
 /// the box walk pushed, and that walk stops at the first box whose declared
