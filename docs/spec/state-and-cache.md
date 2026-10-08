@@ -209,8 +209,9 @@ never from the URL.
 Why the name is the hash, and not the prototype's `wh-<source-id>.<ext>
 (main.go:282)`:
 
-1. Identity and filename become the same fact, so dedupe is a `stat`, not a
-   table lookup that can disagree with the disk.
+1. Identity and filename become the same fact, so dedupe is the file's bytes
+   hashing to the digest in its name, not a table lookup that can disagree with
+   the disk.
 2. A re-materialised favorite lands at the same path it had before, which is what
    makes "the evictor skips pinned files" (features.md 1.2) a stable rule rather
    than one that breaks after a cache clear.
@@ -372,7 +373,7 @@ failure path; `-set` no longer downloads at all, so it has nothing to prune.
 
 | Candidate identity | What it gets right | What it gets wrong | Verdict |
 |---|---|---|---|
-| Content hash (SHA-256 of the stored bytes) | Filename is identity; dedupe is a `stat`; the name verifies the bytes; a re-materialised file returns to a stable path, so pins survive | Costs a hash pass; two byte-identical images from different sources collapse, which is the point but must be a stated decision | **Chosen** as the primary identity |
+| Content hash (SHA-256 of the stored bytes) | Filename is identity; a hit is the file's bytes hashing to the digest in its name, so dedupe and the integrity check are one pass; a re-materialised file returns to a stable path, so pins survive | Costs a hash pass; two byte-identical images from different sources collapse, which is the point but must be a stated decision | **Chosen** as the primary identity |
 | Source-scoped ID (Wallhaven `id`, Wikimedia pageid, local path) | Free: the source already returned it; a cheap pre-download filter | Names are not identity: the same image from two sources has two ids and lands twice; a `local` id built from a filename (as `main.go:246-247` does) changes under a rename | **Kept as a secondary key**, `origin_key`, for the pre-download window check only |
 | Canonical URL | Free; human readable; it is what a re-download needs | Same URL can serve different bytes (re-encode, a `?cb=` query), and different URLs serve identical bytes (mirrors, thumbnails, a local copy of something downloaded earlier) | **Kept as the re-materialisation hint only**, field `origin`, never as identity |
 
