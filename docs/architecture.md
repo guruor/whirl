@@ -660,7 +660,8 @@ terminator  := "OK" | "ERR " code " " message
     set of them: `min_width` and `min_height` sit between `display` and `filters`, and `startup.*`,
     `filters.target_ratio` and `cache.root` appear like any other key. The two keys whose value is
     resolved rather than written keep their file positions too: `backend` after 4.3's precedence,
-    `sources` as the count of enabled sources. `config_schema`, `socket` and `log_level` are absent,
+    `sources` as the count of enabled sources. `config_schema`, `socket`, `log_level` and
+    `log_max_bytes` are absent,
     because they are the daemon's own settings and not the rotation's. A key with no value prints
     `-`, this document's rule everywhere else, which is how an unset `cache.root` or
     `filters.target_ratio` reads. For the config 4.2 writes, the line is exactly
@@ -1388,7 +1389,7 @@ closed and `[D 6 §8.7]` puts the write on the daemon. It parses as JSON: `[L 6]
   "_comment_3": "every level. Every key below is written at its default value, so deleting a line",
   "_comment_4": "keeps the default and there is no key whose absence means something different.",
   "_comment_5": "Precedence, lowest first: compiled defaults, this file, the environment",
-  "_comment_6": "(WHIRL_CONFIG, WHIRL_SOCKET, WHIRL_STATE_DIR, WHIRL_CACHE_DIR, WHIRL_BACKEND,",
+  "_comment_6": "(WHIRL_CONFIG, WHIRL_SOCKET, WHIRL_STATE_DIR, WHIRL_CACHE_DIR, WHIRL_LOG, WHIRL_BACKEND,",
   "_comment_7": "WHIRL_WALLHAVEN_API_KEY), then daemon flags, which exist for tests only.",
   "_comment_8": "Two legacy names are still accepted and log a deprecation warning: `keep` for",
   "_comment_9": "cache.max_files and `cache_dir` for cache.root. Neither is written back.",
@@ -1401,6 +1402,9 @@ closed and `[D 6 §8.7]` puts the write on the daemon. It parses as JSON: `[L 6]
 
   "log_level": "info",
   "_comment_log_level": "off | error | warn | info | debug. The log is a file the daemon owns; it is never an interface.",
+
+  "log_max_bytes": 1048576,
+  "_comment_log_max_bytes": "1 MiB. The cap on the log file, checked at startup and at every rotation: past it the daemon rewrites the file keeping the newest whole lines and writes one line saying what it dropped. 0 means keep everything and is the only value that means that; any other value must be at least 4096.",
 
   "schedule": {
     "interval_seconds": 1800,
@@ -1524,7 +1528,8 @@ Order, later wins:
 1. compiled defaults (every value in 4.2),
 2. the config file,
 3. the environment: `WHIRL_CONFIG` (config path), `WHIRL_SOCKET`, `WHIRL_STATE_DIR`,
-   `WHIRL_CACHE_DIR`, `WHIRL_BACKEND`, and `WHIRL_WALLHAVEN_API_KEY` (the key itself, never a path
+   `WHIRL_CACHE_DIR`, `WHIRL_LOG` (the log file `log_max_bytes` bounds), `WHIRL_BACKEND`, and
+   `WHIRL_WALLHAVEN_API_KEY` (the key itself, never a path
    to it),
 4. command-line flags on the daemon and the worker, which exist only for tests and for the
    `--backend noop` switch `[D 5 §2.4]` needs: `--config`, `--socket`, `--backend`.
@@ -1537,7 +1542,10 @@ Rules, all of them checked before the daemon serves a request:
   `[D 6 §8.7]`, with the key and the two values named in the message. The ordering rules are:
   `cache.max_bytes >= filters.max_bytes` (the cache must hold at least one admissible image),
   `cache.max_files >= 2`, `state.history_entries >= 1`, `dedupe.recent_entries >= 1`,
-  `schedule.interval_seconds >= 60`, and `schedule.worker_deadline_seconds >= 60`.
+  `schedule.interval_seconds >= 60`, and `schedule.worker_deadline_seconds >= 60`. `log_max_bytes`
+  is the one rule that is not an ordering: it is `0` (keep everything) or at least 4096, which is
+  about eight times the widest line the daemon writes (484 bytes measured), so a legal cap always
+  has a line to drop.
 - **A source that fails the daemon's structural check refuses startup; a source that fails the
   worker's semantic check is disabled, not fatal.** `decision:` the split, and the reason it is
   needed: `[D 6 §8.7]` says a config that fails `whirl config check` is a config the daemon refuses

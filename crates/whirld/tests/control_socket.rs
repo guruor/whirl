@@ -1,9 +1,11 @@
 //! The control socket, end to end: a real daemon, a real socket, and the
 //! quickstart's own commands (docs/development.md section 7).
 //!
-//! The test spawns `whirld` with all five variables of section 7 pointing into a
-//! temporary directory, so it touches neither the user's config, state, cache or
-//! socket, and it sets `WHIRL_BACKEND=noop` so no wallpaper is ever set.
+//! The test spawns `whirld` with all six variables of section 7 pointing into a
+//! temporary directory (`WHIRL_CONFIG`, `WHIRL_SOCKET`, `WHIRL_STATE_DIR`,
+//! `WHIRL_CACHE_DIR`, `WHIRL_LOG` and `WHIRL_BACKEND`), so it touches neither the
+//! user's config, state, cache, log or socket, and it sets `WHIRL_BACKEND=noop`
+//! so no wallpaper is ever set.
 //!
 //! Run it with `cargo test --workspace`: the daemon looks for `whirl-worker` next
 //! to its own executable, and that is where a test build lays the two binaries.
@@ -276,14 +278,29 @@ fn spawn_daemon_at(executable: &Path, dir: &Path, socket: &Path, whirl_config: b
     );
 
     // The daemon's stderr goes to a file, never to this process's: a child that
-    // inherited the test harness's pipe would hold it open past the run.
+    // inherited the test harness's pipe would hold it open past the run. That
+    // file is also `WHIRL_LOG`, so the daemon's `log_max_bytes` check bounds the
+    // very file it writes, and it is opened **append** because that is the
+    // descriptor launchd hands a job from `StandardOutPath` (`O_APPEND`; the
+    // in-place trim of `crates/whirld/src/log.rs` depends on it). A plain
+    // `File::create` would write at its stale offset after a trim and leave a
+    // NUL hole, which is neither what launchd does nor what is under test.
+    //
+    // `WHIRL_LOG` also keeps the check off the *user's* own log: without it the
+    // daemon would resolve `$HOME/Library/Logs/whirl/whirl.log` and a test would
+    // trim the log the real daemon is writing.
     let log_path = dir.join("daemon.log");
-    let log = std::fs::File::create(&log_path).expect("a log file");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("a log file");
     let mut command = Command::new(executable);
     command
         .env("WHIRL_SOCKET", socket)
         .env("WHIRL_STATE_DIR", dir.join("state"))
         .env("WHIRL_CACHE_DIR", dir.join("cache"))
+        .env("WHIRL_LOG", &log_path)
         .env("WHIRL_BACKEND", "noop")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -780,6 +797,175 @@ fn a_file_dropped_before_candidacy_reaches_the_daemons_log() {
     );
 }
 
+/// A config whose `log_max_bytes` the test chooses, over one `local` source in
+/// its own tree. The cap used here is the smallest 4.3 lets a config state, so a
+/// handful of rotations reach it rather than thousands.
+fn write_config_with_log_cap(dir: &Path, cap: u64) {
+    let walls = dir.join("walls");
+    std::fs::create_dir_all(&walls).expect("the source's directory");
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"log_max_bytes\": {cap},\n  \
+             \"sources\": [\n    {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \
+             \"paths\": [\"{}\"] }}\n  ]\n}}\n",
+            walls.display()
+        ),
+    )
+    .expect("the test's own config");
+}
+
+/// Files and bytes under `dir`, recursively: the two numbers the log's rule is
+/// judged against.
+fn tree_counts(dir: &Path) -> (usize, u64) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(metadata) = entry.metadata() {
+                files += 1;
+                bytes += metadata.len();
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// Every `*.part` file under `dir`, as paths relative to it.
+fn part_files(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().ends_with(".part") {
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Every file whirl writes has a stated cap and the daemon is the party that
+/// enforces it. The log is the one file the *supervisor* opens --
+/// `spawn_daemon_at` points the daemon's stderr and `WHIRL_LOG` at the same path,
+/// which is what launchd's `StandardOutPath` does -- so the daemon holds it to
+/// `log_max_bytes`, at the end of every rotation.
+///
+/// The rotation is repeated and made to fail on purpose: a failure is what grows
+/// the log (`no_candidates`, 2.7), and `rotate` is the on-demand entrance to the
+/// same path the schedule takes (2.3). The other two files are counted across the
+/// sequence, because "the log is the only thing this touched" is the substance of
+/// the rule.
+///
+/// The numbers are printed, not only asserted, so the run is the evidence a
+/// reader can check without repeating it (`cargo test -- --nocapture`).
+#[test]
+fn repeated_failing_rotations_leave_the_log_at_its_cap_and_nothing_else_changed() {
+    const CAP: u64 = 4096;
+    const ROTATIONS: usize = 40;
+    let daemon = start_prepared(
+        "repeated_failing_rotations_leave_the_log_at_its_cap_and_nothing_else_changed",
+        |dir| write_config_with_log_cap(dir, CAP),
+    );
+
+    // The source directory is empty, so the rotation fails at the candidate
+    // stage and is still logged in full. `next` is 2.3's on-demand rotation.
+    let first = daemon.ask("next");
+    assert!(
+        first
+            .iter()
+            .any(|line| line.starts_with("ERR no_candidates")),
+        "the fixture's rotation has to fail: {first:?}"
+    );
+
+    // The baseline is taken after one rotation rather than before the daemon
+    // starts: the first sweep legitimately writes the cache's own index, and what
+    // the sequence must not do is keep adding to it.
+    let cache_before = tree_counts(&daemon.dir.join("cache"));
+    let state_before = tree_counts(&daemon.dir.join("state"));
+
+    for run in 1..ROTATIONS {
+        let lines = daemon.ask("next");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("ERR no_candidates")),
+            "rotation {run} was expected to fail the same way: {lines:?}"
+        );
+    }
+
+    let log_path = daemon.dir.join("daemon.log");
+    let log_bytes = std::fs::metadata(&log_path).expect("the log's stat").len();
+    let log = String::from_utf8_lossy(&std::fs::read(&log_path).expect("the log")).into_owned();
+    let trims = log
+        .lines()
+        .filter(|line| line.contains("log trimmed:"))
+        .count();
+    let cache_after = tree_counts(&daemon.dir.join("cache"));
+    let state_after = tree_counts(&daemon.dir.join("state"));
+    let parts = part_files(&daemon.dir.join("cache"));
+
+    println!(
+        "log {} bytes against a cap of {CAP}; {trims} trims over {ROTATIONS} failing rotations; \
+         cache {cache_before:?} -> {cache_after:?}; state {state_before:?} -> {state_after:?}; \
+         part files {parts:?}",
+        log_bytes
+    );
+
+    assert!(
+        log_bytes <= CAP,
+        "the log is {log_bytes} bytes against a cap of {CAP}"
+    );
+    assert!(
+        trims >= 1,
+        "the daemon has to say in the log what it did when it trimmed: {trims} trim lines"
+    );
+    assert!(
+        log.contains("whirld: log trimmed: "),
+        "and the line has to be this daemon's own: {log}"
+    );
+    assert_eq!(
+        cache_after.0, cache_before.0,
+        "{ROTATIONS} failing rotations added no cache file"
+    );
+    assert!(
+        cache_after.1 <= cache_before.1 + 1024,
+        "the cache's own index is rewritten in place at every rotation, so a bookkeeping \
+         field can move a few bytes ({} -> {}); what it must not do is accumulate with the \
+         rotations",
+        cache_before.1,
+        cache_after.1
+    );
+    assert_eq!(
+        state_after.0, state_before.0,
+        "and the state directory holds the same files it held"
+    );
+    assert!(
+        state_after.1 <= state_before.1 + 1024,
+        "with the same bound on its bytes ({} -> {})",
+        state_before.1,
+        state_after.1
+    );
+    assert!(
+        parts.is_empty(),
+        "no cache write left a `.part` behind: {parts:?}"
+    );
+}
+
 /// One ISO box: the 32-bit size, the type, then the payload.
 fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut bytes = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
@@ -1190,8 +1376,10 @@ fn cli_binary() -> PathBuf {
     cli
 }
 
-/// One `whirl` command against the running daemon, with the five variables of
-/// docs/development.md section 7 in its environment. Bounded: a client that waits
+/// One `whirl` command against the running daemon, with the five path variables
+/// of docs/development.md section 7 in its environment. (`WHIRL_LOG` is the sixth
+/// there and is not one a client has any use for: the log is the daemon's.)
+/// Bounded: a client that waits
 /// for a line the daemon will never send must fail this test, not hang the suite.
 ///
 /// The three streams are kept apart: stdout and stderr are the CLI's two halves

@@ -59,8 +59,8 @@ unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
 }
 
-/// A temporary tree of this test's own: never the user's config, state, cache or
-/// socket (docs/development.md section 7).
+/// A temporary tree of this test's own: never the user's config, state, cache,
+/// socket or log (docs/development.md section 7).
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("whirl-lock-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -72,8 +72,17 @@ fn socket(dir: &Path) -> PathBuf {
     dir.join("run").join("whirl.sock")
 }
 
-/// The daemon of docs/development.md section 7, with every path redirected and
-/// `WHIRL_BACKEND=noop` so no wallpaper is ever set.
+/// The daemon's log inside this test's tree: the file `WHIRL_LOG` names in
+/// `command` and the one `start` hands the child as its stderr, so the daemon
+/// writes to, and holds its cap to, the file a reader of `daemon.log` sees
+/// (docs/spec/state-and-cache.md 1.1: the supervisor opens it and the daemon
+/// bounds what it was given).
+fn log_file(dir: &Path) -> PathBuf {
+    dir.join("daemon.log")
+}
+
+/// The daemon of docs/development.md section 7, with every path redirected,
+/// including `WHIRL_LOG`, and `WHIRL_BACKEND=noop` so no wallpaper is ever set.
 fn command(dir: &Path) -> Command {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_whirld"));
     let worker = executable
@@ -91,15 +100,32 @@ fn command(dir: &Path) -> Command {
         .env("WHIRL_SOCKET", socket(dir))
         .env("WHIRL_STATE_DIR", dir.join("state"))
         .env("WHIRL_CACHE_DIR", dir.join("cache"))
+        // The daemon resolves its log to `$HOME/Library/Logs/whirl/whirl.log`
+        // (`crates/whirld/src/plan.rs`) and rewrites that file in place to
+        // `log_max_bytes` at startup (`crates/whirld/src/main.rs`). Without
+        // `WHIRL_LOG` every run of this file trims the log the user's own daemon
+        // is writing, which is the one path docs/development.md section 7 does
+        // not let a test near.
+        .env("WHIRL_LOG", log_file(dir))
         .env("WHIRL_BACKEND", "noop")
         .stdin(Stdio::null());
+    // The cheap check beside the comment above: the daemon is handed a log
+    // inside this test's tree, never `$HOME`. Deleting the `WHIRL_LOG` line
+    // above makes this fail rather than quietly repairing to the platform
+    // default, which is how the log came to be the user's own file.
+    assert!(
+        command.get_envs().any(|(name, value)| {
+            name == "WHIRL_LOG" && value.is_some_and(|value| Path::new(value).starts_with(dir))
+        }),
+        "the daemon is handed no log outside its scratch tree"
+    );
     command
 }
 
 /// One running daemon, waited for by its socket: a daemon that has taken the lock
 /// of 1.5 step 1, loaded its state and bound 2.1's socket.
 fn start(dir: &Path) -> Child {
-    let log_path = dir.join("daemon.log");
+    let log_path = log_file(dir);
     let log = std::fs::File::create(&log_path).expect("a log file");
     let mut child = command(dir)
         .stdout(Stdio::null())

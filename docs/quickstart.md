@@ -58,7 +58,7 @@ JSON
 ## 3. Start it, and rotate
 
 ```sh
-export WHIRL_CONFIG="$HOME/.whirl/config.json" WHIRL_SOCKET="$HOME/.whirl/whirl.sock" WHIRL_STATE_DIR="$HOME/.whirl/state" WHIRL_CACHE_DIR="$HOME/.whirl/cache"
+export WHIRL_CONFIG="$HOME/.whirl/config.json" WHIRL_SOCKET="$HOME/.whirl/whirl.sock" WHIRL_STATE_DIR="$HOME/.whirl/state" WHIRL_CACHE_DIR="$HOME/.whirl/cache" WHIRL_LOG="$HOME/.whirl/whirl.log"
 
 whirld
 ```

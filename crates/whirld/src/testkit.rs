@@ -95,6 +95,10 @@ pub fn build(
         state_dir: state_dir.clone(),
         cache_dir: cache_dir.clone(),
         backend: Backend::Noop,
+        // The log the supervisor would open. Nothing here writes it, so a
+        // rotation's check finds no file and touches nothing: a test that wants
+        // a trim writes lines to this path itself (`crate::log`'s own tests).
+        log_path: Some(dir.join("whirl.log")),
         config: RwLock::new(config),
     };
     let worker = Worker::new(
