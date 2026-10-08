@@ -677,6 +677,10 @@ impl Daemon {
         self.reconfigure();
         let deadline = self.worker_deadline();
         let mut reported = None;
+        // 1.6's prefetched entries, as `Reported`: the second half of what this
+        // rotation told the daemon, and the second set of index entries 7.3
+        // step 4 writes. Empty for every rotation that warmed nothing.
+        let mut warmed: Vec<Reported> = Vec::new();
         // 7.3 step 4's input for 8.8: the pid of the worker this run has reaped,
         // written by the two places that hold an exit status -- the `try_wait`
         // that saw a normal exit, and `terminate` on the deadline (1.7.1). A
@@ -690,7 +694,7 @@ impl Daemon {
             .worker
             .run_reporting_reaped(verb, target, run, deadline, &mut reaped);
         let outcome = match result {
-            Ok(Outcome::Set(record)) => {
+            Ok(Outcome::Set { record, prefetched }) => {
                 self.record_success(
                     &record.digest,
                     &record.origin_key,
@@ -707,6 +711,21 @@ impl Daemon {
                     path: record.path.clone().unwrap_or_default(),
                     kind: self.kind_of(&record.origin_key),
                 });
+                // The same input, from the `prefetch:` lines of 4.2: the bytes
+                // this run warmed get the same index entry a set gets, which is
+                // what makes the next rotation find them in the service map
+                // (docs/spec/state-and-cache.md 4.1) instead of fetching them
+                // again - and what keeps 5.5 step 3 from reclaiming them as
+                // orphans.
+                warmed = prefetched
+                    .iter()
+                    .map(|entry| Reported {
+                        digest: entry.digest.clone(),
+                        origin_key: entry.origin_key.clone(),
+                        path: entry.path.clone(),
+                        kind: self.kind_of(&entry.origin_key),
+                    })
+                    .collect();
                 Rotation::Set(record)
             }
             // A rotation verb answered with `source:`/`plan:` lines is not the
@@ -742,7 +761,7 @@ impl Daemon {
         // ("including failed ones") and records no entry, because there is
         // nothing the worker reported. `reaped` goes with it: under 8.7's
         // fallback it is what lets the sweep remove that worker's lock file (8.8).
-        self.finish_rotation(reported.as_ref(), reaped);
+        self.finish_rotation(reported.as_ref(), &warmed, reaped);
         // The log's cap (docs/spec/state-and-cache.md 1.1, 4.2's
         // `log_max_bytes`) is checked at the end of every rotation, which is the
         // one place both the scheduled rotation and the one a client asks for
@@ -965,26 +984,57 @@ impl Daemon {
         }
     }
 
-    /// 7.3 step 4's daemon half, after the worker has exited: the index entry for
-    /// what the worker reported (7.2 makes the daemon the writer of
+    /// 7.3 step 4's daemon half, after the worker has exited: the index entries
+    /// for what the worker reported (7.2 makes the daemon the writer of
     /// `cache/index.json`), then the sweep. Both run after every rotation,
     /// including a failed one (5.5).
+    ///
+    /// `warmed` is the second half of that first part and it is 1.6's: the
+    /// candidates the rotation fetched ahead of itself. They are recorded
+    /// *before* the sweep for the same reason the set's entry is, and with the
+    /// same function: 5.5 step 3 reclaims any file under `sha256/` the index does
+    /// not know, so a prefetched file with no entry would be an orphan the first
+    /// time `cache.grace_seconds` had passed. Each line the daemon logs here is
+    /// the answer to "what is warm" for a person reading the log: it names the
+    /// `origin_key` and the digest a following rotation will be served from.
     ///
     /// `reaped` is the pid of the worker this rotation's process has reaped, and
     /// it is the sweep's alone: 8.8's one exception to the refusal is the
     /// `rotate.lock` of that worker, under 8.7's `excl_file` fallback.
-    fn finish_rotation(&self, reported: Option<&Reported>, reaped: Option<u32>) {
-        if let Some(reported) = reported {
+    fn finish_rotation(
+        &self,
+        reported: Option<&Reported>,
+        warmed: &[Reported],
+        reaped: Option<u32>,
+    ) {
+        if reported.is_some() || !warmed.is_empty() {
             let protected = {
                 let state = self.state();
                 protected_set(&state)
             };
             let now = unix_seconds();
-            match cache::record(&self.effective.cache_dir, reported, &protected, now) {
-                // The sweep writes the file; an entry recorded here is already in
-                // it, and 5.5 step 6 writes it again on every sweep anyway.
-                Ok(_) => {}
-                Err(message) => eprintln!("whirld: index entry not written: {message}"),
+            if let Some(reported) = reported {
+                match cache::record(&self.effective.cache_dir, reported, &protected, now) {
+                    // The sweep writes the file; an entry recorded here is already
+                    // in it, and 5.5 step 6 writes it again on every sweep anyway.
+                    Ok(_) => {}
+                    Err(message) => eprintln!("whirld: index entry not written: {message}"),
+                }
+            }
+            for entry in warmed {
+                match cache::record(&self.effective.cache_dir, entry, &protected, now) {
+                    Ok(Some(recorded)) => eprintln!(
+                        "whirld: prefetched {} {} {} bytes",
+                        entry.origin_key, entry.digest, recorded.bytes
+                    ),
+                    // The two arms `cache::record` documents for a report it
+                    // cannot use: a path outside the cache root, a file that is
+                    // gone, or a digest the index already holds. None of them is a
+                    // fault, and none of them is worth a line the log does not
+                    // need.
+                    Ok(None) => {}
+                    Err(message) => eprintln!("whirld: prefetched entry not written: {message}"),
+                }
             }
         }
         self.sweep_with(reaped);

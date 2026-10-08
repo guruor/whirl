@@ -961,6 +961,32 @@ pub fn parse_worker_set_line(line: &str) -> Option<(String, String, String)> {
     Some((digest.to_string(), origin_key.to_string(), path.to_string()))
 }
 
+/// The worker's `prefetch:` line on stdout: `prefetch: <digest> <origin_key>
+/// <path>`, one per candidate the rotation warmed ahead of itself
+/// (docs/architecture.md 1.6).
+///
+/// The same three fields as the `set:` line and the same parser's shape, with a
+/// different word in front of them, because the daemon does the same thing with
+/// them: the path is validated against the cache root and an index entry is
+/// written for the digest and the `origin_key`. The prefix is what tells the two
+/// apart, and it is what keeps the `set:` line the rotation's result
+/// ([`parse_worker_set_line`]) rather than the last thing the worker happened to
+/// write.
+pub fn parse_worker_prefetch_line(line: &str) -> Option<(String, String, String)> {
+    let rest = line.strip_prefix("prefetch: ")?;
+    let mut fields = rest.splitn(3, ' ');
+    let digest = fields.next()?;
+    if !is_digest(digest) {
+        return None;
+    }
+    let origin_key = fields.next()?;
+    let path = fields.next()?;
+    if origin_key.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((digest.to_string(), origin_key.to_string(), path.to_string()))
+}
+
 /// An RFC 3339 UTC timestamp, e.g. `2026-09-25T07:41:12Z` (docs/architecture.md
 /// 2.6: "Timestamps are RFC 3339 UTC"). A timestamp is a protocol token, so it
 /// is formatted here beside the grammar and the hasher, and every timestamp in

@@ -37,6 +37,18 @@ pub const CONFIG_SCHEMA: i64 = 1;
 /// numbers move together.
 pub const LOG_CAP_MIN_BYTES: u64 = 4096;
 
+/// The ceiling on `prefetch` (docs/architecture.md 4.2 and 4.3).
+///
+/// `0` is the other legal value and means "fetch nothing ahead", which has to be
+/// written rather than inferred - the same shape `log_max_bytes` has. The ceiling
+/// is not taste: every prefetched candidate is one more download inside the
+/// rotation's own `worker_deadline_seconds`, one more report line on the worker's
+/// stdout (which the daemon reads after the worker exits), and one more image
+/// held against `cache.max_bytes` until the sweep reclaims it. `pages` is capped
+/// the same way and for the same kind of reason (45 requests a minute there, a
+/// per-rotation cost here).
+pub const PREFETCH_MAX: usize = 8;
+
 /// The source kinds the schema knows. Also the closed set an unknown `kind` is
 /// reported against (docs/spec/features.md 2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -338,6 +350,12 @@ pub struct Config {
     /// `log_max_bytes`: the cap on the daemon's own log file. `0` keeps
     /// everything and is the only value that means that.
     pub log_max_bytes: u64,
+    /// `prefetch`: how many of the candidates a successful rotation did not
+    /// need are fetched and stored before the worker exits, so the rotations
+    /// after it set from the cache instead of paying for the download. `0`
+    /// turns it off and is the only value that means that; the ceiling is
+    /// [`PREFETCH_MAX`].
+    pub prefetch: usize,
     pub schedule: Schedule,
     pub startup: Startup,
     pub display: DisplaySection,
@@ -360,6 +378,7 @@ impl Default for Config {
             socket: None,
             log_level: LogLevel::Info,
             log_max_bytes: 1_048_576,
+            prefetch: 2,
             schedule: Schedule {
                 interval_seconds: 1800,
                 worker_deadline_seconds: 300,
@@ -691,6 +710,26 @@ fn parse_root(root: &json::Node, warnings: &mut Vec<ConfigWarning>) -> Result<Co
     if let Some(node) = reader.field("log_max_bytes") {
         let field = reader.path("log_max_bytes");
         config.log_max_bytes = want_u64(node, &field)?;
+    }
+    if let Some(node) = reader.field("prefetch") {
+        let field = reader.path("prefetch");
+        let prefetch = want_usize(node, &field)?;
+        // The same shape as `wallhaven.pages`: a count whose ceiling is a fact
+        // about what the rotation can afford, refused here rather than clamped,
+        // because a config that silently means something else is worse than one
+        // that is refused (docs/architecture.md 4.3).
+        if prefetch > PREFETCH_MAX {
+            return Err(ConfigError::new(
+                field,
+                node.line,
+                format!(
+                    "prefetch {prefetch} is above {PREFETCH_MAX}; each one is a download inside \
+                     the rotation's own worker_deadline_seconds and an image held against \
+                     cache.max_bytes"
+                ),
+            ));
+        }
+        config.prefetch = prefetch;
     }
     if let Some(node) = reader.field("schedule") {
         let field = reader.path("schedule");
@@ -2200,6 +2239,9 @@ const DEFAULT_CONFIG_JSON: &str = r#"{
 
   "log_max_bytes": 1048576,
   "_comment_log_max_bytes": "1 MiB. The cap on the log file, checked at startup and at every rotation: past it the daemon rewrites the file keeping the newest whole lines and writes one line saying what it dropped. 0 means keep everything and is the only value that means that; any other value must be at least 4096.",
+
+  "prefetch": 2,
+  "_comment_prefetch": "How many candidates a successful rotation did not need are fetched and stored before the worker exits, so the rotations after it set from the cache instead of paying for the download. 0 turns it off and is the only value that means that; the ceiling is 8.",
 
   "schedule": {
     "interval_seconds": 1800,

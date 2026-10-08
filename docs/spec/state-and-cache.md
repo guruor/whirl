@@ -1023,14 +1023,15 @@ that opens the file.
    arrives while the first is running therefore does not wait behind a queue: its
    worker fails the non-blocking lock and exits `busy`, which is a fact the user
    can see, instead of a second download nobody asked for.
-3. The worker runs: enumerates, filters, downloads, renames, sets, exits with one
-   result line on stdout.
+3. The worker runs: enumerates, filters, downloads, renames, sets, and exits. Its
+   result is the `set:` line on stdout, and the `prefetch:` lines that may follow
+   it are what it warmed on the way out (`docs/architecture.md` 1.6).
 4. The daemon takes `rotate.lock` (the worker has exited, so this cannot block;
    where the `excl_file` fallback of 8.7 is in force, the daemon removes the
    reaped worker's lock file here, under 8.8), validates that the reported path
    is inside the cache root and exists, writes
-   `current.json`, `history.json` and the index entry, runs the sweep, and
-   releases the lock.
+   `current.json`, `history.json` and an index entry for the set and for each
+   `prefetch:` line, runs the sweep, and releases the lock.
 5. The daemon notifies `idle` subscribers once, and only once. The prototype's
    `whd.rs` wakes twice per rotation (worker start and finish) and the spike
    README calls the duplicate notification cosmetic; with R2 in force there is
