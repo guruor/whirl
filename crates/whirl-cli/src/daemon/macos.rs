@@ -416,6 +416,11 @@ fn plist_xml(binary: &Path, log: &Path) -> String {
     let _ = writeln!(xml, "\t<key>ProcessType</key>");
     let _ = writeln!(xml, "\t<string>Background</string>");
     let log = escape(&log.to_string_lossy());
+    // Both streams go to the one file, and launchd opens it with `O_APPEND`.
+    // That descriptor holds the inode, so nothing here may rotate the log by
+    // renaming it: the daemon would go on appending to the renamed file. The
+    // `log_max_bytes` cap is instead applied by rewriting the file in place
+    // (`crates/whirld/src/log.rs`, `docs/decisions/0004`).
     let _ = writeln!(xml, "\t<key>StandardOutPath</key>");
     let _ = writeln!(xml, "\t<string>{log}</string>");
     let _ = writeln!(xml, "\t<key>StandardErrorPath</key>");

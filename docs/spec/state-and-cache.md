@@ -85,7 +85,7 @@ repository for local (nonroaming) applications" [6].
 | `~/Library/Application Support/whirl/state/favorites.json` | The favorites collection. | No. The one irreversible file (section 6.4). |
 | `~/Library/Application Support/whirl/whirl.sock` | The control socket, `0600`. | Yes. Recreated on start. |
 | `~/Library/Caches/whirl/` | `index.json`, `sha256/**`, `tmp/**`. The whole directory. | Yes, for whirl. See 1.4 for the display caveat. |
-| `~/Library/Logs/whirl/whirl.log` | The log, one file rotated at 1 MiB, three kept. | Yes. Diagnostics only. |
+| `~/Library/Logs/whirl/whirl.log` | The log, one file, rewritten in place when it crosses `log_max_bytes` (`docs/architecture.md` 4.2), newest whole lines kept. | Yes. Diagnostics only. |
 
 `decision:` the directory is literally `whirl`, not a reverse-DNS bundle id.
 Apple's convention is "a subdirectory whose name matches the bundle identifier
@@ -101,6 +101,22 @@ follows the same naming convention as the two directories above. This is a
 convention call, not a quoted requirement: Apple's table is written for the
 system domain, and the reason to follow it is that a user with a disk-space
 problem can delete logs without wondering whether they were state.
+
+`decision:` the log is rewritten **in place** rather than rotated, and that is
+forced by who opens it. The daemon never opens the log: the launchd job's
+`StandardOutPath` and `StandardErrorPath` do
+(`crates/whirl-cli/src/daemon/macos.rs`), and launchd opens that descriptor with
+`O_APPEND` and offers no rotation key. An `O_APPEND` descriptor holds the inode,
+not the path, so renaming the log out of the way would leave the daemon appending
+to the renamed file: the archive would grow and the live log would stay empty,
+which is the opposite of what a rotation is for. Rewriting in place keeps the
+inode, so the daemon's next line lands on the kept text. The cap itself is
+`log_max_bytes` (4.2), and the daemon applies it at startup and at the end of
+every rotation. The one thing this asks of a setup that writes the log by hand is
+that its redirect append (`>>`, or any `O_APPEND` descriptor): a `>` redirect
+does not append, and a write at its stale offset after a trim would leave a NUL
+hole. Nothing in whirl redirects with `>`; the harness that spawns a daemon under
+test opens its log with `append(true)` for that reason.
 
 ### 1.2 Linux (XDG)
 

@@ -1404,10 +1404,11 @@ binaries and unpacking it again. The layout is the workflow's; the download is
 not.
 
 **Running it without touching your own wallpaper or your own state.** The daemon
-writes where the five environment variables of the next subsection point, and the
+writes where the six environment variables of the next subsection point, and the
 macOS defaults are real user paths: `~/Library/Application Support/whirl` for the
-config, the socket and the state, `~/Library/Caches/whirl` for the cache. Set all
-five and nothing outside the directory you name is written at all:
+config, the socket and the state, `~/Library/Caches/whirl` for the cache,
+`~/Library/Logs/whirl` for the log. Set all six and nothing outside the directory
+you name is written at all:
 
 ```sh
 RUN=/tmp/whirl-sandbox
@@ -1429,6 +1430,7 @@ export WHIRL_CONFIG="$RUN/config.json"
 export WHIRL_SOCKET="$RUN/whirl.sock"
 export WHIRL_STATE_DIR="$RUN/state"
 export WHIRL_CACHE_DIR="$RUN/cache"
+export WHIRL_LOG="$RUN/whirl.log"
 export WHIRL_BACKEND=noop
 
 whirld                                       # terminal 1: the daemon, in the foreground
@@ -1437,7 +1439,8 @@ whirld                                       # terminal 1: the daemon, in the fo
 The copy is the point of the recipe: the one source points into `$RUN`, so a
 rotation cannot take a picture out of your real directory even if it did set one.
 The daemon prints what it resolved before it listens, which is the check that the
-five variables took effect:
+five path variables took effect (`WHIRL_LOG` is the sixth and is not printed: the
+daemon bounds that file, it does not own it):
 
 ```
 whirld: config /tmp/whirl-sandbox/config.json
@@ -1446,7 +1449,7 @@ whirld: backend noop
 whirld: listening on /tmp/whirl-sandbox/whirl.sock
 ```
 
-With the same five exported in terminal 2, `whirl status` answers with those paths
+With the same six exported in terminal 2, `whirl status` answers with those paths
 in it. This is one real block, unabridged:
 
 ```
@@ -1573,8 +1576,9 @@ Drop `--root <dir>` if the binaries went to the default prefix; the three
 `command -v whirl; command -v whirld; command -v whirl-worker` prints nothing
 afterwards, which is the check. Two things are then left that an install did not
 put there: the sandbox directory you made, which is yours to delete, and, if you
-ever ran the daemon with none of the five variables, your real
-`~/Library/Application Support/whirl` and `~/Library/Caches/whirl`.
+ever ran the daemon with none of the six variables, your real
+`~/Library/Application Support/whirl`, `~/Library/Caches/whirl` and
+`~/Library/Logs/whirl`.
 
 **Do I have to publish this to crates.io to install it?** No, and no step here
 needs a registry, a token or a password:
@@ -1612,7 +1616,7 @@ The real `~/Library/Application Support/whirl` and `~/Library/Caches/whirl` were
 listed before and after and did not change. Not executed: a download from a real
 release, because none exists, and anything on Windows or Linux.
 
-### The five environment variables
+### The six environment variables
 
 Precedence is config file, then environment, then daemon flags
 (`docs/architecture.md` 4.3). The flags exist for tests.
@@ -1623,6 +1627,7 @@ Precedence is config file, then environment, then daemon flags
 | `WHIRL_SOCKET` | the control socket path, overriding `socket` in the config |
 | `WHIRL_STATE_DIR` | where `current.json`, `history.json`, `favorites.json` and the locks live |
 | `WHIRL_CACHE_DIR` | where candidate images and `index.json` live |
+| `WHIRL_LOG` | the daemon's own log file, the one `log_max_bytes` bounds; with none, the platform's log path is used and nothing is created |
 | `WHIRL_BACKEND` | `native` or `noop`; `noop` runs every stage except the platform setter |
 
 `WHIRL_WALLHAVEN_API_KEY` is read by the worker only when the daemon's own
