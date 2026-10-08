@@ -17,7 +17,7 @@ decision.
 | `docs/`, `prototype/` | exist |
 | the Cargo workspace (`crates/`) | exists on pull request #1: `whirl-core`, `whirld`, `whirl-cli`, `whirl-worker`, four members and no third-party dependency |
 | `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36240381639`, thirteen jobs, on the tip of `development`. The `coverage` job added since is the fourteenth, and it has run on a runner: run `37462295465`, the whole workflow green, the coverage job's log ending in the floor holding (section 4, "What has and has not been verified") |
-| `.github/workflows/release.yml` | written here, lints clean, and **has run** three times: green once, on the throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag; and red twice since, on the throwaway guard probes `v0.0.1-rc.test-guard`, run `36156068912`, and `v0.0.1-rc.review-guard-t6d652592`, run `36157463795`, where the `guard` job failed because the tag was not on `main` and `build` and `release` were skipped, so neither probe built or published anything. No tag and no release exists on `origin` today |
+| `.github/workflows/release.yml` | written here, lints clean, and **has run** five times: green once, on the throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag; red twice since, on the throwaway guard probes `v0.0.1-rc.test-guard`, run `36156068912`, and `v0.0.1-rc.review-guard-t6d652592`, run `36157463795`; red again on the probe `v0.0.1-rc.workflow-probe`, run `37708302190`, cut at the tip of the branch carrying the manual entrance; and once as a dispatch, `release rehearsal (v0.0.1-rc.rehearsal)`, run `37708471746`, started by hand against that branch. In the three throwaway runs the `guard` job failed because the commit was not on `main`, the run title resolved, `guard` read `VERSION` out of the workflow `env:` (the tag on a push, the typed input on a dispatch), and `build` and `release` were skipped, so none of them built or published anything. Every probe tag and its release has been deleted, so no throwaway tag and no throwaway release exists on `origin`. **No rehearsal has reached the build jobs yet:** `guard` refuses every commit that is not on `main`, by design, so a run started by hand that builds and reports needs the entrance on `main` (section 5, "Starting a run by hand") |
 | a running daemon reachable from a checkout | yes: the section 7 sequence below, driven from a fresh clone of pull request #1 on a scratch socket, no wallpaper touched |
 | anything that sets a real wallpaper in CI | never, by design (see "What CI cannot prove") |
 
@@ -616,7 +616,11 @@ before it is used as a range.
   and the three triggers here (7 when this list landed: `coverage` is the eighth),
   and the 2 jobs of the release workflow with its one
   trigger. Both commands and their output are in the pull request that added
-  this list (pull request #5, "What I ran, and what it said").
+  this list (pull request #5, "What I ran, and what it said"). **The release
+  workflow has since grown** a third job and a second trigger, the manual entrance
+  of section 5: `actionlint` 1.7.11 and a YAML parse find them, in the pull request
+  that added the manual entrance, and run `37708302190` executed the file in that
+  state.
 - **Verified when this guide was written, and now superseded:** `gh run list -R
   guruor/whirl` returned an empty list, so no CI run had executed. **The first run
   is pull request #1's:** run `36126085459`, green, twelve jobs. A run named by its
@@ -730,9 +734,11 @@ the number is the vendor's to change and ours to re-check.
 - **A release is a git tag `vX.Y.Z` on `main`,** plus the artifacts the tag
   workflow builds from it (below). No branch is a release. The rule is not prose
   only: the `guard` job in `.github/workflows/release.yml` fails unless the
-  tagged commit is an ancestor of `origin/main`, and the build and publish jobs
-  wait behind it (`needs:`), so a tag pushed on any other branch publishes
-  nothing. Ancestry is the question a tag push can be asked, and it admits both
+  commit the run is building is an ancestor of `origin/main`, and the build and
+  publish jobs wait behind it (`needs:`), so a tag pushed on any other branch
+  publishes nothing. A run started by hand is asked the same question about the
+  commit it is building ("Starting a run by hand", below). Ancestry is the
+  question a tag push can be asked, and it admits both
   legitimate tags: one at `main`'s tip, and one that `main` has moved ahead of
   since it was cut. The notes are written
   *before* the tag, not after it, because the workflow publishes them from the
@@ -768,15 +774,17 @@ Then, and only then, the tag: "Cutting a release, step by step" below.
 ### Making the tag do the work
 
 `.github/workflows/release.yml` runs on a tag push (`on: push: tags: ["v*"]`) and
-is this document's procedure in executable form:
+is this document's procedure in executable form. It can also be started by hand
+(`workflow_dispatch`), which is a rehearsal of that procedure rather than the
+release itself: "Starting a run by hand", below.
 
 | step | what happens |
 |---|---|
-| guard | the first job, and the one the other two wait behind: it fails unless the tagged commit is an ancestor of `origin/main`, printing the tag, the tagged commit, `origin/main` and what the ancestry check found. A tag on any other branch stops here, with nothing built and no release created |
+| guard | the first job, and the one the other two wait behind: it fails unless the commit this run is building is an ancestor of `origin/main`, printing the version, that commit, `origin/main` and what the ancestry check found. A tag on any other branch stops here, with nothing built and no release created |
 | build | `cargo build --workspace --release` on `ubuntu-latest`, `macos-latest` and `windows-latest`: the command the `artifacts` job runs, and the same three binaries per platform |
 | package | one archive per platform, `whirl-<tag>-<os>-<arch>.<ext>`, and the run fails if the runner's architecture is not the one the archive name claims, because a mislabelled artifact is worse than a missing one |
 | notes | `docs/releases/<tag>.md` from the tagged commit. A `vX.Y.Z-rc.N` tag with no such file is rendered from `.github/release-notes-template.md`, placeholders and all, which is what the prerelease flag says out loud. A final release with no notes file is refused, and so is a file that is missing a required section or still holds a placeholder |
-| publish | `gh release create <tag>` with the three archives attached, each with a `<archive>.sha256` beside it, and `--verify-tag` so a typo cannot create a tag quietly. Each checksum is written in the same run from the bytes that are attached, its first field is the archive's sha256, and the run stops before this step if a checksum cannot be produced or if the archives and the checksums do not match one for one, because the frontend's installer verifies every archive against the checksum published beside it. A tag with a prerelease suffix (`v0.2.0-rc.1`) is published as a GitHub prerelease; `vX.Y.Z` is not |
+| publish | `gh release create <tag>` with the three archives attached, each with a `<archive>.sha256` beside it, and `--verify-tag` so a typo cannot create a tag quietly. Each checksum is written in the same run from the bytes that are attached, its first field is the archive's sha256, and the run stops before this step if a checksum cannot be produced or if the archives and the checksums do not match one for one, because the frontend's installer verifies every archive against the checksum published beside it. A tag with a prerelease suffix (`v0.2.0-rc.1`) is published as a GitHub prerelease; `vX.Y.Z` is not. Only a tag push reaches this step: a run started by hand stops before it, so it creates no release and no tag |
 
 Three consequences worth stating:
 
@@ -790,11 +798,45 @@ Three consequences worth stating:
   manual repair this workflow exists to remove.
 
 The workflow does not run the test suite, and does not need to: the `guard` job
-has established that the tagged commit is on `main`, `ci.yml` has already run the
-whole matrix on it, both on the pull request that landed it and on the push to
-`main` the merge produced, and the release checklists are what say it is
-releasable. The tag is the last step of a procedure that starts with a green
+has established that the commit this run is building is on `main`, `ci.yml` has
+already run the whole matrix on it, both on the pull request that landed it and on
+the push to `main` the merge produced, and the release checklists are what say it
+is releasable. The tag is the last step of a procedure that starts with a green
 `main`, not a substitute for it.
+
+### Starting a run by hand
+
+A tag push is the release, and a run started by hand is a rehearsal of one. The
+workflow has both entrances because a release that can only be started by writing
+a ref is a release a ref-level outage can hold: on 2026-10-07 GitHub's Git
+Operations refused a new tag ref with a server-side 500 for about an hour, and
+there was no way to start the run, or to repeat it, until the ref went in by
+another route.
+
+```sh
+gh workflow run release.yml --ref main -f version=v0.2.2-rc.3
+```
+
+- **It takes one input, `version`,** the release as a tag spells it (`vX.Y.Z` or
+  `vX.Y.Z-rc.N`). There is no tag to read the version from on this path, so the
+  input is the only place it can come from, and every job that needs it takes it
+  from there: the archives are named for it, the notes gate is asked about it, and
+  the title of the run carries it (`release rehearsal (v0.2.2-rc.3)`), which is
+  how a rehearsal is told apart in the run list from the run that published.
+- **Both gates apply.** The version's shape is validated, and the commit the run
+  is building must be an ancestor of `origin/main`; the same two checks a tag push
+  is held to. Dispatch it from `main`: GitHub reads the workflow, and the commit a
+  run builds, from the ref it is dispatched against, so a dispatch against a
+  working branch does start a run, and that run is then refused by `guard`, which
+  is the gate working rather than a rehearsal happening (run `37708471746` is one:
+  the title resolved and the version came from the input, the ancestry check
+  failed, and `build` and `release` were skipped).
+- **Nothing is published and no tag is created.** The run builds the same three
+  archives, runs the notes gate, writes a `sha256` beside every archive, and then
+  reports what a tag push would attach. Publishing is what a tag push asks for,
+  and a release tag comes from a tag push: this entrance is for the run that has
+  to be started and repeated while refs cannot be written, and for reading what
+  the release would be before it is cut.
 
 ### Cutting a release, step by step
 
@@ -832,9 +874,11 @@ For someone who has never done it here:
    If it failed on the notes gate, fix the notes, land them on `main` by a pull
    request, and rerun the failed run. Do not delete the tag to push it again.
 6. **A prerelease is the same procedure with `vX.Y.Z-rc.N`,** except that step 3 is
-   optional and the run marks it as a prerelease. That is the only shape to use for
-   a rehearsal: a tag that looks like a final release is not a rehearsal, and
-   deleting one afterwards leaves a release in every clone that fetched it.
+   optional and the run marks it as a prerelease. That is the only shape a
+   throwaway tag may have: a tag that looks like a final release is not a
+   rehearsal, and deleting one afterwards leaves a release in every clone that
+   fetched it. A run that must publish nothing at all is started by hand instead,
+   and needs no tag: "Starting a run by hand", above.
 
 ### What a release artifact is, per platform
 
