@@ -12,7 +12,12 @@
 //! pipeline's dependency one trait wide, so a source card adds an arm to
 //! [`build`] and a test in `pipeline.rs` supplies its own.
 
-mod local;
+// `local` is `pub(crate)` because the pipeline's own tests ask the source's
+// admission (`header_of`) directly, to check that the file this source admits is
+// the file the download path measures and the file it drops is the file the
+// download path refuses: those two callers ask one function (`pipeline::head_window`)
+// and one verdict has to come back out.
+pub(crate) mod local;
 mod wallhaven;
 
 use whirl_core::config::{Config, SourceConfig, SourceKind};

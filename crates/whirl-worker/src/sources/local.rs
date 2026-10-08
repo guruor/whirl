@@ -80,10 +80,11 @@ use crate::pipeline::sniff;
 
 /// How many of a file's first bytes the header read looks at. The same 1024 the
 /// pipeline's own sniff uses for the formats that answer inside it
-/// (`crate::pipeline::head_window`): a HEIC is the one that is read further, and
-/// by how much is that function's answer and not a bound of this source's own.
-/// This is not the decode 2.2 refuses to ship: it is the header read 2.2 puts in
-/// the source's own contract.
+/// (`crate::pipeline::head_window`): a JPEG whose frame header is behind a large
+/// Exif segment, and a HEIC, are the ones read further, and by how much is that
+/// function's answer and not a bound of this source's own. This is not the
+/// decode 2.2 refuses to ship: it is the header read 2.2 puts in the source's
+/// own contract.
 const HEAD_BYTES: usize = 1024;
 
 /// The `local` source of docs/spec/features.md 2.2.
@@ -450,11 +451,16 @@ fn unreadable_root(root: &Path, follow_symlinks: bool) -> Option<String> {
 /// The window is the pipeline's own ([`crate::pipeline::head_window`]) and not a
 /// second opinion: a file this source admits is a file every later stage can
 /// measure, and the one it drops here is the one they would drop too. That is
-/// the whole difference between a JPEG folder and an iPhone one: a HEIC's
-/// dimensions sit in an `ispe` box behind `meta`, past 1 KiB in every `.heic`
-/// measured on this machine, so the small read is widened for exactly the file
-/// whose own bytes say HEIC and whose dimensions the small window did not find.
-fn header_of(path: &Path) -> Option<crate::pipeline::Header> {
+/// the whole difference between a folder of photographs and one this source
+/// cannot read: a HEIC's dimensions sit in an `ispe` box behind `meta`, and a
+/// JPEG's frame header sits behind its own APP1/Exif segment, so the small read
+/// is widened for exactly the file whose own bytes say (a HEIC brand, a JPEG
+/// `ffd8`) that the dimensions may be further in and whose small window did not
+/// find them.
+///
+/// `pub(crate)` for the pipeline's tests, which check this verdict against the
+/// one the download path reaches for the same bytes (`pipeline::store`).
+pub(crate) fn header_of(path: &Path) -> Option<crate::pipeline::Header> {
     let head = read_head(path, HEAD_BYTES)?;
     if let Some(header) = sniff(&head) {
         return Some(header);

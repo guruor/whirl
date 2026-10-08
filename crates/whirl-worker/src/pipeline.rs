@@ -37,25 +37,41 @@ use whirl_core::state::{self, IndexFile, StateFile};
 /// The largest header this build sniffs for the formats whose dimensions are in
 /// the first bytes: PNG's `IHDR`, a JPEG's frame header, WebP's `VP8`/`VP8L`/
 /// `VP8X` chunk. Section 3 step 5 asks for "the first bytes", and this is how
-/// many of them are kept. A HEIC is not one of these: see [`HEIC_WINDOW`].
+/// many of them are kept. Two formats are not like these: a HEIC's dimensions
+/// are behind `meta`, and a JPEG's frame header can sit behind a multi-kilobyte
+/// APP1/Exif segment, so each widens to [`WIDE_WINDOW`] when this window did not
+/// measure it.
 const HEAD_WINDOW: usize = 1024;
 
-/// The window a stream's or a file's head is widened to when the bytes
-/// themselves say HEIC and the small window did not measure them.
+/// The window a stream's or a file's head is widened to when the small window
+/// did not measure the bytes and the bytes themselves say they are a format
+/// whose dimensions can lie further in.
 ///
-/// A HEIC's dimensions live in an `ispe` box inside `iprp`/`ipco`, behind the
-/// `meta` box's `hdlr`, `dinf`, `pitm`, `iinf` and `iref`, so they are nothing
-/// like "the first bytes" - and the first `ispe` in the file is the *thumbnail*
-/// item's, which is why the walk below follows `pitm` and `ipma` to the primary
-/// item rather than taking the first or the largest box it finds. Measured
-/// against the thirteen `.heic` files Apple ships in
-/// `/System/Library/Desktop Pictures` on macOS 26.5: the first `ispe` in `ipco`,
-/// the thumbnail's, starts at 1245, 1680, 1781, 2686 and 3421, and the primary
-/// item's starts 20 bytes later in each file; every `meta` box ends by 5220, and
-/// one `.heic` that `sips` wrote puts an `ispe` at 1063. All of them are past
-/// 1024. 64 KiB is the worst of those with an order of magnitude to spare and is
-/// the size of the read buffer in [`store`] and in `Run::reference`, so a HEIC
-/// costs one wider first read and no second pass.
+/// Two formats need it, and [`sniffed`]'s own walk is what decides both:
+///
+/// - **A HEIC.** Its dimensions live in an `ispe` box inside `iprp`/`ipco`,
+///   behind the `meta` box's `hdlr`, `dinf`, `pitm`, `iinf` and `iref`, so they
+///   are nothing like "the first bytes" - and the first `ispe` in the file is
+///   the *thumbnail* item's, which is why the walk below follows `pitm` and
+///   `ipma` to the primary item rather than taking the first or the largest box
+///   it finds. Measured against the thirteen `.heic` files Apple ships in
+///   `/System/Library/Desktop Pictures` on macOS 26.5: the first `ispe` in
+///   `ipco`, the thumbnail's, starts at 1245, 1680, 1781, 2686 and 3421, and the
+///   primary item's starts 20 bytes later in each file; every `meta` box ends by
+///   5220, and one `.heic` that `sips` wrote puts an `ispe` at 1063. All of them
+///   are past 1024.
+/// - **A JPEG.** Its frame header sits behind whatever APP segments precede it,
+///   and an APP1/Exif segment is a photograph's own metadata: on the eight
+///   `wallhaven` files that first exposed this, the APP1 segment declares 3.0 KB
+///   to 6.0 KB, so the walk has to reach byte 3042 to 5970 while the small
+///   window holds 1024. Every JPEG already in a library begins with a small JFIF
+///   segment (`0xffe0`, length 16) whose frame header sits at byte 154 to 319,
+///   which is why the small window measured those and not these.
+///
+/// 64 KiB is the worst size measured here with an order of magnitude to spare,
+/// and it is the size of the read buffer in [`store`] and in `Run::reference`,
+/// so a file that needs the wide window costs one wider first read and no second
+/// pass.
 ///
 /// **What has to fit is the whole `meta` box, not the `ispe`.** The walk in
 /// [`boxes`] stops at the first box whose *declared* size runs past the read,
@@ -69,7 +85,7 @@ const HEAD_WINDOW: usize = 1024;
 /// is still not one whirl will promise to display (features.md 2.2), and it is
 /// dropped before candidacy rather than counted at a stage, which is why the
 /// worker reports it on stderr and this daemon forwards that to its log.
-const HEIC_WINDOW: usize = 64 * 1024;
+const WIDE_WINDOW: usize = 64 * 1024;
 
 /// A failed stage: what the daemon turns into the `ERR` code of 2.7.
 #[derive(Debug, Clone)]
@@ -666,30 +682,87 @@ pub struct Header {
 /// What a downloaded file is, or `None` when nothing in the first bytes
 /// identifies one of the four formats of features.md 2.2.
 pub fn sniff(bytes: &[u8]) -> Option<Header> {
-    sniff_png(bytes)
-        .or_else(|| sniff_jpeg(bytes))
-        .or_else(|| sniff_webp(bytes))
-        .or_else(|| sniff_heic(bytes))
+    match sniffed(bytes) {
+        Sniffed::Measured(header) => Some(header),
+        Sniffed::BeyondWindow | Sniffed::NotAnImage => None,
+    }
+}
+
+/// What the first bytes say about the four formats of features.md 2.2, with the
+/// third answer a single [`sniff`] cannot carry.
+///
+/// A head is a window, and "the bytes did not measure" is two different facts.
+/// A JPEG's frame header can sit behind a multi-kilobyte APP1/Exif segment, and
+/// its segment walk then runs out of bytes while `ffd8` still says these are a
+/// picture: [`Sniffed::BeyondWindow`] is that case, and a caller must not report
+/// it as `not_an_image`, because the bound is the window and not the content. A
+/// HEIC answers the same question through the brand test [`is_heic`] rather than
+/// through this arm, because its walk cannot tell "no `meta` box" (not a picture
+/// this build promises, features.md 2.2) from "a `meta` box past the head".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sniffed {
+    /// The dimensions were read.
+    Measured(Header),
+    /// The bytes begin one of the four formats, and the walk that reads their
+    /// dimensions ran past the end of what was kept.
+    BeyondWindow,
+    /// The bytes are not one of the four formats of features.md 2.2.
+    NotAnImage,
+}
+
+fn sniffed(bytes: &[u8]) -> Sniffed {
+    if let Some(header) = sniff_png(bytes) {
+        return Sniffed::Measured(header);
+    }
+    match sniff_jpeg(bytes) {
+        Sniffed::Measured(header) => return Sniffed::Measured(header),
+        // A file whose first two bytes are `ffd8` is a JPEG and nothing else
+        // here, so the other two walks are not asked when the JPEG's own ran
+        // out of bytes.
+        Sniffed::BeyondWindow => return Sniffed::BeyondWindow,
+        Sniffed::NotAnImage => {}
+    }
+    if let Some(header) = sniff_webp(bytes) {
+        return Sniffed::Measured(header);
+    }
+    if let Some(header) = sniff_heic(bytes) {
+        return Sniffed::Measured(header);
+    }
+    Sniffed::NotAnImage
 }
 
 /// How many bytes the head of a file or a stream is worth keeping, given what
-/// has arrived so far: [`HEAD_WINDOW`], or [`HEIC_WINDOW`] once the small window
-/// is full, the bytes say HEIC, and the sniff still has not measured them.
+/// has arrived so far: [`HEAD_WINDOW`], or [`WIDE_WINDOW`] once the small window
+/// is full and the bytes say they are a format whose dimensions the small window
+/// did not measure.
 ///
 /// The questions are asked in that order because each one is cheaper to answer
 /// than the read it would cause. A file shorter than the small window is not
-/// widened: there is nothing more to read. A JPEG, a PNG or a WebP answers
-/// inside the small window, and so does a HEIC whose `ispe` happens to be in
-/// there. What is left is the case this exists for: a HEIC whose dimensions sit
-/// behind `meta`, which is every HEIC measured on this machine, at 1063 to 3421
-/// bytes in. Both callers of [`sniff`] ask this and not a constant of their own,
-/// so a file the local source admits is a file the pipeline can measure, and a
-/// file the local source drops is a file the pipeline would drop.
+/// widened: there is nothing more to read. A PNG or a WebP answers inside the
+/// small window, and so does a JPEG whose frame header is not behind a large
+/// segment and a HEIC whose `ispe` happens to sit early. What is left is the two
+/// cases this exists for: a HEIC whose dimensions sit behind `meta` - which is
+/// every HEIC measured on this machine, at 1063 to 3421 bytes in - and a JPEG
+/// whose frame header sits behind a multi-kilobyte APP1/Exif segment, at 3042 to
+/// 5970 bytes in on the files that exposed this. Both callers of [`sniff`] ask
+/// this and not a constant of their own, so a file the local source admits is a
+/// file the pipeline can measure, and a file the local source drops is a file
+/// the pipeline would drop.
 pub fn head_window(head: &[u8]) -> usize {
-    if head.len() >= HEAD_WINDOW && sniff(head).is_none() && is_heic(head) {
-        HEIC_WINDOW
-    } else {
-        HEAD_WINDOW
+    if head.len() < HEAD_WINDOW {
+        return HEAD_WINDOW;
+    }
+    match sniffed(head) {
+        Sniffed::Measured(_) => HEAD_WINDOW,
+        // A JPEG the small window could not walk: a wider head may reach its
+        // frame header, and one that outruns even the wide window is reported as
+        // bounded by it rather than as bad content (`store`).
+        Sniffed::BeyondWindow => WIDE_WINDOW,
+        // A HEIC the small window could not measure: its brand is what says the
+        // dimensions may be further in, because `sniffed` cannot walk into a
+        // `meta` box the head did not hold.
+        Sniffed::NotAnImage if is_heic(head) => WIDE_WINDOW,
+        Sniffed::NotAnImage => HEAD_WINDOW,
     }
 }
 
@@ -709,14 +782,14 @@ fn sniff_png(bytes: &[u8]) -> Option<Header> {
     })
 }
 
-fn sniff_jpeg(bytes: &[u8]) -> Option<Header> {
+fn sniff_jpeg(bytes: &[u8]) -> Sniffed {
     if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
-        return None;
+        return Sniffed::NotAnImage;
     }
     let mut at = 2;
     while at + 3 < bytes.len() {
         if bytes[at] != 0xff {
-            return None;
+            return Sniffed::NotAnImage;
         }
         let marker = bytes[at + 1];
         // Fill bytes and standalone markers carry no length.
@@ -730,13 +803,13 @@ fn sniff_jpeg(bytes: &[u8]) -> Option<Header> {
         }
         let length = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
         if length < 2 {
-            return None;
+            return Sniffed::NotAnImage;
         }
         // SOF0..SOF15 except DHT (c4), JPG (c8) and DAC (cc) carry the frame
         // header, and it is width and height in that order at a fixed offset.
         let frame = (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc);
         if frame && at + 9 < bytes.len() {
-            return Some(Header {
+            return Sniffed::Measured(Header {
                 ext: "jpg",
                 height: u16::from_be_bytes([bytes[at + 5], bytes[at + 6]]) as u32,
                 width: u16::from_be_bytes([bytes[at + 7], bytes[at + 8]]) as u32,
@@ -744,7 +817,11 @@ fn sniff_jpeg(bytes: &[u8]) -> Option<Header> {
         }
         at += 2 + length;
     }
-    None
+    // The walk reached the end of the bytes given before a frame header. For a
+    // whole file that is a truncated picture; for a stream it is a head window
+    // the photograph's own APP1/Exif segment runs past. Either way the bytes
+    // said `ffd8`, so this is not a claim that they are not a JPEG.
+    Sniffed::BeyondWindow
 }
 
 fn sniff_webp(bytes: &[u8]) -> Option<Header> {
@@ -1213,11 +1290,12 @@ pub fn store(
         }
         hasher.update(&buffer[..read]);
         // Section 3 step 5's head. It starts at the small window and widens, at
-        // most once, for a HEIC the small one cannot measure (`head_window`).
-        // That is why this takes as much of the chunk as the *current* window
-        // has room for instead of a fixed count: the file that needs the wide
-        // window can arrive whole in this one read, and capping the first take
-        // at 1024 bytes would lose the rest of it.
+        // most once, for a file the small one cannot measure (`head_window`: a
+        // JPEG behind a large Exif segment, a HEIC behind `meta`). That is why
+        // this takes as much of the chunk as the *current* window has room for
+        // instead of a fixed count: the file that needs the wide window can
+        // arrive whole in this one read, and capping the first take at 1024
+        // bytes would lose the rest of it.
         let mut taken = 0;
         while taken < read {
             let room = window.saturating_sub(head.len());
@@ -1239,9 +1317,23 @@ pub fn store(
         return Err(write_failure(origin, error));
     }
 
-    let header = match sniff(&head) {
-        Some(header) => header,
-        None => {
+    let header = match sniffed(&head) {
+        Sniffed::Measured(header) => header,
+        // A JPEG whose own walk ran out of head: the bytes said `ffd8`, so what
+        // the reader needs is the bound that stopped the measurement, not a
+        // claim that the bytes are not a picture. The code stays the protocol's
+        // `not_an_image` (2.7 has one code for a sniff that produced no header,
+        // and a new code would be a protocol change); the message is what
+        // distinguishes the two.
+        Sniffed::BeyondWindow => {
+            part.discard();
+            return Err(Failure::new(
+                "download",
+                ErrorCode::NotAnImage,
+                format!("{origin}: the header is past the {window}-byte head window"),
+            ));
+        }
+        Sniffed::NotAnImage => {
             part.discard();
             return Err(Failure::new(
                 "download",
@@ -2295,6 +2387,65 @@ mod tests {
         bytes
     }
 
+    /// The payload of an APP1/Exif segment of `len` bytes: the Exif identifier
+    /// (`Exif\0\0`, JEITA CP-3451 4.7.2), then filler, so the segment has the
+    /// shape a camera or a wallpaper service writes. `len` is the payload length;
+    /// the segment's declared length is `len + 2` ([`jpeg_segment`]).
+    fn exif(len: usize) -> Vec<u8> {
+        let mut payload = b"Exif\0\0".to_vec();
+        assert!(len >= payload.len(), "an Exif payload holds its identifier");
+        let pad = len - payload.len();
+        filler(&mut payload, pad);
+        payload
+    }
+
+    /// The payload of an APP2/ICC segment of `len` bytes: the ICC signature
+    /// (`ICC_PROFILE\0`, ICC.1:2004-10 Annex B.4), then filler.
+    fn icc(len: usize) -> Vec<u8> {
+        let mut payload = b"ICC_PROFILE\0".to_vec();
+        assert!(len >= payload.len(), "an ICC payload holds its signature");
+        let pad = len - payload.len();
+        filler(&mut payload, pad);
+        payload
+    }
+
+    /// One JPEG segment as a real encoder writes it: `ff<marker>`, the declared
+    /// length, then the payload. ISO/IEC 10918-1 B.1.1.4: the length field counts
+    /// itself and the payload.
+    fn jpeg_segment(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let declared = payload.len() + 2;
+        assert!(
+            declared <= u16::MAX as usize,
+            "a JPEG segment's length field is 16 bits"
+        );
+        let mut bytes = vec![0xff, marker];
+        bytes.extend_from_slice(&(declared as u16).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// A JPEG in the shape a photograph from a camera or a wallpaper service has,
+    /// rather than the minimal JFIF one above: `ffd8`, then the APP segments the
+    /// test names (APP1/Exif, APP2/ICC, both skipped when empty), then the frame
+    /// header, then `image` bytes of coded data. The shape is the point: a
+    /// photograph's frame header sits behind its own metadata, which is
+    /// kilobytes, instead of at byte 30.
+    fn jpeg_photo(width: u16, height: u16, app1: &[u8], app2: &[u8], image: usize) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8];
+        if !app1.is_empty() {
+            bytes.extend_from_slice(&jpeg_segment(0xe1, app1));
+        }
+        if !app2.is_empty() {
+            bytes.extend_from_slice(&jpeg_segment(0xe2, app2));
+        }
+        bytes.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+        filler(&mut bytes, image);
+        bytes
+    }
+
     fn webp_header(chunk: &[u8; 4], body: &[u8]) -> Vec<u8> {
         let mut bytes = b"RIFF".to_vec();
         bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -2830,7 +2981,7 @@ mod tests {
         assert!(is_heic(small), "but the bytes say what they are");
         assert_eq!(
             head_window(small),
-            HEIC_WINDOW,
+            WIDE_WINDOW,
             "so a head is worth reading further, and this is by how much"
         );
         assert_eq!(
@@ -2844,18 +2995,25 @@ mod tests {
         );
     }
 
-    /// The widening is for that one case and no other: everything that answers
-    /// inside the small window keeps the 1 KiB read, which is every JPEG, PNG and
-    /// WebP in a library and every HEIC whose `ispe` happens to sit early.
+    /// The widening is for the two formats whose dimensions can sit past the
+    /// small window and no other: everything that answers inside it keeps the
+    /// 1 KiB read, which is every PNG and WebP in a library, every JPEG whose
+    /// frame header is not behind a large APP segment, and every HEIC whose
+    /// `ispe` happens to sit early.
     #[test]
-    fn the_window_widens_only_for_a_heic_the_small_one_cannot_measure() {
+    fn the_window_widens_only_for_a_file_the_small_window_cannot_measure() {
         assert_eq!(head_window(&png(1600, 900)), HEAD_WINDOW);
-        assert_eq!(head_window(&jpeg(1920, 1080)), HEAD_WINDOW);
+        assert_eq!(
+            head_window(&jpeg(1920, 1080)),
+            HEAD_WINDOW,
+            "the minimal JFIF fixture answers at byte 30, which is exactly the shape \
+             that hid this defect: a library of those is not a library of photographs"
+        );
         assert_eq!(head_window(&webp_lossless(800, 600)), HEAD_WINDOW);
         assert_eq!(
             head_window(b"<html>not a picture</html>"),
             HEAD_WINDOW,
-            "and a file that is not a picture is not a HEIC either"
+            "and a file that is not a picture is not a HEIC or a JPEG either"
         );
         assert_eq!(
             head_window(&heic_of((1024, 1024), (6016, 6016), 4096)[..200]),
@@ -2877,6 +3035,219 @@ mod tests {
             head_window(&long),
             HEAD_WINDOW,
             "the small window measured it, so there is nothing to widen for"
+        );
+    }
+
+    /// The defect the eight `wallhaven` files exposed, on a fixture shaped the way
+    /// a photograph is: `ffd8`, an APP1/Exif segment of 3.0 KB that declares its
+    /// own length, then the frame header. The minimal [`jpeg`] fixture above
+    /// begins with an APP0/JFIF segment of 16 bytes and answers at byte 30, which
+    /// is why every JPEG already in a cache passed while these did not.
+    #[test]
+    fn a_photograph_behind_a_large_exif_segment_is_measured() {
+        let photo = jpeg_photo(1920, 1080, &exif(3048), &[], 0);
+        assert!(
+            photo.len() > HEAD_WINDOW,
+            "the Exif segment alone outruns the small window: {} bytes",
+            photo.len()
+        );
+        let small = &photo[..HEAD_WINDOW];
+        assert_eq!(
+            sniff(small),
+            None,
+            "the small window cannot reach the frame header"
+        );
+        assert_eq!(
+            sniffed(small),
+            Sniffed::BeyondWindow,
+            "and the walk ran out of head rather than the bytes being something else"
+        );
+        assert_eq!(
+            head_window(small),
+            WIDE_WINDOW,
+            "so a head is worth reading further, and this is by how much"
+        );
+        assert_eq!(
+            sniff(&photo),
+            Some(Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            }),
+            "the bytes are a JPEG whose dimensions were only ever a window away"
+        );
+    }
+
+    /// The same rule with two large pre-frame segments in front of the frame
+    /// header, which is what a phone or an editor writes when it stores Exif and
+    /// an ICC profile: the walk has to step past both, and neither fits in the
+    /// small window.
+    #[test]
+    fn a_photograph_behind_exif_and_a_large_icc_segment_is_measured() {
+        let photo = jpeg_photo(3840, 2160, &exif(2048), &icc(3072), 0);
+        let small = &photo[..HEAD_WINDOW];
+        assert_eq!(sniff(small), None, "APP1 alone is past the small window");
+        assert_eq!(head_window(small), WIDE_WINDOW);
+        assert_eq!(
+            sniff(&photo),
+            Some(Header {
+                ext: "jpg",
+                width: 3840,
+                height: 2160
+            }),
+            "the walk steps past APP1 and APP2 to the frame header"
+        );
+    }
+
+    /// The whole stream, not the sniff alone: section 3 step 5 reads a head that
+    /// is assembled from the reads of a download, and a photograph is more than
+    /// one 64 KiB read. The fixture is a real shape - 3 KB of Exif, the frame
+    /// header, then 70 KB of coded image - so the head has to widen mid-stream,
+    /// the file is stored under its digest, and the dimensions the old 1 KiB
+    /// head could not measure are reported.
+    #[test]
+    fn a_streamed_photograph_is_sniffed_stored_and_reported_with_its_dimensions() {
+        let dir = scratch("worker-streamed-photo");
+        let photo = jpeg_photo(1920, 1080, &exif(3048), &[], 70_000);
+        assert!(
+            photo.len() > 64 * 1024,
+            "the fixture needs more than one read of store's 64 KiB buffer: {} bytes",
+            photo.len()
+        );
+        let cache = Cache::at(dir.join("cache"));
+        let transport = Bytes::of(&[("pictures/photo.jpg", photo.clone())]);
+
+        let stored = store(&cache, 1, "pictures/photo.jpg", &transport, 200_000)
+            .expect("a photograph the small head refused is stored");
+
+        assert_eq!(
+            stored.header,
+            Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert_eq!(stored.bytes, photo.len() as u64);
+        assert!(!stored.hit);
+        assert_eq!(
+            stored.path,
+            state::content_path(cache.root(), &protocol::sha256_hex(&photo), "jpg")
+        );
+        assert!(stored.path.is_file(), "the bytes are published");
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "the part file is renamed, not left behind"
+        );
+    }
+
+    /// A JPEG past even the wide window is a bound and not bad content: the same
+    /// fixture one order of magnitude larger, so its APP1/Exif segment (the
+    /// largest a JPEG segment can declare, `0xffff`) steps the walk to byte
+    /// 65539, three bytes past the 64 KiB window. The bytes are a well-formed
+    /// JPEG that a reader with the whole file measures, so the failure must name
+    /// the window rather than claim the file is not an image.
+    #[test]
+    fn a_head_that_runs_out_mid_walk_names_the_window_and_not_bad_content() {
+        let dir = scratch("worker-head-window");
+        let photo = jpeg_photo(1920, 1080, &exif(65_533), &[], 4_000);
+        assert!(photo.len() > WIDE_WINDOW);
+        assert_eq!(
+            sniff(&photo),
+            Some(Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            }),
+            "the file is a JPEG and only the window is short"
+        );
+        let cache = Cache::at(dir.join("cache"));
+        let transport = Bytes::of(&[("pictures/deep.jpg", photo.clone())]);
+
+        let failure = store(&cache, 1, "pictures/deep.jpg", &transport, 200_000)
+            .expect_err("the wide window cannot reach the frame header");
+
+        assert_eq!(
+            failure.code,
+            ErrorCode::NotAnImage,
+            "2.7 has one code for a sniff that read no header; the message tells the two apart"
+        );
+        assert_eq!(failure.stage, "download");
+        assert!(
+            failure.message.contains("65536-byte head window"),
+            "the message names the bound: {}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("not JPEG, PNG, WebP or HEIC"),
+            "the bytes are a JPEG, and the message does not say otherwise: {}",
+            failure.message
+        );
+        assert_eq!(count_files(&cache.root().join("sha256")), 0);
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "the part file is deleted on this path too"
+        );
+    }
+
+    /// The same bytes, both callers of the sniff. `sources/local.rs` admits a
+    /// file it can measure and `store` measures what it downloaded, and both ask
+    /// [`head_window`] how much of a head is worth reading, so one verdict has to
+    /// come back for one file: a file this source admits is a file the download
+    /// path accepts, and one it drops is one the download path refuses.
+    ///
+    /// The fixture is the shape that made the disagreement visible in review:
+    /// `ffd8`, a 4 KB APP1/Exif segment, an APP2/ICC segment, then the frame
+    /// header at byte 4032 - past the 1 KiB small window and well inside the
+    /// 64 KiB one. `whirl-worker --verb set --target <this file>` took it while
+    /// the same bytes over the wire came back `not_an_image`, because the small
+    /// window was the only one the download path ever asked for. Both accept now,
+    /// and neither refuses a head the other reads.
+    #[test]
+    fn a_file_admitted_locally_and_the_same_bytes_fetched_get_the_same_verdict() {
+        let photo = jpeg_photo(1920, 1080, &exif(3998), &icc(24), 0);
+        assert!(
+            photo.len() > HEAD_WINDOW,
+            "the fixture has to outrun the small window: {} bytes",
+            photo.len()
+        );
+        let dir = scratch("worker-two-callers");
+        let path = dir.join("photo.jpg");
+        std::fs::write(&path, &photo).expect("the fixture file");
+
+        // The local source's own admission: what decides whether the file is a
+        // candidate at all (`local::candidate`).
+        let local = crate::sources::local::header_of(&path);
+        // The download path, handed the same bytes over a transport.
+        let cache = Cache::at(dir.join("cache"));
+        let transport = Bytes::of(&[("photo.jpg", photo.clone())]);
+        let wire = store(&cache, 1, "photo.jpg", &transport, 200_000)
+            .expect("the same bytes the local source admits are stored, not refused");
+
+        assert_eq!(
+            local,
+            Some(Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            }),
+            "the local source reads the frame header behind the Exif segment"
+        );
+        assert_eq!(
+            wire.header,
+            Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            },
+            "and the wire path measures the same frame header"
+        );
+        assert_eq!(
+            local.as_ref(),
+            Some(&wire.header),
+            "one function answers both callers"
         );
     }
 
