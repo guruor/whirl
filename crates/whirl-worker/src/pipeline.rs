@@ -24,7 +24,7 @@
 
 use crate::backend::{self, SetError};
 use crate::sources::Sources;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -341,9 +341,15 @@ pub fn stage_type(input: Vec<Seeking>, platform: Platform) -> Stage {
     stage
 }
 
-/// 2.5 step 5, the cheap half of dedupe: a candidate whose `origin_key` (or
-/// whose id) is in the recent window of 4.1, "the whole history ring (50 entries
-/// by default) plus the current index".
+/// 2.5 step 5: a candidate whose `origin_key` (or whose id) is in the recent
+/// window of 4.1, which is the history ring bounded by `dedupe.recent_entries`.
+///
+/// The cache index is not part of this set. It is the service map
+/// ([`Window::cached`]): a candidate the cache already holds is set from the
+/// cache rather than dropped, so the rule this stage enforces is "not the image
+/// whirl just set", and "not bytes whirl already has" costs no request and no
+/// download. What the index does not hold is a miss at both halves, and is
+/// fetched.
 ///
 /// A window that holds every candidate therefore empties this stage, and that is
 /// the answer 4.1 asks for rather than a case to work around: the rotation ends
@@ -421,28 +427,55 @@ pub fn settable(platform: Platform, ext: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The recent window: the origin keys and digests a candidate is compared
-/// against before it costs a request.
+/// against before it costs a request, and the cache index, which is what a
+/// candidate the cache already holds is served from.
 ///
-/// It is built from the history ring and the cache index, which are the daemon's
-/// files (7.2). This process only reads them, and it tolerates anything it finds:
-/// 7.1's rule is "No reader takes a lock, and every reader must tolerate any file
-/// being replaced under it", and a window that cannot be read is a missed
-/// preference, never a failed rotation. Nothing here writes either file.
+/// Both files are the daemon's (7.2). This process only reads them, and it
+/// tolerates anything it finds: 7.1's rule is "No reader takes a lock, and every
+/// reader must tolerate any file being replaced under it", and a window that
+/// cannot be read is a missed preference, never a failed rotation. Nothing here
+/// writes either file.
+///
+/// The two are not the same half of the dedupe, and the difference is the point
+/// of the whole struct. The history ring is the **rejection** set: a candidate
+/// in it is dropped, which is the rule that stops a `random` query setting the
+/// same wallpaper twice in a week. The index is the **service** map: a candidate
+/// whose `origin_key` the index names, under a file that is still there, is
+/// taken from the cache instead of fetched, so bytes whirl already holds are
+/// never downloaded a second time. The index is deliberately *not* part of the
+/// rejection set: an image the cache already holds is not a candidate to drop,
+/// it is one to set for free (4.1). An entry the sweep removed, or one that is
+/// listed but whose file is gone, is served by neither half and is fetched again
+/// like any other miss.
 #[derive(Debug, Clone, Default)]
 pub struct Window {
     keys: HashSet<String>,
+    held: HashMap<String, Held>,
+}
+
+/// One index entry, reduced to the two fields the cache path is built from: the
+/// digest, which is the file's own name, and the extension the name carries
+/// (docs/spec/state-and-cache.md 2.1 and section 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Held {
+    digest: String,
+    ext: String,
 }
 
 impl Window {
     pub fn empty() -> Window {
         Window {
             keys: HashSet::new(),
+            held: HashMap::new(),
         }
     }
 
-    /// A window from the two files, bounded by `dedupe.recent_entries` (4.1: the
-    /// whole ring, and the index). The state directory is where the ring lives;
-    /// the index lives in the cache root.
+    /// A window from the two files: the history ring bounded by
+    /// `dedupe.recent_entries` (4.1), and every index entry that names an
+    /// `origin_key`. The state directory is where the ring lives; the index lives
+    /// in the cache root. Either file may be absent, unreadable, of a newer
+    /// schema or malformed, and each case leaves that half empty rather than
+    /// failing: the rotation falls back to fetching.
     pub fn load(state_dir: &Path, index_path: &Path, bound: usize) -> Window {
         let mut window = Window::empty();
         if let Ok(Some(text)) = read_file(&state_dir.join(state::HISTORY_FILE)) {
@@ -465,8 +498,28 @@ impl Window {
             match IndexFile::parse(&text) {
                 Ok(StateFile::Read(index)) => {
                     for (digest, entry) in &index.entries {
-                        window.add(digest);
-                        window.add(&entry.origin_key);
+                        // An entry with no `origin_key` names no candidate, so it
+                        // has nothing to serve; the digest alone is not a key the
+                        // selection of 4.1 can look up.
+                        //
+                        // One `origin_key` can name two digests: a source that
+                        // re-encoded the same id has two entries for it. The map
+                        // keeps one of them, chosen by the index's own digest
+                        // order, and that is the one a rotation is served - so a
+                        // re-encode that happens after the window has moved past
+                        // the id is served the older bytes instead of being
+                        // fetched. That is the price of keying the service on the
+                        // id the source gave, which is the mapping the index is
+                        // for and the mapping no other file holds.
+                        if !entry.origin_key.is_empty() {
+                            window.held.insert(
+                                entry.origin_key.clone(),
+                                Held {
+                                    digest: digest.clone(),
+                                    ext: entry.ext.clone(),
+                                },
+                            );
+                        }
                     }
                 }
                 Ok(StateFile::SchemaNewer { found }) => {
@@ -500,8 +553,27 @@ impl Window {
         self.keys.contains(key)
     }
 
+    /// The cache file a candidate's `origin_key` is already held under, when the
+    /// index names one and the file it names is still there. This is the whole
+    /// of the consultation: a `Some` is a candidate served from the cache with no
+    /// request to the source (4.1).
+    ///
+    /// The `stat` here is the rotation's decision and not the sweep's, which is
+    /// what makes an entry the sweep has taken, or one that is listed but whose
+    /// file is gone, a fetch again rather than a silent nothing.
+    pub fn cached(&self, cache: &Cache, origin_key: &str) -> Option<(String, PathBuf)> {
+        let held = self.held.get(origin_key)?;
+        let path = state::content_path(cache.root(), &held.digest, &held.ext);
+        if path.is_file() {
+            return Some((held.digest.clone(), path));
+        }
+        None
+    }
+
     /// The same set as a list, which is what a source is handed so it can
     /// exclude the window in its own request where it can (`EnumContext.recent`).
+    /// It is the rejection set and only that: the cache index is consulted
+    /// through [`Window::cached`], not handed to a source to exclude.
     pub fn keys(&self) -> Vec<String> {
         self.keys.iter().cloned().collect()
     }
@@ -1471,6 +1543,16 @@ enum Filled {
     /// The bytes are a cache entry under `sha256/` (docs/spec/state-and-cache.md
     /// section 3): `copy`, and every kind that is not a `local` one.
     Stored(Stored),
+    /// The bytes were already in the cache, under the digest the index names for
+    /// this candidate's `origin_key`, and nothing was fetched (4.1). This is the
+    /// `hit` of section 3 step 7 reached *before* the request instead of after
+    /// it: the same bytes, the same content-addressed path, no download.
+    Cached {
+        /// The digest the index records for this `origin_key`.
+        digest: String,
+        /// The content-addressed path that digest names, `stat`ed and there.
+        path: PathBuf,
+    },
     /// Nothing was written, and the platform is pointed at the candidate's own
     /// path: features.md 2.2's `reference`, the printed default.
     Referenced {
@@ -1491,15 +1573,17 @@ impl Filled {
     fn digest(&self) -> &str {
         match self {
             Filled::Stored(stored) => &stored.digest,
+            Filled::Cached { digest, .. } => digest,
             Filled::Referenced { digest, .. } => digest,
         }
     }
 
-    /// The path the platform is given, which is the one thing the two arms
+    /// The path the platform is given, which is the one thing the arms
     /// disagree about: the cache file, or the user's own file.
     fn path(&self) -> &Path {
         match self {
             Filled::Stored(stored) => &stored.path,
+            Filled::Cached { path, .. } => path,
             Filled::Referenced { path, .. } => path,
         }
     }
@@ -1615,9 +1699,9 @@ impl Run<'_> {
                     // file is removed and "the error is reported", once.
                     Err(failure) => return Err(failure),
                 };
-                // 1.6's first line belongs to the store, and a reference-mode
-                // candidate reached the setter without one: nothing was
-                // downloaded, so nothing is claimed to have been.
+                // 1.6's first line belongs to the store, and neither a
+                // reference-mode candidate nor one served from the cache reached
+                // it: nothing was downloaded, so nothing is claimed to have been.
                 if let Filled::Stored(_) = &filled {
                     println!("{}", self.report(&seeking, &filled).downloaded_line());
                 }
@@ -1704,6 +1788,13 @@ impl Run<'_> {
     /// `reference` is why this branch is not the rare one: a `local` source that
     /// says nothing about `mode` does not copy the user's library.
     ///
+    /// The cache is consulted first, and only for the arm that would store:
+    /// 4.1's service map. A candidate whose `origin_key` the index names under a
+    /// file that is still there is taken from the cache without a request, which
+    /// is section 3 step 7's hit reached before the download instead of after it.
+    /// The other two answers are the same miss they always were: no entry, or an
+    /// entry whose file is gone, falls through to [`store`] and is fetched.
+    ///
     /// `Ok(None)` is the backstop of 2.5 step 1 for a candidate whose source did
     /// not report its dimensions: the header is the authority, and a file under
     /// the floor is not admissible. It is a rejection rather than a failure, so
@@ -1717,6 +1808,14 @@ impl Run<'_> {
     ) -> Result<Option<Filled>, Failure> {
         if matches!(self.mode_of(&seeking.source), Some(LocalMode::Reference)) {
             return self.reference(seeking).map(Some);
+        }
+        // 4.1: the index is asked before the request is made, not after it. The
+        // floor of 2.5 step 1 is not re-applied here: the source's own dimensions
+        // admitted this candidate at the resolution stage, and the file was
+        // admitted the first time it was stored, so a second measurement would
+        // read the same bytes to reach the same answer.
+        if let Some((digest, path)) = self.window.cached(self.cache, &seeking.origin_key()) {
+            return Ok(Some(Filled::Cached { digest, path }));
         }
         let cap = self
             .config
@@ -2087,13 +2186,13 @@ fn disabled_record(source: &SourceConfig, reason: String) -> String {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::io::Cursor;
     use std::rc::Rc;
     use whirl_core::config::{Config, ConfigError};
     use whirl_core::protocol::{Kind, Via};
     use whirl_core::source::{Capability, Enumerated, FilterSet, Source, SourceError};
-    use whirl_core::state::{HistoryEntry, HistoryFile};
+    use whirl_core::state::{CacheIndexEntry, HistoryEntry, HistoryFile, IndexFile};
 
     // -- the two things a test owns: a source and a byte source -------------
 
@@ -3323,6 +3422,326 @@ mod tests {
             "the third rotation set nothing: the two calls are the two rotations before it"
         );
         assert_eq!(count_files(&cache.root().join("sha256")), 2);
+    }
+
+    // -- what the index is asked before a fetch (4.1) -----------------------
+
+    /// A [`Bytes`] that also records every origin it was asked for: the
+    /// accounting behind "the second rotation fetches zero bytes for that id".
+    struct Counting {
+        bodies: HashMap<String, Vec<u8>>,
+        opened: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Counting {
+        fn of(pairs: &[(&str, Vec<u8>)]) -> Counting {
+            Counting {
+                bodies: pairs
+                    .iter()
+                    .map(|(origin, bytes)| (origin.to_string(), bytes.clone()))
+                    .collect(),
+                opened: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        /// The origins this transport was asked to open, in order.
+        fn opened(&self) -> Vec<String> {
+            self.opened.borrow().clone()
+        }
+    }
+
+    impl Transport for Counting {
+        fn open(&self, origin: &str) -> Result<Box<dyn Read>, String> {
+            self.opened.borrow_mut().push(origin.to_string());
+            match self.bodies.get(origin) {
+                Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
+                None => Err(format!("{origin}: no such file")),
+            }
+        }
+    }
+
+    /// The daemon's own record for a rotation (`whirl_core::state`), so the file
+    /// a test writes is the file [`Window::load`] really reads.
+    fn history_entry(report: &Report) -> HistoryEntry {
+        HistoryEntry {
+            set_at: "2026-09-26T00:00:00Z".to_string(),
+            via: Via::Source,
+            kind: Kind::Local,
+            origin_key: report.origin_key.clone(),
+            digest: Some(report.digest.clone()),
+            path: Some(report.path.clone()),
+        }
+    }
+
+    /// `history.json`, written the way the daemon writes it (6.2: newest first).
+    fn write_history_at(state_dir: &Path, entries: &[HistoryEntry]) {
+        fs::create_dir_all(state_dir).expect("the state directory");
+        let file = HistoryFile {
+            seq: entries.len() as u64 + 1,
+            written_at: "2026-09-26T00:00:00Z".to_string(),
+            entries: entries.to_vec(),
+        };
+        fs::write(state_dir.join(state::HISTORY_FILE), file.encode())
+            .expect("history.json is written");
+    }
+
+    /// `cache/index.json`, in the shape `whirld::cache::record` writes: the digest
+    /// is the key, and the entry names the `origin_key` and the extension the
+    /// file's own name carries. The other fields are the daemon's and the
+    /// pipeline reads none of them.
+    fn write_index_at(cache: &Cache, entries: &[(&Report, &str)]) {
+        let mut index = IndexFile {
+            seq: 1,
+            written_at: "2026-09-26T00:00:00Z".to_string(),
+            root_id: "test-root".to_string(),
+            entries: BTreeMap::new(),
+            dangling: Vec::new(),
+        };
+        for (report, ext) in entries {
+            index.entries.insert(
+                report.digest.clone(),
+                CacheIndexEntry {
+                    ext: ext.to_string(),
+                    bytes: 1,
+                    first_seen: "2026-09-26T00:00:00Z".to_string(),
+                    last_used: "2026-09-26T00:00:00Z".to_string(),
+                    source: "pictures".to_string(),
+                    kind: Kind::Local,
+                    origin: None,
+                    origin_key: report.origin_key.clone(),
+                    width: None,
+                    height: None,
+                    pinned: false,
+                },
+            );
+        }
+        fs::write(cache.index_path(), index.encode()).expect("the index is written");
+    }
+
+    /// A candidate whose image the cache already holds is taken from the cache,
+    /// with no request to the source (4.1).
+    ///
+    /// Three rotations over a listing of two ids, with the window at
+    /// `dedupe.recent_entries = 1` so that an id comes round again: the first two
+    /// fetch, because nothing is held; the third offers the id the first one set,
+    /// finds it in the index under a file that is still there, and opens no
+    /// origin at all. The counting transport is the accounting, and the history
+    /// and the index are written between the runs exactly as the daemon writes
+    /// them (6.2), from the reports the rotations produced.
+    #[test]
+    fn a_candidate_the_cache_already_holds_is_set_without_a_fetch() {
+        let dir = scratch("worker-held");
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        // Rotation 1: nothing is held, so the first candidate is fetched.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation fetches");
+        assert_eq!(first.origin_key, "pictures:one");
+        assert_eq!(transport.opened(), vec!["pictures/one.png".to_string()]);
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+
+        // Rotation 2: the id just set is in the window, so the other candidate is
+        // fetched. The window is small enough that the first id comes round on the
+        // very next rotation.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation fetches the other candidate");
+        assert_eq!(second.origin_key, "pictures:two");
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string()
+            ]
+        );
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png"), (&second, "png")]);
+
+        // Rotation 3: the window holds only the second id, so the first is offered
+        // again. It is in the index, under a file that is still there, so it is
+        // set from the cache and the transport is asked for nothing.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the third rotation serves the first candidate from the cache");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(third.digest, first.digest);
+        assert_eq!(third.path, first.path);
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string()
+            ],
+            "the third rotation fetched nothing: the index was consulted first"
+        );
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "a candidate served from the cache has no part file"
+        );
+        assert_eq!(
+            setter.targets(),
+            vec![first.path.clone(), second.path.clone(), first.path.clone()],
+            "every rotation set something, the last one from the cache"
+        );
+    }
+
+    /// The same id, whose cached file has been deleted, is fetched again: the
+    /// `stat` is the rotation's decision, so a file the index lists but the disk
+    /// does not have is a miss like any other (4.1).
+    #[test]
+    fn a_held_candidate_whose_file_is_gone_is_fetched_again() {
+        let dir = scratch("worker-held-gone");
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation fetches");
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation fetches the other candidate");
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png"), (&second, "png")]);
+
+        // The index still names the first file; the disk no longer has it.
+        let stored = state::content_path(cache.root(), &first.digest, "png");
+        fs::remove_file(&stored).expect("the cached file is removed");
+        assert!(!stored.exists(), "the fixture starts with the file gone");
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the rotation fetches the candidate again");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(third.digest, first.digest);
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/one.png".to_string(),
+            ],
+            "a listed file that is gone is fetched again, not served"
+        );
+        assert!(
+            stored.is_file(),
+            "the bytes are back under their own content-addressed name"
+        );
+    }
+
+    /// A rotation still succeeds when the index is absent, unreadable or stale:
+    /// the index half of the window comes back empty and every candidate is
+    /// fetched, rather than the rotation failing on a file it only reads (7.1).
+    #[test]
+    fn a_rotation_survives_an_index_it_cannot_read() {
+        let dir = scratch("worker-index-unreadable");
+        let config = copy_config(&dir);
+        let bytes = long_png(1600, 900, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![candidate(
+                "one",
+                "pictures/one.png",
+                1600,
+                900,
+                bytes.len() as u64,
+            )]),
+        );
+        let transport = Counting::of(&[("pictures/one.png", bytes.clone())]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+        // The window is empty for the whole test - `dedupe.recent_entries` at 0 -
+        // so the candidate is offered every time and the only half under test is
+        // the index.
+        let window = || Window::load(&state_dir, &cache.index_path(), 0);
+
+        // Absent: the common case, and an empty index rather than an error.
+        assert!(!cache.index_path().exists());
+        assert!(window().cached(&cache, "pictures:one").is_none());
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window(), &setter, 1)
+            .rotate()
+            .expect("an absent index does not fail a rotation");
+        assert_eq!(transport.opened(), vec!["pictures/one.png".to_string()]);
+
+        // Unreadable: text the schema cannot parse. The file is read, warned
+        // about and ignored, and the candidate is fetched like a miss.
+        fs::create_dir_all(cache.root()).expect("the cache root");
+        fs::write(cache.index_path(), "{ not the index at all\n").expect("a broken index");
+        assert!(window().cached(&cache, "pictures:one").is_none());
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window(), &setter, 2)
+            .rotate()
+            .expect("an unreadable index does not fail a rotation");
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/one.png".to_string()
+            ],
+            "an unreadable index serves nothing, so the bytes are fetched"
+        );
+        assert_eq!(second.digest, first.digest);
+
+        // A newer schema is a downgrade rather than corruption (6.4 step 4): it
+        // is left alone, serves nothing, and the rotation still fetches.
+        fs::write(cache.index_path(), "{\n  \"schema\": 2\n}\n").expect("a newer index");
+        assert!(window().cached(&cache, "pictures:one").is_none());
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window(), &setter, 3)
+            .rotate()
+            .expect("a newer index does not fail a rotation");
+        assert_eq!(
+            transport.opened().len(),
+            3,
+            "three rotations, three fetches"
+        );
+        assert_eq!(third.digest, first.digest);
+        assert_eq!(
+            fs::read_to_string(cache.index_path()).expect("the newer index"),
+            "{\n  \"schema\": 2\n}\n",
+            "a newer schema is left exactly as it is"
+        );
     }
 
     /// The invariant of section 3: a partial fetch never becomes a cache file.
