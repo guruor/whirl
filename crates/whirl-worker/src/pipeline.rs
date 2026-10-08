@@ -554,17 +554,26 @@ impl Window {
     }
 
     /// The cache file a candidate's `origin_key` is already held under, when the
-    /// index names one and the file it names is still there. This is the whole
-    /// of the consultation: a `Some` is a candidate served from the cache with no
-    /// request to the source (4.1).
+    /// index names one and the file it names really holds the bytes that name
+    /// claims. This is the whole of the consultation: a `Some` is a candidate
+    /// served from the cache with no request to the source (4.1).
     ///
-    /// The `stat` here is the rotation's decision and not the sweep's, which is
-    /// what makes an entry the sweep has taken, or one that is listed but whose
-    /// file is gone, a fetch again rather than a silent nothing.
+    /// The check is the file's **bytes**, not its existence. A content-addressed
+    /// name is the digest of the bytes it was written from, so section 2's third
+    /// reason for the scheme - "a file whose bytes do not hash to its name was
+    /// truncated or damaged by something else, and that is detectable without a
+    /// second index" - is the condition of the hit rather than a report after it.
+    /// A file that is gone, unreadable, or whose bytes have moved off its name is
+    /// a miss, and the candidate falls through to the fetch like any other; the
+    /// index entry beside it is what the sweep will reclaim (5.5).
+    ///
+    /// The decision here is the rotation's and not the sweep's, which is what
+    /// makes an entry the sweep has taken, or one that is listed but whose file
+    /// is gone, a fetch again rather than a silent nothing.
     pub fn cached(&self, cache: &Cache, origin_key: &str) -> Option<(String, PathBuf)> {
         let held = self.held.get(origin_key)?;
         let path = state::content_path(cache.root(), &held.digest, &held.ext);
-        if path.is_file() {
+        if hashes_to(&path, &held.digest) {
             return Some((held.digest.clone(), path));
         }
         None
@@ -577,6 +586,35 @@ impl Window {
     pub fn keys(&self) -> Vec<String> {
         self.keys.iter().cloned().collect()
     }
+}
+
+/// Whether the file at `path` really carries the bytes its name claims: a whole
+/// pass of SHA-256 that spells `digest`, the 64 lower-case hex characters the
+/// cache path is built from.
+///
+/// This is section 2's third reason for content-addressed names, used as a
+/// condition rather than as a report: "a file whose bytes do not hash to its
+/// name was truncated or damaged by something else, and that is detectable
+/// without a second index". A file that is gone, unreadable, or whose bytes have
+/// moved off its name answers `false`, and both callers read that as a miss: the
+/// hit is not taken, the candidate is fetched, and the bytes that arrive replace
+/// whatever the name was holding.
+fn hashes_to(path: &Path, digest: &str) -> bool {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = protocol::Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(_) => return false,
+        }
+    }
+    hasher.hex() == digest
 }
 
 fn read_file(path: &Path) -> Result<Option<String>, String> {
@@ -1324,10 +1362,20 @@ pub fn store(
     };
     let digest = hasher.hex();
     let final_path = state::content_path(cache.root(), &digest, header.ext);
-    if final_path.is_file() {
+    if final_path.is_file() && hashes_to(&final_path, &digest) {
         // Section 3 step 7: "If the final path already exists, the bytes are
         // identical by construction, so `unlink` the part file and report a
         // cache hit (the daemon bumps `last_used`)."
+        //
+        // "By construction" is the file's own contents, not the fact that a
+        // directory entry is there: the arriving bytes already hash to `digest`,
+        // so the name is right, but a file something else truncated or replaced
+        // under that name is not the copy the name promises. That one fails
+        // [`hashes_to`] and falls through to the `rename` below, which replaces
+        // it with the bytes just fetched instead of handing the damaged copy to
+        // the setter. The same check decides [`Window::cached`], so the before-
+        // the-request hit and this after-the-download one agree about what a hit
+        // is.
         part.discard();
         return Ok(Stored {
             digest,
@@ -3588,6 +3636,11 @@ mod tests {
         assert_eq!(third.digest, first.digest);
         assert_eq!(third.path, first.path);
         assert_eq!(
+            fs::read(&first.path).expect("the cached file is readable"),
+            one,
+            "the bytes served from the cache are the origin's own"
+        );
+        assert_eq!(
             transport.opened(),
             vec![
                 "pictures/one.png".to_string(),
@@ -3668,6 +3721,162 @@ mod tests {
         assert!(
             stored.is_file(),
             "the bytes are back under their own content-addressed name"
+        );
+    }
+
+    /// The same id, whose cached file is still there under its own name but no
+    /// longer holds the bytes that name spells, is fetched again: the hit is the
+    /// file's contents matching the index's digest, not the file's existence
+    /// (4.1, and section 2's third reason for content-addressed names).
+    ///
+    /// The bytes that arrive replace the damaged copy under the same name, so
+    /// the setter is handed the image the name promises rather than whatever was
+    /// sitting under it.
+    #[test]
+    fn a_held_candidate_whose_file_was_replaced_is_fetched_again() {
+        let dir = scratch("worker-held-replaced");
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation fetches");
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation fetches the other candidate");
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png"), (&second, "png")]);
+
+        // The index still names the first file and the file is still there under
+        // that name, but something replaced its bytes in place: another image,
+        // same name. It no longer hashes to what the name spells.
+        let stored = state::content_path(cache.root(), &first.digest, "png");
+        let tampered = long_png(1600, 902, 48);
+        assert_ne!(
+            protocol::sha256_hex(&tampered),
+            first.digest,
+            "the replacement must hash to a different name for the case to bite"
+        );
+        fs::write(&stored, &tampered).expect("the cached file is replaced in place");
+
+        // The consultation is the file's bytes, so this is a miss even though the
+        // `stat` succeeds.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        assert!(
+            window.cached(&cache, "pictures:one").is_none(),
+            "a file whose bytes do not hash to its name is not a hit"
+        );
+
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the rotation fetches the candidate again");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(third.digest, first.digest);
+        assert_eq!(third.path, first.path);
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/one.png".to_string(),
+            ],
+            "a file whose bytes have moved off its name is fetched again, not served"
+        );
+        assert_eq!(
+            fs::read(&stored).expect("the cache file is readable"),
+            one,
+            "the bytes that arrived replaced the damaged copy under the same name"
+        );
+        assert_eq!(
+            setter.targets().last().expect("the third rotation set"),
+            &stored.display().to_string(),
+            "the setter was handed the repaired file, not the damaged one"
+        );
+    }
+
+    /// The same id, whose index entry the sweep has evicted, is fetched again:
+    /// the index is the service map, and an id it no longer names has nothing to
+    /// serve however healthy the file for it may be (4.1).
+    #[test]
+    fn a_swept_entry_is_fetched_again() {
+        let dir = scratch("worker-entry-swept");
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation fetches");
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation fetches the other candidate");
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+
+        // The sweep's eviction write: the index no longer names the first id,
+        // while the file it used to describe is untouched on disk.
+        write_index_at(&cache, &[(&second, "png")]);
+        let stored = state::content_path(cache.root(), &first.digest, "png");
+        assert!(
+            stored.is_file(),
+            "the file the evicted entry described stays"
+        );
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        assert!(
+            window.cached(&cache, "pictures:one").is_none(),
+            "an id the index no longer names has nothing to serve"
+        );
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the rotation fetches the candidate again");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/one.png".to_string(),
+            ],
+            "an evicted entry is a miss, and the candidate is fetched"
         );
     }
 
