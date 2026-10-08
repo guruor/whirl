@@ -5,6 +5,13 @@
 //! becomes the exit code (0 the verb completed, 1 the daemon refused, 2 the
 //! daemon is unreachable, 3 the command line was wrong).
 //!
+//! A verb that changes the wallpaper (`next`, `prev`, `set`) narrates the wait
+//! the daemon's interim `queued` opens: one courtesy line on stderr naming the
+//! bound, because a rotation may run to `schedule.worker_deadline_seconds` and
+//! the silence between `queued` and the verdict otherwise reads as a hang. The
+//! line is on stderr so stdout stays the daemon's data lines alone, which is
+//! what a script reads (2.5.1).
+//!
 //! The one command that is not a protocol request is `daemon`, which asks the
 //! platform's supervisor for the daemon's lifecycle rather than asking the
 //! daemon anything (section 8, `daemon.rs`); it keeps the same four exit codes.
@@ -248,6 +255,30 @@ enum TalkError {
     Io(std::io::Error),
 }
 
+/// The courtesy line `whirl` prints to stderr once the daemon has queued a
+/// rotation (2.6's interim line), so a wait that can run to the worker deadline
+/// does not read as a hang.
+///
+/// The bound is the client's own rotation request timeout: docs/architecture.md
+/// 2.8 sets it at 300 s "deliberately equal to the worker deadline", and 2.7's
+/// `timeout` is "the request did not complete inside 300 s". The client does not
+/// ask the daemon for its configured `schedule.worker_deadline_seconds`, because
+/// 2.5.1 has no protocol line for it: the number here is the one the spec fixes
+/// for the client's own patience.
+#[cfg(unix)]
+const ROTATION_WAIT: &str = "whirl: working; the rotation may take up to 300 s";
+
+/// Whether this request changes the wallpaper, and so is one whose `queued`
+/// begins a wait worth narrating. `config check` carries `queued` too (2.6), but
+/// it reports a plan rather than a wallpaper, so it keeps the client's silence.
+#[cfg(unix)]
+fn sets_the_wallpaper(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Next | Request::Prev | Request::SetPath(_) | Request::SetId(_)
+    )
+}
+
 /// One connection, one request, one response (2.3). The greeting is checked
 /// before the request goes out, because a client that cannot read the answer
 /// should not ask the question.
@@ -302,6 +333,15 @@ fn talk(request: &Request) -> Result<ExitCode, TalkError> {
                 }
             }
             Exit::Line => println!("{line}"),
+            Exit::Interim => {
+                // `queued` goes to stdout as it always did; the courtesy line
+                // that says the wait has begun is the client's own, and only for
+                // a verb whose answer changes the wallpaper.
+                println!("{line}");
+                if sets_the_wallpaper(request) {
+                    eprintln!("{ROTATION_WAIT}");
+                }
+            }
         }
     }
 }

@@ -588,6 +588,15 @@ when the daemon replied and 2 when the socket is unreachable. It adds no protoco
 `ping` is a verb for any client (below); it is the CLI's own way to ask the question a user asks,
 "is the daemon there", without `nc` and without reading a socket by hand.
 
+`decision:` `whirl next`, `whirl prev` and `whirl set <path|id>` print one line to stderr, and nothing
+new to stdout, after the daemon has answered `queued` (2.6): `whirl: working; the rotation may take up
+to 300 s`. The worker may run to `schedule.worker_deadline_seconds`, so the gap between `queued` and the
+`set:` line is the command's normal shape, and a client silent through it reads as a command that "just
+said queued and nothing happened". The line names the bound the client itself waits by (2.8's 300 s
+rotation request timeout) and is on stderr because the data lines belong to stdout and a harness reads
+that stream. `config check` carries `queued` too but reports a plan rather than a wallpaper change, so
+it is not one of the three; nothing about `queued` itself changes on the wire.
+
 Verbs with no CLI verb, and why they exist: `hello` is negotiation for any client, and the CLI never
 sends it (`whirl version` maps to `version` alone, above); `close` is a clean shutdown of one
 connection, and `whirl idle` issues it itself; `subscribe` is the frontend surface, reached through
