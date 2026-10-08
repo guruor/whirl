@@ -17,7 +17,7 @@ decision.
 | `docs/`, `prototype/` | exist |
 | the Cargo workspace (`crates/`) | exists on pull request #1: `whirl-core`, `whirld`, `whirl-cli`, `whirl-worker`, four members and no third-party dependency |
 | `.github/workflows/ci.yml` | written here, lints clean, and **has run**: green on macOS, Windows and Linux, run `36240381639`, thirteen jobs, on the tip of `development`. The `coverage` job added since is the fourteenth, and it has run on a runner: run `37462295465`, the whole workflow green, the coverage job's log ending in the floor holding (section 4, "What has and has not been verified") |
-| `.github/workflows/release.yml` | written here, lints clean, and **has run** four times: green once, on the throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag; red twice since, on the throwaway guard probes `v0.0.1-rc.test-guard`, run `36156068912`, and `v0.0.1-rc.review-guard-t6d652592`, run `36157463795`, where the `guard` job failed because the tag was not on `main` and `build` and `release` were skipped, so neither probe built or published anything; and red again on the probe `v0.0.1-rc.workflow-probe`, run `37708302190`, cut at the tip of the branch carrying the manual entrance, where the run title resolved, `guard` read `VERSION` out of the workflow `env:` and failed on the same ancestry check, and `build` and `release` were skipped. Every probe tag and its release has been deleted, so no throwaway tag and no throwaway release exists on `origin`. The manual entrance (`workflow_dispatch`) is new and **has not been dispatched**: GitHub reads the set of manually runnable workflows from the default branch, so it can be started by hand only once the change carrying it is on `main` (section 5, "Starting a run by hand") |
+| `.github/workflows/release.yml` | written here, lints clean, and **has run** five times: green once, on the throwaway prerelease tag `v0.0.1-rc.test`, run `36140056903`, four jobs green, the release published with its three platform archives attached and then deleted together with its tag; red twice since, on the throwaway guard probes `v0.0.1-rc.test-guard`, run `36156068912`, and `v0.0.1-rc.review-guard-t6d652592`, run `36157463795`; red again on the probe `v0.0.1-rc.workflow-probe`, run `37708302190`, cut at the tip of the branch carrying the manual entrance; and once as a dispatch, `release rehearsal (v0.0.1-rc.rehearsal)`, run `37708471746`, started by hand against that branch. In the three throwaway runs the `guard` job failed because the commit was not on `main`, the run title resolved, `guard` read `VERSION` out of the workflow `env:` (the tag on a push, the typed input on a dispatch), and `build` and `release` were skipped, so none of them built or published anything. Every probe tag and its release has been deleted, so no throwaway tag and no throwaway release exists on `origin`. **No rehearsal has reached the build jobs yet:** `guard` refuses every commit that is not on `main`, by design, so a run started by hand that builds and reports needs the entrance on `main` (section 5, "Starting a run by hand") |
 | a running daemon reachable from a checkout | yes: the section 7 sequence below, driven from a fresh clone of pull request #1 on a scratch socket, no wallpaper touched |
 | anything that sets a real wallpaper in CI | never, by design (see "What CI cannot prove") |
 
@@ -825,11 +825,12 @@ gh workflow run release.yml --ref main -f version=v0.2.2-rc.3
   how a rehearsal is told apart in the run list from the run that published.
 - **Both gates apply.** The version's shape is validated, and the commit the run
   is building must be an ancestor of `origin/main`; the same two checks a tag push
-  is held to. Dispatch it from `main`: the commit a run builds is the tip of the
-  ref it was dispatched against, so a dispatch against a working branch is refused
-  by `guard`, correctly, because that branch's tip is not on `main`. GitHub also
-  reads the set of manually runnable workflows from the default branch, so the
-  trigger has to be on `main` before a dispatch works at all.
+  is held to. Dispatch it from `main`: GitHub reads the workflow, and the commit a
+  run builds, from the ref it is dispatched against, so a dispatch against a
+  working branch does start a run, and that run is then refused by `guard`, which
+  is the gate working rather than a rehearsal happening (run `37708471746` is one:
+  the title resolved and the version came from the input, the ancestry check
+  failed, and `build` and `release` were skipped).
 - **Nothing is published and no tag is created.** The run builds the same three
   archives, runs the notes gate, writes a `sha256` beside every archive, and then
   reports what a tag push would attach. Publishing is what a tag push asks for,
