@@ -6,6 +6,20 @@ name: release
 # `.github/workflows/ci.yml` builds, one archive per platform, and attaches them
 # to a GitHub Release whose notes come from a template in the repository.
 #
+# It has two entrances. A tag push is the release: it builds, checks and
+# publishes. A run started by hand (`workflow_dispatch`) is a rehearsal: it names
+# the version to rehearse, runs the same gates over the same build, reports what a
+# tag push would attach, and publishes nothing and creates no tag. The second
+# entrance exists because a release that can only be started by writing a ref is a
+# release a ref-level outage can hold: on 2026-10-07 GitHub's Git Operations
+# refused a new tag ref with a server-side 500 for about an hour, and there was no
+# way to start the run, or to retry it, until the ref went in by another route.
+#
+# The version therefore has one definition, `VERSION` in the `env:` block below:
+# the tag on a tag push, the typed input on a run started by hand. Every job that
+# needs it takes it from there, so no job reads `github.ref_name` on the manual
+# path, where the ref is a branch and not a version at all.
+#
 # The rule is enforced here, not assumed. The first job, `guard`, fails unless the
 # tagged commit is an ancestor of `origin/main`, and `build` and `release` both
 # name it in `needs:`, so a tag pushed anywhere else builds nothing and publishes
@@ -36,13 +50,26 @@ name: release
 #   action cannot change under the repository between two runs (section 4);
 # - the release is created with the `gh` the runner already has, so no
 #   third-party action is given the write token;
-# - no event payload is spliced into a `run:` step: the tag and the commit reach
-#   the scripts through `env:`, and the first script refuses a tag that is not
-#   release-shaped before anything uses it.
+# - no event payload is spliced into a `run:` step: the version and the commit
+#   reach the scripts through `env:`, and the shape gate refuses a version that is
+#   not release-shaped before it is used as a path or as a `gh` argument.
 
 on:
   push:
     tags: ["v*"]
+  # The second way in: a run started by hand, for the release that has to be
+  # rehearsed or repeated while no ref can be written. There is no tag to read the
+  # version from on this path, so it is typed, as a tag spells it, and both gates
+  # below apply to it exactly as they apply to a tag push.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: the version to rehearse, as the tag spells it (v0.2.1)
+        required: true
+
+# The run list says which entrance a run came through, so a rehearsal is never
+# read as the run that published, and the version is in the title either way.
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('release rehearsal ({0})', github.event.inputs.version) || format('release ({0})', github.ref_name) }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -57,6 +84,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The version this run is for, defined once and read by every job that needs it:
+  # the tag on a tag push, and the input on a run started by hand. `inputs` is
+  # empty on a push, so the fallback is what a tag push already reads. A hand-run
+  # with a blank input falls back to the ref, which the shape gate then refuses
+  # rather than building an archive nothing can name.
+  VERSION: ${{ github.event.inputs.version || github.ref_name }}
 
 jobs:
   # First in the graph, and `build` and `release` both wait behind it: a tag that
@@ -65,7 +98,11 @@ jobs:
   # release is a tag `vX.Y.Z` on `main`, docs/development.md section 5) is a
   # fact about history, so this job is a fetch and one ancestry question.
   guard:
-    name: guard (${{ github.ref_name }} is on main)
+    # The check is about the commit this run is building, not about a ref: on a
+    # run started by hand the ref is the branch the dispatch was made against,
+    # and a branch name is not a version and says nothing about what is being
+    # released. The commit is what the ancestry question below is asked about.
+    name: guard (${{ github.sha }} is on main)
     runs-on: ubuntu-latest
     steps:
       # `fetch-depth: 0`, because the check below asks a question about history
@@ -80,27 +117,28 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - name: Refuse a tag whose commit is not on main
+      - name: Refuse a run whose commit is not on main
         shell: bash
         env:
-          # The tag and the commit reach this script through `env:`: no event
-          # payload is spliced into a `run:` step.
-          TAG: ${{ github.ref_name }}
+          # The commit reaches this script through `env:`: no event payload is
+          # spliced into a `run:` step. `VERSION` is the workflow's own, and it is
+          # the tag on a tag push and the typed input on a run started by hand;
+          # neither the version nor the ref is spliced into a `run:` step either.
           SHA: ${{ github.sha }}
         run: |
           set -eu
           if ! git rev-parse --verify --quiet refs/remotes/origin/main > /dev/null; then
-            echo "::error::origin/main is not in this checkout, so this job cannot say whether $TAG is on main. Refusing rather than publishing a release that nothing checked; the checkout needs the repository's history (fetch-depth: 0)."
+            echo "::error::origin/main is not in this checkout, so this job cannot say whether $VERSION is on main. Refusing rather than publishing a release that nothing checked; the checkout needs the repository's history (fetch-depth: 0)."
             exit 1
           fi
           main=$(git rev-parse origin/main)
-          echo "tag $TAG points at $SHA"
+          echo "release $VERSION points at commit $SHA"
           echo "origin/main is $main"
           if git merge-base --is-ancestor "$SHA" origin/main; then
             if [ "$SHA" = "$main" ]; then
-              echo "the tagged commit is main's tip"
+              echo "the commit this run is building is main's tip"
             else
-              echo "the tagged commit is an ancestor of main, which has moved ahead of it since the tag was cut; the release still describes the tagged commit"
+              echo "the commit this run is building is an ancestor of main, which has moved ahead of it since; the release still describes that commit"
             fi
             exit 0
           fi
@@ -110,7 +148,7 @@ jobs:
           else
             echo "ancestry: $SHA is NOT an ancestor of origin/main, and the two share no history at all"
           fi
-          echo "::error::$TAG is not on main, so it is not a release. Nothing was built and no release will be published. A release is a tag vX.Y.Z on main (docs/development.md section 5): delete this tag, get the commit onto main by a pull request, and tag main's tip."
+          echo "::error::$VERSION is not on main, so it is not a release. Nothing was built and no release will be published. A release is a tag vX.Y.Z on main (docs/development.md section 5): put this commit on main by a pull request, and tag main's tip."
           exit 1
 
   build:
@@ -184,7 +222,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          ARCHIVE: whirl-${{ github.ref_name }}-${{ matrix.slug }}.${{ matrix.ext }}
+          ARCHIVE: whirl-${{ env.VERSION }}-${{ matrix.slug }}.${{ matrix.ext }}
         run: |
           set -eu
           tar --create --gzip --file "$ARCHIVE" --directory dist .
@@ -194,7 +232,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          ARCHIVE: whirl-${{ github.ref_name }}-${{ matrix.slug }}.${{ matrix.ext }}
+          ARCHIVE: whirl-${{ env.VERSION }}-${{ matrix.slug }}.${{ matrix.ext }}
         run: |
           Compress-Archive -Path dist\* -DestinationPath $env:ARCHIVE
           Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -203,8 +241,8 @@ jobs:
           $zip.Dispose()
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: whirl-${{ github.ref_name }}-${{ matrix.slug }}
-          path: whirl-${{ github.ref_name }}-${{ matrix.slug }}.${{ matrix.ext }}
+          name: whirl-${{ env.VERSION }}-${{ matrix.slug }}
+          path: whirl-${{ env.VERSION }}-${{ matrix.slug }}.${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 90
 
@@ -224,7 +262,10 @@ jobs:
           merge-multiple: true
       - name: Assemble and check the release notes
         env:
-          TAG: ${{ github.ref_name }}
+          # The step's own gate is unchanged, its refusal of a version that is not
+          # release-shaped included; only where its string comes from is: the tag
+          # on a tag push, the typed input on a run started by hand.
+          TAG: ${{ env.VERSION }}
           SHA: ${{ github.sha }}
         run: |
           python3 - <<'PY'
@@ -320,7 +361,7 @@ jobs:
               handle.write(f"NOTES_FILE={notes_file}\n")
               handle.write(f"PRERELEASE={str(prerelease).lower()}\n")
           PY
-      - name: Assert the three platform archives are here, named for this tag
+      - name: Assert the three platform archives are here, named for this version
         run: |
           set -eu
           found=$(find dist -type f | sort)
@@ -332,9 +373,9 @@ jobs:
           fi
           for archive in $found; do
             case "$(basename "$archive")" in
-              "whirl-${GITHUB_REF_NAME}-"*) ;;
+              "whirl-${VERSION}-"*) ;;
               *)
-                echo "::error::$archive is not named for the tag $GITHUB_REF_NAME"
+                echo "::error::$archive is not named for the version $VERSION"
                 exit 1
                 ;;
             esac
@@ -402,7 +443,7 @@ jobs:
           for archive in $archives; do
             checksum="$archive.sha256"
             if [ ! -f "$checksum" ]; then
-              echo "::error::$archive has no checksum beside it; refusing to publish $GITHUB_REF_NAME with an archive the installer cannot verify."
+              echo "::error::$archive has no checksum beside it; refusing to publish $VERSION with an archive the installer cannot verify."
               exit 1
             fi
             published=$(awk 'NR==1 { print $1 }' "$checksum")
@@ -419,10 +460,14 @@ jobs:
             fi
             echo "  checksum ok  $(basename "$archive")"
           done
+      # A tag push is the only entrance that publishes: a release tag comes from a
+      # tag push, and a run started by hand stops at the rehearsal step below,
+      # which is what keeps a rehearsal from creating a release or a tag.
       - name: Create the release, with the notes, the archives and their checksums attached
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ env.VERSION }}
         run: |
           set -eu
           # `--verify-tag`: this run was triggered by the tag, so the tag must
@@ -442,3 +487,20 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
             --json tagName,isPrerelease,isDraft,assets \
             --jq '"  \(.tagName) prerelease=\(.isPrerelease) draft=\(.isDraft)", (.assets[] | "  \(.name) \(.size) bytes")'
+      # A run started by hand built and checked everything a release needs and
+      # stops here: no release is created and no tag is created, because a release
+      # tag comes from a tag push. What it prints is what a tag push of the same
+      # version would attach, so a rehearsal is read the way the release is, and
+      # the run's title in the run list says it was one.
+      - name: Report the rehearsal (a run started by hand publishes nothing)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -eu
+          echo "rehearsal for $VERSION: built and checked, nothing published"
+          echo "release notes: $NOTES_FILE"
+          echo "prerelease: $PRERELEASE"
+          echo "what a tag push of $VERSION would attach:"
+          for archive in $(find dist -type f ! -name '*.sha256' | sort); do
+            echo "  $(basename "$archive")  $(wc -c < "$archive" | tr -d ' ') bytes  sha256 $(awk 'NR==1 { print $1 }' "$archive.sha256")"
+          done
+          echo "no release and no tag was created: this run was started by hand, and a release tag comes from a tag push"
