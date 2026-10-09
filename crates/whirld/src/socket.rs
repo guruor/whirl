@@ -643,7 +643,7 @@ fn dispatch(daemon: &Daemon, line: &str, out: &mut impl Write) -> io::Result<Con
                         write_ok(out)?;
                     }
                 }
-                Ok(Outcome::Set(_)) => {
+                Ok(Outcome::Set { .. }) => {
                     write_err(
                         out,
                         ErrorCode::WorkerFailed,

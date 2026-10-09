@@ -2764,6 +2764,158 @@ fn a_local_source_in_copy_mode_rotates_and_the_second_next_is_the_other_image() 
     );
 }
 
+/// The same config as [`write_rotation_config`] with 4.2's `prefetch` named, in
+/// `copy` mode: the count is the subject of the test that writes this file, and
+/// leaving it to the shipped default would make that test measure a number it
+/// did not choose.
+fn write_warming_config(dir: &Path, walls: &Path, prefetch: usize) {
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            "{{\n  \"config_schema\": 1,\n  \"prefetch\": {prefetch},\n  \"sources\": [\n    \
+             {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \"mode\": \"copy\", \
+             \"paths\": [\"{}\"] }}\n  ]\n}}\n",
+            walls.display()
+        ),
+    )
+    .expect("the test's own config");
+}
+
+/// 4.2 end to end, over the real socket and the real worker binary, with the
+/// source's bytes replaced between the rotations: three planted images,
+/// `prefetch: 2`, and the three `next` calls that follow.
+///
+/// The first rotation sets one image, fetches and stores two more, and the
+/// daemon writes an index entry for each of the two and logs a line naming them -
+/// which is the card's "what is warm is observable, in the log". Each planted
+/// file is then **rewritten** with the same header and different bytes, so a
+/// rotation that read the source would set different bytes, and the only place
+/// the planted ones still exist is the cache. All three rotations set a
+/// different planted image, and `sha256/` holds exactly three files, which is the
+/// cache having gained nothing else.
+///
+/// The source's own bytes have to keep parsing: the `local` source enumerates a
+/// directory's images and 2.5 step 1 measures the header, so a directory that had
+/// lost its files would enumerate nothing and 1.4's exhaustion would answer
+/// before the cache was ever asked. The rewrite is what leaves a candidate to ask
+/// about and no bytes to fetch.
+///
+/// The daemon and the worker are the binaries `cargo test --workspace` builds
+/// next to each other (this file's module doc), so a `-p whirld` run after a
+/// `whirl-worker` edit can test a stale worker: build the workspace when the
+/// source changed.
+#[test]
+fn a_warmed_rotation_serves_the_next_two_without_reading_the_source() {
+    let planted: Vec<(&str, Vec<u8>)> = vec![
+        ("a.png", rotation_png(2560, 1440)),
+        ("b.png", rotation_png(2048, 1152)),
+        ("c.png", rotation_png(2560, 1441)),
+    ];
+    let name = "a_warmed_rotation_serves_the_next_two_without_reading_the_source";
+    let daemon = start_prepared(name, |dir| {
+        let walls = dir.join("walls");
+        std::fs::create_dir_all(&walls).expect("the source's directory");
+        for (file, bytes) in &planted {
+            std::fs::write(walls.join(file), bytes).expect("a planted image");
+        }
+        write_warming_config(dir, &walls, 2);
+    });
+    let walls = daemon.dir.join("walls");
+
+    // Rotation 1: one set, two warmed, all three now held.
+    let first = set_fields(&daemon.ask("next"));
+    assert_eq!(first[2], "source", "a rotation sets through a source (2.6)");
+    let first_bytes = std::fs::read(Path::new(&first[3])).expect("the first cache file");
+    assert!(
+        planted.iter().any(|(_, bytes)| bytes == &first_bytes),
+        "the bytes in the cache are the image the source offered"
+    );
+
+    let log = daemon.log();
+    let warmed: Vec<String> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("whirld: prefetched "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        warmed.len(),
+        2,
+        "the rotation warmed the two candidates after the one it set: {log}"
+    );
+    for line in &warmed {
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(
+            fields.len(),
+            4,
+            "`<origin_key> <digest> <bytes> bytes`: {line}"
+        );
+        assert!(
+            fields[0].starts_with("pictures:"),
+            "the warmed line names the source's own origin: {line}"
+        );
+        assert_ne!(
+            fields[0], first[1],
+            "the image that was set is not one of the warmed ones: {line}"
+        );
+        assert_eq!(fields[1].len(), 64, "a digest is 64 hex chars: {line}");
+    }
+
+    let index = std::fs::read_to_string(daemon.dir.join("cache").join("index.json"))
+        .expect("the cache index the daemon wrote");
+    assert_eq!(
+        index.matches("\"origin_key\"").count(),
+        3,
+        "the daemon writes an index entry for each `prefetch:` line (7.3 step 4): {index}"
+    );
+    for line in &warmed {
+        let digest = line.split(' ').nth(1).expect("the digest field");
+        assert!(
+            index.contains(digest),
+            "the warmed digest {digest} is in the index: {index}"
+        );
+    }
+
+    // The source's files keep their headers and lose their bytes: every candidate
+    // the walk can name is now a file whose contents are not the planted image,
+    // so a rotation that set it from the source would set something else.
+    for (file, bytes) in &planted {
+        let mut replaced = bytes.clone();
+        replaced.extend_from_slice(b"not the image the index holds");
+        std::fs::write(walls.join(file), &replaced).expect("the rewritten image");
+        assert_ne!(
+            std::fs::read(walls.join(file)).expect("the rewritten image"),
+            *bytes,
+            "the rewrite has to have changed the bytes for the test to mean anything"
+        );
+    }
+
+    let mut set_digests = vec![first[0].clone()];
+    for rotation in 2..=3 {
+        let fields = set_fields(&daemon.ask("next"));
+        assert_eq!(
+            fields[2], "source",
+            "rotation {rotation} is still a source rotation (2.6)"
+        );
+        let bytes = std::fs::read(Path::new(&fields[3]))
+            .unwrap_or_else(|error| panic!("rotation {rotation}'s cache file: {error}"));
+        assert!(
+            planted.iter().any(|(_, planted)| planted == &bytes),
+            "rotation {rotation} set a planted image, so it was served from the cache"
+        );
+        assert!(
+            !set_digests.contains(&fields[0]),
+            "rotation {rotation} set an image no rotation had set yet: {fields:?}"
+        );
+        set_digests.push(fields[0].clone());
+    }
+    assert_eq!(
+        count_files(&daemon.dir.join("cache").join("sha256")),
+        3,
+        "three images, three cache files: the prefetch added nothing beyond the two \
+         it was asked for"
+    );
+}
+
 /// The same rotation in features.md 2.2's default, which is `reference`: the
 /// platform is pointed at the user's own file and the cache gains nothing.
 ///

@@ -257,12 +257,26 @@ either side can see the whole interface:
   not carry (`$XDG_STATE_HOME` and `$XDG_CACHE_HOME` on Linux, `%LOCALAPPDATA%` on Windows;
   `[D 6 §1.2]`, `[D 6 §1.3]`), and a child left to re-derive them reads a different `history.json`
   than the daemon wrote and gets a 4.1 window that is silently empty.
-- **stdout:** at most two lines. `downloaded: <digest> <abs path>` after the rename, and
-  `set: <digest> <origin_key> <abs path>` after the setter returned success. The daemon parses the
-  last non-empty line as the result and keeps the whole capture for the log
-  `[D 6 §7.2]` (the worker does not open the log file). Two lines rather than one because of
-  1.7.3: a worker that dies between the setter and its exit has still told the daemon what is on
-  screen.
+- **stdout:** up to `2 + prefetch` lines, in this order. `downloaded: <digest> <abs path>` after
+  the rename, then `set: <digest> <origin_key> <abs path>` after the setter returned success, then
+  one `prefetch: <digest> <origin_key> <abs path>` per candidate the prefetch warmed. The daemon
+  reads the `set:` line as the result, wherever it sits in the capture, and keeps the whole
+  capture for the log `[D 6 §7.2]` (the worker does not open the log file). More than one line
+  rather than one because of 1.7.3: a worker that dies between the setter and its exit has still
+  told the daemon what is on screen.
+- **the prefetch, and the three rules it holds to.** After the `set:` line is out the worker walks
+  on and fetches and stores the next `prefetch` candidates (the config key of 4.2, 2 by default,
+  `0` off), the ones the selection would have offered next, so the rotations after this one set
+  with no request at all. **It never delays the set it belongs to:** the setter has returned and
+  the report is on stdout before the first byte is read. **It obeys the same dedupe, cache-cap and
+  sweep rules as a rotation,** because its bytes go through the same content-addressed store and
+  the daemon writes an index entry for each `prefetch:` line like any other `[D 6 §7.3]`. **A
+  prefetch that fails never fails the rotation that triggered it:** every failure is a warning on
+  stderr, which is the surface this section gives diagnostics. And because the daemon does not read
+  what a worker wrote when it kills it for the deadline of 1.7.1, the prefetch spends at most half
+  of `schedule.worker_deadline_seconds` and stops: past that line the rotation's own half would
+  have gone to warming, and a prefetch that ran into the deadline could turn a set into the
+  `worker_timeout` the daemon would report instead.
 - **exit code:** 0 when the verb completed and the wallpaper was set (or, for `check`, when the
   plan was produced); non-zero with the failing stage on stderr otherwise. The `ERR` code the
   client sees is derived from the failing stage, and the mapping is in 2.7.
@@ -1405,6 +1419,9 @@ closed and `[D 6 §8.7]` puts the write on the daemon. It parses as JSON: `[L 6]
 
   "log_max_bytes": 1048576,
   "_comment_log_max_bytes": "1 MiB. The cap on the log file, checked at startup and at every rotation: past it the daemon rewrites the file keeping the newest whole lines and writes one line saying what it dropped. 0 means keep everything and is the only value that means that; any other value must be at least 4096.",
+
+  "prefetch": 2,
+  "_comment_prefetch": "How many candidates a successful rotation did not need are fetched and stored before the worker exits, so the rotations after it set from the cache instead of paying for the download. 0 turns it off and is the only value that means that; the ceiling is 8.",
 
   "schedule": {
     "interval_seconds": 1800,

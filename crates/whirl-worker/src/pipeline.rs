@@ -18,9 +18,12 @@
 //! source can exist: a test-only `kind` compiled into this binary would be a
 //! shipped kind.
 //!
-//! The stdout contract is docs/architecture.md 1.6: at most two lines,
-//! `downloaded: <digest> <path>` after the rename, then
-//! `set: <digest> <origin_key> <path>` after the setter returned success.
+//! The stdout contract is docs/architecture.md 1.6: `downloaded: <digest>
+//! <path>` after the rename, then `set: <digest> <origin_key> <path>` after the
+//! setter returned success, then up to `prefetch` lines of
+//! `prefetch: <digest> <origin_key> <path>` for the candidates warmed ahead,
+//! where `prefetch` is the key of docs/architecture.md 4.2. The daemon reads
+//! the `set:` line as the result, wherever it sits.
 
 use crate::backend::{self, SetError};
 use crate::sources::Sources;
@@ -1657,6 +1660,21 @@ fn nonce() -> u32 {
 // The rotation
 // ---------------------------------------------------------------------------
 
+/// The share of the rotation's own deadline the prefetch may spend before it
+/// yields (docs/architecture.md 1.6 and 1.7.1).
+///
+/// The deadline is the whole rotation's, and the daemon enforces it by killing
+/// the worker and never reading what the worker wrote: a prefetch that ran into
+/// it would lose the `set:` line this rotation has already printed and be
+/// recorded as the `worker_timeout` the daemon reports instead of a set. So the
+/// prefetch stops with half the deadline left, whatever that deadline is. It is
+/// not a measurement of the prefetch - that is 1-9 s against the 300 s default,
+/// and it is in the tests below - it is the smallest share that leaves the
+/// rotation proper as much room as the prefetch took. The floor on
+/// `worker_deadline_seconds` is 60 (docs/architecture.md 4.3), so this is never
+/// a shorter budget than one candidate's own worst case.
+const PREFETCH_DEADLINE_DIVISOR: u32 = 2;
+
 /// One run's inputs: everything the stages need that is not the config, so a
 /// test can drive a whole rotation with a source and a transport of its own.
 pub struct Run<'a> {
@@ -1671,6 +1689,12 @@ pub struct Run<'a> {
     pub run: u64,
     /// The one integer draw features.md F2 allows a rotation.
     pub draw: u64,
+    /// When this run began, for the one thing that needs a clock: the prefetch's
+    /// share of `schedule.worker_deadline_seconds`
+    /// ([`PREFETCH_DEADLINE_DIVISOR`]). A field rather than a `now()` inside
+    /// [`Run::rotate`] so a test can age a run by a deadline without sleeping
+    /// through one.
+    pub started: std::time::Instant,
 }
 
 /// What a candidate's bytes became: the whole of what features.md 2.2's `mode`
@@ -1746,6 +1770,7 @@ impl Run<'_> {
     /// failure reported is the last download failure, so `status` gains the
     /// `offline` that section names instead of a message blaming the filters.
     pub fn rotate(&self) -> Result<Report, Failure> {
+        let started = self.started;
         let order = weighted_order(&self.sources.weights(), self.draw);
         if order.is_empty() {
             // Name the reason, not a guess between the two: a source with no
@@ -1769,7 +1794,16 @@ impl Run<'_> {
         let mut set_failures: Vec<SetError> = Vec::new();
         let mut fill_failures: Vec<Failure> = Vec::new();
         let mut reasons: Vec<String> = Vec::new();
-        for index in order {
+        // The walk is an index over `order` rather than `for index in order`
+        // because it no longer ends where it used to: [`Run::warm`] picks it up
+        // at the position the set left it, and that needs both the position and
+        // the candidates this source had not offered yet (docs/architecture.md
+        // 4.2).
+        let mut at = 0usize;
+        let mut set: Option<(Report, std::vec::IntoIter<Seeking>)> = None;
+        while at < order.len() {
+            let index = order[at];
+            at += 1;
             let entry = &self.sources.entries()[index];
             let candidates = match self.enumerate(entry) {
                 Ok(candidates) => candidates,
@@ -1811,7 +1845,8 @@ impl Run<'_> {
                 );
                 continue;
             }
-            for seeking in filtered.kept {
+            let mut kept = filtered.kept.into_iter();
+            while let Some(seeking) = kept.next() {
                 if bad.contains(&seeking.candidate.id) {
                     continue;
                 }
@@ -1850,7 +1885,13 @@ impl Run<'_> {
                     Ok(()) => {
                         let report = self.report(&seeking, &filled);
                         println!("{}", report.set_line());
-                        return Ok(report);
+                        // The set has happened and the daemon has been told
+                        // before the prefetch below starts, which is the whole of
+                        // "it never delays the set it belongs to"
+                        // (docs/architecture.md 1.6): the wallpaper is up whether
+                        // or not anything is warmed.
+                        set = Some((report, kept));
+                        break;
                     }
                     Err(error) => {
                         // features.md 1.4: the candidate is marked bad for the
@@ -1870,6 +1911,17 @@ impl Run<'_> {
                     }
                 }
             }
+            if set.is_some() {
+                break;
+            }
+        }
+        if let Some((report, kept)) = set {
+            // 4.2's prefetch: this process already holds the rotation lock, the
+            // cache root and the transport, and the wallpaper is already up. The
+            // walk continues from where the set left it, so the two candidates
+            // fetched here are the next two this selection would offer.
+            self.warm(started, kept, &order[at..], &bad);
+            return Ok(report);
         }
         if let Some(last) = set_failures.pop() {
             return Err(Failure::new("set", last.code, last.message));
@@ -1889,6 +1941,186 @@ impl Run<'_> {
                 reasons.join("; ")
             ),
         ))
+    }
+
+    /// The rest of the walk [`Run::rotate`] stopped: the next `prefetch`
+    /// candidates the selection would offer are fetched and stored, so the
+    /// rotations after this one set from the cache with no request at all
+    /// (docs/architecture.md 1.6, docs/spec/state-and-cache.md 4.1).
+    ///
+    /// It runs in this process, after the set and after the `set:` line is out,
+    /// and those two facts are what make the three rules 1.6 states true rather
+    /// than aspirational:
+    ///
+    /// - **It never delays the set it belongs to.** The setter has returned and
+    ///   the report is on stdout before the first byte of a prefetch is read.
+    /// - **It obeys the same dedupe, cache cap and sweep rules as a rotation.**
+    ///   The bytes go through [`store`], the same function a set uses, under the
+    ///   same content-addressed name, so the index entry and the eviction both
+    ///   see one kind of file. A candidate the index already serves is not
+    ///   fetched ([`Window::cached`]), and one the recent window rejects was
+    ///   already removed by [`filter_pipeline`] before the walk reached it.
+    /// - **A prefetch that fails never fails the rotation that triggered it.**
+    ///   Every failure below is a log line on stderr, which is the surface 1.6
+    ///   gives diagnostics, and this function returns nothing the caller can
+    ///   fail on. It is the same line [`candidate_failure`] draws for the
+    ///   rotation: a candidate's own bad bytes move on to the next candidate,
+    ///   and a cache that cannot be written at all stops the prefetch rather than
+    ///   repeating one disk error per candidate.
+    ///
+    /// `cursor` is what the source that offered the set had not offered yet and
+    /// `rest` the sources the rotation never reached, in the order
+    /// [`weighted_order`] gave. A rotation stops at its first success, so those
+    /// sources were not enumerated; the prefetch enumerates them here, at most
+    /// once each, exactly as the same walk would have.
+    ///
+    /// A `reference`-mode candidate warms nothing: its bytes stay the user's own
+    /// file and it names no cache entry ([`Run::reference`]), so there is nothing
+    /// to hold, which is why `mode` is consulted before the request rather than
+    /// after it.
+    fn warm(
+        &self,
+        started: std::time::Instant,
+        cursor: std::vec::IntoIter<Seeking>,
+        rest: &[usize],
+        bad: &HashSet<String>,
+    ) -> usize {
+        let wanted = self.config.prefetch;
+        if wanted == 0 {
+            return 0;
+        }
+        // The deadline is the rotation's, not the prefetch's (1.7.1), and the
+        // daemon does not read what a worker wrote when it kills it for that
+        // deadline. A prefetch that ran into it would therefore lose the `set:`
+        // line this rotation has already printed and be recorded as a timeout
+        // instead of a set, which would make "a prefetch that fails never fails
+        // the rotation that triggered it" false. So it spends
+        // [`PREFETCH_DEADLINE_DIVISOR`]'s share of the deadline and no more.
+        let deadline = std::time::Duration::from_secs(self.config.schedule.worker_deadline_seconds);
+        let budget = deadline / PREFETCH_DEADLINE_DIVISOR;
+        let mut stored = 0usize;
+        let mut kept = cursor;
+        let mut rest = rest.iter().copied();
+        loop {
+            for seeking in kept.by_ref() {
+                if started.elapsed() >= budget {
+                    return stored;
+                }
+                // A candidate this run already refused is not one to spend a
+                // request on: the setter's answer and the bytes' answer do not
+                // change because the prefetch is asking.
+                if bad.contains(&seeking.candidate.id) {
+                    continue;
+                }
+                match self.warm_one(&seeking) {
+                    Ok(true) => {
+                        stored += 1;
+                        if stored >= wanted {
+                            return stored;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(failure) if candidate_failure(&failure) => {
+                        eprintln!("warning: prefetch: {}: {}", failure.stage, failure.message);
+                    }
+                    Err(failure) => {
+                        eprintln!(
+                            "warning: prefetch stopped: {}: {}",
+                            failure.stage, failure.message
+                        );
+                        return stored;
+                    }
+                }
+            }
+            let Some(index) = rest.next() else {
+                return stored;
+            };
+            let entry = &self.sources.entries()[index];
+            // The same budget, before the next source is asked: enumerating one
+            // is a request too (a listing page for `wallhaven`, a directory walk
+            // for `local`).
+            if started.elapsed() >= budget {
+                return stored;
+            }
+            match self.enumerate(entry) {
+                Ok(candidates) => {
+                    kept = filter_pipeline(self.config, self.platform, self.window, candidates)
+                        .kept
+                        .into_iter();
+                }
+                Err(reason) => {
+                    // 4.2's "never fails the rotation" applies here too, and a
+                    // source the prefetch could not ask warms nothing rather than
+                    // stopping the walk: the sources after it may still be
+                    // reachable.
+                    eprintln!(
+                        "warning: prefetch: source {} is disabled: {reason}",
+                        entry.config.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// One candidate's bytes for [`Run::warm`]: the same two routes a set takes
+    /// with the setter left out.
+    ///
+    /// `Ok(true)` means the bytes are now a cache entry under `sha256/` and the
+    /// `prefetch:` line naming them is on stdout (docs/architecture.md 1.6).
+    /// `Ok(false)` is the three cases where there is nothing to hold and nothing
+    /// to report, none of them a failure: a `reference`-mode candidate, which
+    /// stores nothing by design; a candidate the index already serves, which is
+    /// the point of the prefetch rather than a miss; and bytes under 2.5 step 1's
+    /// floor, which the rotation would refuse at the same point and for the same
+    /// reason ([`Run::fill`] answers `Ok(None)` for it).
+    ///
+    /// The floor is re-applied here because the source's own dimensions admitted
+    /// the candidate before it was fetched, and the header is the authority on
+    /// what arrived (features.md 2.5 step 1). A file under the floor stays a
+    /// cache entry: it is a valid image, 5.5's sweep owns removal, and deleting a
+    /// file a cache hit may share is worse than keeping a small one.
+    fn warm_one(&self, seeking: &Seeking) -> Result<bool, Failure> {
+        if matches!(self.mode_of(&seeking.source), Some(LocalMode::Reference)) {
+            return Ok(false);
+        }
+        if self
+            .window
+            .cached(self.cache, &seeking.origin_key())
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let stored = store(
+            self.cache,
+            self.run,
+            &seeking.candidate.origin,
+            self.transport,
+            self.cap_of(&seeking.source),
+        )?;
+        let (min_width, min_height) = floors(self.config, seeking);
+        if stored.header.width < min_width || stored.header.height < min_height {
+            return Ok(false);
+        }
+        println!(
+            "prefetch: {} {} {}",
+            stored.digest,
+            seeking.origin_key(),
+            stored.path.display()
+        );
+        Ok(true)
+    }
+
+    /// The download cap that applies to one candidate: the source's own
+    /// `max_bytes` or the global `filters.max_bytes` (features.md 2.1), which is
+    /// the same choice [`Run::fill`] makes for the candidate it set and
+    /// [`stage_size`] makes before either of them runs.
+    fn cap_of(&self, source: &str) -> u64 {
+        self.config
+            .sources
+            .iter()
+            .find(|configured| configured.id == source)
+            .and_then(|configured| configured.max_bytes)
+            .unwrap_or(self.config.filters.max_bytes)
     }
 
     /// features.md 2.2's `mode` for the source that offered a candidate, or
@@ -1957,19 +2189,12 @@ impl Run<'_> {
         if let Some((digest, path)) = self.window.cached(self.cache, &seeking.origin_key()) {
             return Ok(Some(Filled::Cached { digest, path }));
         }
-        let cap = self
-            .config
-            .sources
-            .iter()
-            .find(|source| source.id == seeking.source)
-            .and_then(|source| source.max_bytes)
-            .unwrap_or(self.config.filters.max_bytes);
         let stored = store(
             self.cache,
             self.run,
             &seeking.candidate.origin,
             self.transport,
-            cap,
+            self.cap_of(&seeking.source),
         )?;
         let (min_width, min_height) = floors(self.config, seeking);
         if stored.header.width < min_width || stored.header.height < min_height {
@@ -2331,7 +2556,9 @@ mod tests {
     use std::rc::Rc;
     use whirl_core::config::{Config, ConfigError};
     use whirl_core::protocol::{Kind, Via};
-    use whirl_core::source::{Capability, Enumerated, FilterSet, Source, SourceError};
+    use whirl_core::source::{
+        Capability, Enumerated, FilterSet, Source, SourceError, SourceErrorKind,
+    };
     use whirl_core::state::{CacheIndexEntry, HistoryEntry, HistoryFile, IndexFile};
 
     // -- the two things a test owns: a source and a byte source -------------
@@ -2344,6 +2571,11 @@ mod tests {
         candidates: Vec<Candidate>,
         seen_recent: Rc<RefCell<Vec<String>>>,
         broken: Option<String>,
+        /// A source that validates and then cannot be enumerated: the prefetch's
+        /// "a source it could not ask warms nothing" arm needs one that is
+        /// reachable when the rotation starts and unreachable by the time the
+        /// walk is past its first source.
+        unreachable: Option<String>,
     }
 
     impl Fixture {
@@ -2352,6 +2584,16 @@ mod tests {
                 candidates,
                 seen_recent: Rc::new(RefCell::new(Vec::new())),
                 broken: None,
+                unreachable: None,
+            }
+        }
+
+        /// A source whose `enumerate` answers the way a `local` source with a
+        /// path that is gone does (features.md 2.1).
+        fn unreachable(message: &str) -> Fixture {
+            Fixture {
+                unreachable: Some(message.to_string()),
+                ..Fixture::with(Vec::new())
             }
         }
 
@@ -2375,7 +2617,13 @@ mod tests {
 
         fn enumerate(&self, ctx: &EnumContext) -> Result<Enumerated, SourceError> {
             *self.seen_recent.borrow_mut() = ctx.recent.clone();
-            Ok(Enumerated::of(self.candidates.clone()))
+            match &self.unreachable {
+                Some(message) => Err(SourceError::new(
+                    SourceErrorKind::NotFound,
+                    message.to_string(),
+                )),
+                None => Ok(Enumerated::of(self.candidates.clone())),
+            }
         }
 
         fn capabilities(&self) -> FilterSet {
@@ -2833,7 +3081,23 @@ mod tests {
     /// `local.mode` lives (features.md 2.2); `extra` lands after the `sources`
     /// array, which is where a test adds a top-level key. Two arguments rather
     /// than one because a key in the wrong object is not the key under test.
+    ///
+    /// The body names `prefetch: 0` even though the shipped default is 2, and it
+    /// is the same move `copy_config` makes with `mode`: the prefetch is the
+    /// subject of its own tests below and every other test here is about the
+    /// walk, the window, the cache or the setter. Left at the default, a
+    /// successful rotation in any of them would fetch two candidates the test
+    /// never asked for, and `transport.opened()` and the `sha256/` file count
+    /// would be asserting the prefetch's behaviour instead of the walk's. The
+    /// tests that are about the prefetch name the count in their own body, one
+    /// count each.
     fn config_with(dir: &Path, extra: &str, source_keys: &str) -> Config {
+        config_with_prefetch(dir, 0, extra, source_keys)
+    }
+
+    /// The same body with 4.2's `prefetch` set to `prefetch`, which is the only
+    /// key a prefetch test needs to vary.
+    fn config_with_prefetch(dir: &Path, prefetch: usize, extra: &str, source_keys: &str) -> Config {
         // A path becomes a string literal in the body, so it is escaped rather
         // than trusted: on Windows `dir` is `C:\Users\...`, and an unescaped
         // `\U` is a syntax error at the config parser (which decodes the full
@@ -2848,6 +3112,7 @@ mod tests {
             "{{\n  \"config_schema\": 1,\n  \"backend\": \"noop\",\n  \"min_width\": 16,\n  \
              \"min_height\": 16,\n  \"filters\": {{ \"max_bytes\": 4096, \"ratio_tolerance\": 0.02, \
              \"target_ratio\": null }},\n  \"cache\": {{ \"root\": {} }},\n  \
+             \"prefetch\": {prefetch},\n  \
              \"sources\": [ {{ \"id\": \"pictures\", \"kind\": \"local\", \"weight\": 1, \
              \"paths\": [{}]{source_keys} }} ]{extra}\n}}\n",
             quoted(dir.join("cache")),
@@ -2876,6 +3141,25 @@ mod tests {
         config_with(dir, "", ", \"mode\": \"copy\"")
     }
 
+    /// The fixture config in `copy` with 4.2's `prefetch` at `count`: the arm that
+    /// stores, and the count the prefetch tests are about. One helper for the two
+    /// halves of the same setup, so a prefetch test cannot accidentally run
+    /// under the other `mode` and assert the reference arm's behaviour.
+    fn warm_config(dir: &Path, count: usize) -> Config {
+        config_with_prefetch(dir, count, "", ", \"mode\": \"copy\"")
+    }
+
+    /// The same config with the rotation's own deadline set to `seconds`: the
+    /// budget a prefetch has to fit inside (docs/architecture.md 1.7.1).
+    fn warm_config_with_deadline(dir: &Path, count: usize, seconds: u64) -> Config {
+        config_with_prefetch(
+            dir,
+            count,
+            &format!(", \"schedule\": {{ \"worker_deadline_seconds\": {seconds} }}"),
+            ", \"mode\": \"copy\"",
+        )
+    }
+
     fn candidate(id: &str, origin: &str, width: u32, height: u32, bytes: u64) -> Candidate {
         Candidate {
             id: id.to_string(),
@@ -2902,6 +3186,22 @@ mod tests {
             config: config.sources[0].clone(),
             source: Box::new(source),
         }])
+    }
+
+    /// The same for a rotation with more than one source, which the prefetch
+    /// needs: it walks on past the source the set came from (`Run::warm`), so a
+    /// test of that walk needs a second and a third. Every entry carries the
+    /// fixture config's one source, so their origins share its `pictures` prefix.
+    fn table_of(config: &Config, fixtures: Vec<Fixture>) -> crate::sources::Sources {
+        crate::sources::Sources::of(
+            fixtures
+                .into_iter()
+                .map(|source| crate::sources::Entry {
+                    config: config.sources[0].clone(),
+                    source: Box::new(source),
+                })
+                .collect(),
+        )
     }
 
     fn empty_window(dir: &Path) -> Window {
@@ -2964,6 +3264,7 @@ mod tests {
             platform: Platform::Macos,
             run,
             draw: 0,
+            started: std::time::Instant::now(),
         }
     }
 
@@ -3841,6 +4142,963 @@ mod tests {
             "the third rotation set nothing: the two calls are the two rotations before it"
         );
         assert_eq!(count_files(&cache.root().join("sha256")), 2);
+    }
+
+    // -- 4.2's prefetch ----------------------------------------------------
+
+    /// A transport that costs a stated wall-clock time per open *and* writes its
+    /// opens into an event log, and a setter that writes into the same log. The
+    /// two together are how one test asserts the order of the two acts without
+    /// asserting a clock: the set's entry has to be in the log before the second
+    /// fetch's, whatever the machine does with the durations.
+    struct Slow {
+        bodies: HashMap<String, Vec<u8>>,
+        events: Rc<RefCell<Vec<String>>>,
+        per_open: std::time::Duration,
+    }
+
+    impl Slow {
+        fn of(pairs: &[(&str, Vec<u8>)], per_open: std::time::Duration) -> Slow {
+            Slow {
+                bodies: pairs
+                    .iter()
+                    .map(|(origin, bytes)| (origin.to_string(), bytes.clone()))
+                    .collect(),
+                events: Rc::new(RefCell::new(Vec::new())),
+                per_open,
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl Transport for Slow {
+        fn open(&self, origin: &str) -> Result<Box<dyn Read>, String> {
+            std::thread::sleep(self.per_open);
+            self.events.borrow_mut().push(format!("fetch:{origin}"));
+            match self.bodies.get(origin) {
+                Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
+                None => Err(format!("{origin}: no such file")),
+            }
+        }
+    }
+
+    struct LoggingSetter(Rc<RefCell<Vec<String>>>);
+
+    impl Setter for LoggingSetter {
+        fn set(&self, path: &str) -> Result<(), SetError> {
+            self.0.borrow_mut().push(format!("set:{path}"));
+            Ok(())
+        }
+    }
+
+    /// The three fields of the `prefetch:` line for a candidate this test warmed,
+    /// rebuilt from the bytes: the digest is the one hash (the reported digest and
+    /// the content address are the same string), the `origin_key` is the walk's,
+    /// and the path is where a store puts it. A test that follows a warming
+    /// rotation with a keeping one writes these into `cache/index.json`, which is
+    /// the daemon's half of 7.3 step 4 and the half a unit test has to stand in
+    /// for.
+    fn warmed(cache: &Cache, id: &str, bytes: &[u8]) -> Report {
+        let digest = protocol::sha256_hex(bytes);
+        Report {
+            path: state::content_path(cache.root(), &digest, "png")
+                .display()
+                .to_string(),
+            digest,
+            origin_key: format!("pictures:{id}"),
+        }
+    }
+
+    /// The deliverable, in the order the walk takes it: with `prefetch: 2`, the
+    /// rotation that sets `one` fetches `two` and `three` as well, and both are
+    /// cache entries by the time it exits.
+    ///
+    /// The window is empty for this run, so the walk is the listing's own order.
+    /// `opened()` is the assertion that the two warmed are exactly the next two
+    /// the selection would offer, and it is a stronger statement than a count: a
+    /// prefetch that warmed the *last* two, or both of the highest-weight source's
+    /// candidates, or the first two again, fails here. `sha256/` and `tmp/` are
+    /// the assertion that they were stored the way a set candidate is stored, one
+    /// file per content address with no part file left behind.
+    #[test]
+    fn a_rotation_warms_the_next_two_candidates_in_walk_order() {
+        let dir = scratch("warm-two");
+        let config = warm_config(&dir, 2);
+        assert_eq!(
+            config.prefetch, 2,
+            "the count is the card's default and the number under test"
+        );
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let three = long_png(1600, 902, 32);
+        let four = long_png(1600, 903, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+                candidate("three", "pictures/three.png", 1600, 902, three.len() as u64),
+                candidate("four", "pictures/four.png", 1600, 903, four.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+            ("pictures/three.png", three.clone()),
+            ("pictures/four.png", four.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation sets and warms");
+
+        assert_eq!(first.origin_key, "pictures:one");
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/three.png".to_string()
+            ],
+            "the candidate that was set, then the next two the walk would offer"
+        );
+        assert_eq!(
+            setter.targets(),
+            vec![first.path.clone()],
+            "the prefetch sets nothing: one setter call for the one set"
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            3,
+            "the set's file and the two the prefetch stored"
+        );
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "every part file was renamed into place or removed"
+        );
+        for (id, bytes) in [("two", &two), ("three", &three)] {
+            let held = warmed(&cache, id, bytes);
+            assert_eq!(
+                fs::read(&held.path).expect("the warmed file is readable"),
+                **bytes,
+                "{id} holds the origin's own bytes"
+            );
+        }
+        assert_eq!(
+            cache.root().join("sha256").read_dir().unwrap().count(),
+            3,
+            "and nothing else: `four` was never fetched"
+        );
+    }
+
+    /// 4.2's payoff, with the daemon's half of it: after a rotation warms the next
+    /// two, the two rotations that follow fetch nothing at all.
+    ///
+    /// The index the daemon writes from the `prefetch:` lines is written here
+    /// between the runs, exactly as `write_index_at` does it after a `set:` line,
+    /// and the counting transport is the accounting: its `opened()` list stops
+    /// growing once the first rotation is over, and the bytes each later rotation
+    /// set are the origin's own.
+    #[test]
+    fn the_two_rotations_after_a_warming_one_fetch_nothing() {
+        let dir = scratch("warm-then-instant");
+        let config = warm_config(&dir, 2);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let three = long_png(1600, 902, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+                candidate("three", "pictures/three.png", 1600, 902, three.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+            ("pictures/three.png", three.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        // Rotation 1: sets `one`, warms `two` and `three`, fetches all three.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation sets and warms");
+        assert_eq!(transport.opened().len(), 3);
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(
+            &cache,
+            &[
+                (&first, "png"),
+                (&warmed(&cache, "two", &two), "png"),
+                (&warmed(&cache, "three", &three), "png"),
+            ],
+        );
+
+        // Rotation 2: the window holds only `one`, so `two` is offered; it is held,
+        // so it is set from the cache and nothing is fetched - not even by the
+        // prefetch, whose next candidates (`three`, then `one`) are held too.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation sets from the cache");
+        assert_eq!(second.origin_key, "pictures:two");
+        assert_eq!(second.digest, warmed(&cache, "two", &two).digest);
+        assert_eq!(
+            fs::read(&second.path).expect("the cached file is readable"),
+            two,
+            "the bytes served from the cache are the origin's own"
+        );
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/three.png".to_string()
+            ],
+            "the second rotation fetched zero bytes, the prefetch included"
+        );
+
+        // Rotation 3: the window is one entry deep, so the listing order offers
+        // `one` again before `three`; `one` is held, so it is served from the cache
+        // on the same terms.
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the third rotation sets from the cache");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(
+            fs::read(&third.path).expect("the cached file is readable"),
+            one
+        );
+        assert_eq!(
+            transport.opened().len(),
+            3,
+            "the two rotations after the warming one fetched nothing at all"
+        );
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "and neither wrote a part file, because neither downloaded"
+        );
+    }
+
+    /// The set happens before the prefetch work starts, and the order is asserted
+    /// rather than measured: one event log carries the transport's opens and the
+    /// setter's call, and the setter's entry has to be second - after the set
+    /// candidate's own fetch and before the first prefetch fetch.
+    ///
+    /// The transport is deliberately slow (150 ms an open) so the test is the same
+    /// claim a person would make from a stopwatch, but nothing here reads a clock:
+    /// on a machine loaded past the point of measuring anything, the order is
+    /// still the order.
+    #[test]
+    fn the_set_happens_before_the_prefetch_starts() {
+        let dir = scratch("warm-order");
+        let config = warm_config(&dir, 2);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let three = long_png(1600, 902, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+                candidate("three", "pictures/three.png", 1600, 902, three.len() as u64),
+            ]),
+        );
+        let transport = Slow::of(
+            &[
+                ("pictures/one.png", one),
+                ("pictures/two.png", two),
+                ("pictures/three.png", three),
+            ],
+            std::time::Duration::from_millis(150),
+        );
+        let setter = LoggingSetter(Rc::clone(&transport.events));
+        let cache = Cache::at(dir.join("cache"));
+        let window = Window::load(&dir.join("state"), &cache.index_path(), 1);
+
+        noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the rotation sets and warms");
+
+        let events = transport.events();
+        assert_eq!(
+            events.len(),
+            4,
+            "one fetch for the set, one set, two fetches for the prefetch: {events:?}"
+        );
+        assert!(
+            events[0].starts_with("fetch:pictures/one.png"),
+            "the walk's first candidate is fetched first: {events:?}"
+        );
+        assert!(
+            events[1].starts_with("set:"),
+            "the setter is called as soon as the first candidate is measured, before \
+             the prefetch asks for anything: {events:?}"
+        );
+        assert!(
+            events[2..]
+                .iter()
+                .all(|event| event.starts_with("fetch:pictures/")),
+            "and only then is the walk resumed: {events:?}"
+        );
+    }
+
+    /// The first-line rule against the second line's failure: a candidate the
+    /// prefetch cannot fetch at all is a warning on stderr and nothing else. The
+    /// rotation is green, the cache holds the one file the set stored and no part
+    /// file, and the candidate the prefetch could not warm is still fetched by the
+    /// rotation that needs it.
+    ///
+    /// This is 4.2's "a prefetch that fails never fails the rotation that
+    /// triggered it", and the second half is why it matters: the failure costs a
+    /// warning now and a download later, which is what the rotation would have
+    /// paid anyway.
+    #[test]
+    fn a_prefetch_whose_fetch_fails_leaves_the_rotation_green_and_warms_nothing() {
+        let dir = scratch("warm-fetch-fails");
+        let config = warm_config(&dir, 2);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        // The transport has no body for `two`: the write path for a URL whose CDN
+        // answers 500, and for a path whose file has gone.
+        let transport = Counting::of(&[("pictures/one.png", one.clone())]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("a prefetch that fails is still a rotation that set");
+
+        assert_eq!(first.origin_key, "pictures:one");
+        assert_eq!(
+            setter.targets(),
+            vec![first.path.clone()],
+            "the set is the only setter call"
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            1,
+            "the failed prefetch added nothing to the cache"
+        );
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "and left no part file behind"
+        );
+
+        // The rotation that needs `two` pays its own download, and it is green.
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+        let two_transport = Counting::of(&[("pictures/two.png", two.clone())]);
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(
+            &config,
+            &sources,
+            &two_transport,
+            &cache,
+            &window,
+            &setter,
+            2,
+        )
+        .rotate()
+        .expect("the candidate the prefetch could not warm is fetched by the rotation");
+        assert_eq!(second.origin_key, "pictures:two");
+        assert_eq!(
+            fs::read(&second.path).expect("the file is there"),
+            two,
+            "and the bytes are the origin's own"
+        );
+    }
+
+    /// The other half of "a prefetch that fails never fails the rotation": with
+    /// every source unreachable, the rotation still sets from what is held, and
+    /// the prefetch's own failures change nothing. Nothing was fetched, so nothing
+    /// was added to the cache and no part file exists.
+    #[test]
+    fn a_rotation_with_every_source_unreachable_sets_from_what_is_held() {
+        let dir = scratch("warm-unreachable");
+        let config = warm_config(&dir, 2);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        // A first rotation with a working transport, to hold `one` and `two`.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(
+            &config,
+            &sources,
+            &Bytes::of(&[
+                ("pictures/one.png", one.clone()),
+                ("pictures/two.png", two.clone()),
+            ]),
+            &cache,
+            &window,
+            &setter,
+            1,
+        )
+        .rotate()
+        .expect("the first rotation fetches and warms");
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(
+            &cache,
+            &[(&first, "png"), (&warmed(&cache, "two", &two), "png")],
+        );
+        assert_eq!(count_files(&cache.root().join("sha256")), 2);
+
+        // The network is unreachable: every open fails, the held candidate's
+        // included - the cache is asked first, so it is never opened at all.
+        let transport = Counting::of(&[]);
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the rotation sets from the cache with nothing reachable");
+        assert_eq!(second.origin_key, "pictures:two");
+        assert_eq!(
+            fs::read(&second.path).expect("the cached file is readable"),
+            two,
+            "the bytes served from the cache are the origin's own"
+        );
+        assert_eq!(
+            transport.opened(),
+            Vec::<String>::new(),
+            "the set candidate was served from the cache, so it was never opened, and \
+             the walk ends at the source's second candidate: nothing was even attempted"
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            2,
+            "a prefetch that fetched nothing added nothing"
+        );
+        assert_eq!(count_files(&state::tmp_dir(cache.root())), 0);
+    }
+
+    /// `prefetch: 0` is the off switch, and it is the only value that means that:
+    /// the walk stops where it always did, one fetch for the set and nothing
+    /// after it.
+    #[test]
+    fn a_prefetch_of_zero_warms_nothing() {
+        let dir = scratch("warm-off");
+        let config = warm_config(&dir, 0);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[("pictures/one.png", one), ("pictures/two.png", two)]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = Window::load(&dir.join("state"), &cache.index_path(), 1);
+        let setter = Recorder::default();
+
+        noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the rotation sets");
+
+        assert_eq!(
+            transport.opened(),
+            vec!["pictures/one.png".to_string()],
+            "0 turns the prefetch off: the walk stops at its first success"
+        );
+        assert_eq!(count_files(&cache.root().join("sha256")), 1);
+    }
+
+    /// The prefetch spends the rotation's own budget, not the deadline itself:
+    /// with the half of the deadline already gone, nothing is warmed and the set
+    /// stands.
+    ///
+    /// This is the arm that keeps "a prefetch that fails never fails the rotation
+    /// that triggered it" true at the deadline. The daemon does not read what a
+    /// worker wrote when it kills it for that deadline (docs/architecture.md
+    /// 1.7.1), so a prefetch that ran into it would lose this rotation's `set:`
+    /// line and be recorded as a timeout. The run is aged rather than slept
+    /// through: `Run` carries its own start ([`Run::started`]) for exactly this.
+    #[test]
+    fn a_deadline_with_no_room_stops_the_prefetch_before_it_fetches() {
+        let dir = scratch("warm-deadline");
+        // 60 is the floor 4.3 puts on the deadline, so half of it is the smallest
+        // budget a prefetch can be given and the only one a unit test can reach.
+        let config = warm_config_with_deadline(&dir, 2, 60);
+        assert_eq!(
+            config.prefetch, 2,
+            "the count is not what this test varies: the budget is"
+        );
+        assert_eq!(config.schedule.worker_deadline_seconds, 60);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[("pictures/one.png", one), ("pictures/two.png", two)]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = Window::load(&dir.join("state"), &cache.index_path(), 1);
+        let setter = Recorder::default();
+
+        let aged = Run {
+            started: std::time::Instant::now() - std::time::Duration::from_secs(31),
+            ..noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+        };
+        let first = aged
+            .rotate()
+            .expect("the rotation sets; only the prefetch is out of budget");
+
+        assert_eq!(first.origin_key, "pictures:one");
+        assert_eq!(
+            setter.targets(),
+            vec![first.path.clone()],
+            "the set is the rotation's, and the deadline does not touch it"
+        );
+        assert_eq!(
+            transport.opened(),
+            vec!["pictures/one.png".to_string()],
+            "the budget was spent before the prefetch could ask for a second image"
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            1,
+            "and nothing was stored on the prefetch's account"
+        );
+    }
+
+    /// A source the prefetch cannot ask warms nothing and stops nothing: the walk
+    /// carries on to the sources after it and the rotation stays green.
+    ///
+    /// The arm exists because the prefetch's walk is the rotation's own and a
+    /// source can fail between the two: the one that is asked and cannot answer
+    /// is features.md 2.1's missing path, which the daemon leaves disabled rather
+    /// than fatal. docs/architecture.md 1.6 is what it must not do instead, which
+    /// is fail the rotation that already set.
+    ///
+    /// `prefetch` is the ceiling here, so the count cannot be reached before the
+    /// last source has been asked: the walk has to cross the source that fails to
+    /// get there, whichever order the draw put the three sources in.
+    #[test]
+    fn a_prefetch_that_meets_a_source_it_cannot_ask_keeps_walking() {
+        let dir = scratch("warm-source-disabled");
+        let config = warm_config(&dir, whirl_core::config::PREFETCH_MAX);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let three = long_png(1600, 902, 32);
+        let sources = table_of(
+            &config,
+            vec![
+                Fixture::with(vec![candidate(
+                    "one",
+                    "pictures/one.png",
+                    1600,
+                    900,
+                    one.len() as u64,
+                )]),
+                Fixture::unreachable("pictures/gone: No such file or directory"),
+                Fixture::with(vec![
+                    candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+                    candidate("three", "pictures/three.png", 1600, 902, three.len() as u64),
+                ]),
+            ],
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one),
+            ("pictures/two.png", two),
+            ("pictures/three.png", three),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = Window::load(&dir.join("state"), &cache.index_path(), 1);
+        let setter = Recorder::default();
+
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the rotation sets, whatever the prefetch meets after it");
+
+        assert!(
+            ["pictures:one", "pictures:two", "pictures:three"].contains(&first.origin_key.as_str()),
+            "the set is one of the three candidates: {:?}",
+            first.origin_key
+        );
+        assert_eq!(
+            setter.targets().len(),
+            1,
+            "and it is the only set the rotation made"
+        );
+        let mut opened = transport.opened();
+        opened.sort();
+        assert_eq!(
+            opened,
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/three.png".to_string(),
+                "pictures/two.png".to_string(),
+            ],
+            "every candidate was fetched: the set's, and the two the prefetch \
+             reached past the source it could not ask"
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            3,
+            "and all three are held, which is the two warmed plus the one set"
+        );
+    }
+
+    /// A candidate the index already serves is not fetched by the prefetch either.
+    /// The service map of 4.1 is asked before the request on both paths, and the
+    /// walk resumes past the hit: `two` costs nothing, `three` is warmed, and the
+    /// count still reaches the two it was asked for.
+    #[test]
+    fn a_prefetch_does_not_fetch_a_candidate_the_index_already_serves() {
+        let dir = scratch("warm-held");
+        let config = warm_config(&dir, 2);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let three = long_png(1600, 902, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+                candidate("three", "pictures/three.png", 1600, 902, three.len() as u64),
+            ]),
+        );
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        // `two` is held: a file under the content address, and the index entry
+        // that names it. `one` and `three` are not.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let holder = Bytes::of(&[("pictures/two.png", two.clone())]);
+        let seeded = noop_run_of(&config, &sources, &holder, &cache, &window, &setter, 1);
+        // One rotation that sets `two` is the least contrived way to hold it.
+        let held = seeded.rotate().expect("the fixture rotation holds `two`");
+        assert_eq!(held.origin_key, "pictures:two");
+        write_index_at(&cache, &[(&held, "png")]);
+        write_history_at(&state_dir, &[]);
+
+        let transport = Counting::of(&[("pictures/one.png", one), ("pictures/three.png", three)]);
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the rotation sets `one` and warms `three`");
+
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/three.png".to_string()
+            ],
+            "`two` is held, so the prefetch skipped it and took the next candidate"
+        );
+    }
+
+    /// A candidate whose bytes are under 2.5 step 1's floor warms nothing, and the
+    /// walk resumes: the count is a count of warm entries, not of attempts, so the
+    /// candidate after the unusable one is warmed instead.
+    ///
+    /// The bytes stay a cache entry, which is what [`Run::fill`] does with them on
+    /// the set path too: they are a valid image, 5.5's sweep owns removal, and the
+    /// file has no index entry, so it is an orphan the sweep reclaims after
+    /// `cache.orphan_grace_seconds`.
+    #[test]
+    fn a_candidate_under_the_floor_warms_nothing_and_the_walk_resumes() {
+        let dir = scratch("warm-floor");
+        let config = warm_config(&dir, 2);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let small = long_png(12, 12, 8);
+        let four = long_png(1600, 903, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+                // The source claims the dimensions the filter admits; the bytes
+                // are the authority, and they are 12x12.
+                candidate("three", "pictures/three.png", 1600, 902, small.len() as u64),
+                candidate("four", "pictures/four.png", 1600, 903, four.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one),
+            ("pictures/two.png", two.clone()),
+            ("pictures/three.png", small),
+            ("pictures/four.png", four.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = Window::load(&dir.join("state"), &cache.index_path(), 1);
+        let setter = Recorder::default();
+
+        noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the rotation sets `one` and warms the two after it");
+
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/three.png".to_string(),
+                "pictures/four.png".to_string()
+            ],
+            "the under-floor candidate was measured and skipped, and the walk went on"
+        );
+        assert!(Path::new(&warmed(&cache, "two", &two).path).exists());
+        assert!(Path::new(&warmed(&cache, "four", &four).path).exists());
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            4,
+            "four files: the set's, the two warmed, and the one the floor excluded"
+        );
+    }
+
+    /// `reference` mode warms nothing, on purpose. The bytes stay the user's own
+    /// file, the platform is pointed at that path and no cache entry is written,
+    /// so there is nothing for a following rotation to be served from.
+    ///
+    /// The fixture's default `mode` is `reference` (features.md 2.2), which is
+    /// what the config here gets by naming no `mode` at all: the prefetch must not
+    /// quietly download two copies of what the mode exists to leave in place.
+    #[test]
+    fn a_reference_mode_rotation_warms_nothing() {
+        let dir = scratch("warm-reference");
+        let config = config_with_prefetch(&dir, 2, "", "");
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let window = Window::load(&dir.join("state"), &cache.index_path(), 1);
+        let setter = Recorder::default();
+
+        let report = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the reference-mode rotation sets");
+
+        assert_eq!(
+            transport.opened(),
+            vec!["pictures/one.png".to_string()],
+            "the set candidate was opened to hash it; the prefetch warmed nothing"
+        );
+        assert_eq!(
+            count_files(&cache.root().join("sha256")),
+            0,
+            "reference mode writes no cache file, and the prefetch does not either"
+        );
+        assert_eq!(count_files(&state::tmp_dir(cache.root())), 0);
+        assert_eq!(
+            report.path, "pictures/one.png",
+            "the platform was pointed at the candidate's own origin, not at a cache file"
+        );
+    }
+
+    /// The measurement the card asks for, printed rather than asserted: the time
+    /// from the trigger to the set, and the time each of the two rotations after
+    /// it takes, with `prefetch: 2` and with `prefetch: 0`.
+    ///
+    /// The transport costs 150 ms an open, so the numbers mean something on any
+    /// machine. Run it with `--nocapture` to see them; the assertions are the
+    /// counts, because a wall-clock bound is a flake on a loaded runner:
+    ///
+    ///     cargo test -p whirl-worker --bin whirl-worker the_prefetch_timings -- --nocapture
+    #[test]
+    fn the_prefetch_timings_with_and_without_the_prefetch() {
+        let per_open = std::time::Duration::from_millis(150);
+
+        /// The setter's own clock: when the set happened, measured from the
+        /// trigger, so "the set happens before the prefetch work starts" has a
+        /// number that is not the rotation's total.
+        struct TimedSetter {
+            start: std::time::Instant,
+            at: Rc<RefCell<Option<std::time::Duration>>>,
+        }
+
+        impl Setter for TimedSetter {
+            fn set(&self, _path: &str) -> Result<(), SetError> {
+                *self.at.borrow_mut() = Some(self.start.elapsed());
+                Ok(())
+            }
+        }
+
+        let measure = |prefetch: usize| -> (u128, u128, u128, usize, usize) {
+            let dir = scratch(&format!("warm-timing-{prefetch}"));
+            let config = warm_config(&dir, prefetch);
+            let one = long_png(1600, 900, 32);
+            let two = long_png(1600, 901, 32);
+            let three = long_png(1600, 902, 32);
+            let sources = table(
+                &config,
+                Fixture::with(vec![
+                    candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                    candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+                    candidate("three", "pictures/three.png", 1600, 902, three.len() as u64),
+                ]),
+            );
+            let transport = Slow::of(
+                &[
+                    ("pictures/one.png", one),
+                    ("pictures/two.png", two.clone()),
+                    ("pictures/three.png", three.clone()),
+                ],
+                per_open,
+            );
+            let cache = Cache::at(dir.join("cache"));
+            let state_dir = dir.join("state");
+            let fetches = |transport: &Slow| {
+                transport
+                    .events()
+                    .iter()
+                    .filter(|event| event.starts_with("fetch:"))
+                    .count()
+            };
+
+            // Rotation 1: the trigger to the set, and the whole rotation. The two
+            // differ by exactly the prefetch, and the difference is the number the
+            // card's second bullet is about.
+            let at = Rc::new(RefCell::new(None));
+            let start = std::time::Instant::now();
+            let setter = TimedSetter {
+                start,
+                at: Rc::clone(&at),
+            };
+            let window = Window::load(&state_dir, &cache.index_path(), 1);
+            let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+                .rotate()
+                .expect("the first rotation sets");
+            let first_whole = start.elapsed().as_millis();
+            let to_set = at
+                .borrow()
+                .expect("the setter ran in the first rotation")
+                .as_millis();
+            let first_fetches = fetches(&transport);
+
+            write_history_at(&state_dir, &[history_entry(&first)]);
+            write_index_at(
+                &cache,
+                &[
+                    (&first, "png"),
+                    (&warmed(&cache, "two", &two), "png"),
+                    (&warmed(&cache, "three", &three), "png"),
+                ],
+            );
+
+            // Rotation 2: `two` is served from the cache, and warming it means the
+            // whole walk is held, so the prefetch fetches nothing either.
+            let at = Rc::new(RefCell::new(None));
+            let start = std::time::Instant::now();
+            let setter = TimedSetter {
+                start,
+                at: Rc::clone(&at),
+            };
+            let window = Window::load(&state_dir, &cache.index_path(), 1);
+            let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+                .rotate()
+                .expect("the second rotation sets from the cache");
+            let second_whole = start.elapsed().as_millis();
+            assert_eq!(second.origin_key, "pictures:two");
+            assert_eq!(
+                second.digest,
+                warmed(&cache, "two", &two).digest,
+                "the second rotation set the bytes the warming one stored"
+            );
+
+            (
+                to_set,
+                first_whole,
+                second_whole,
+                first_fetches,
+                fetches(&transport) - first_fetches,
+            )
+        };
+
+        let (warm_to_set, warm_first, warm_second, warm_first_fetches, warm_second_fetches) =
+            measure(2);
+        let (cold_to_set, cold_first, cold_second, cold_first_fetches, cold_second_fetches) =
+            measure(0);
+
+        println!(
+            "prefetch=2: set {warm_to_set} ms after the trigger, rotation 1 done at \
+             {warm_first} ms ({warm_first_fetches} fetches: the set and the two \
+             warmed), rotation 2 {warm_second} ms ({warm_second_fetches} fetches, \
+             served from the cache)"
+        );
+        println!(
+            "prefetch=0: set {cold_to_set} ms after the trigger, rotation 1 done at \
+             {cold_first} ms ({cold_first_fetches} fetch), rotation 2 {cold_second} ms \
+             ({cold_second_fetches} fetches, the download the prefetch would have paid)"
+        );
+
+        assert_eq!(
+            warm_first_fetches, 3,
+            "with the prefetch: the set candidate and the two after it"
+        );
+        assert_eq!(
+            warm_second_fetches, 0,
+            "and the rotation after it fetches nothing, the prefetch included"
+        );
+        assert_eq!(
+            cold_first_fetches, 1,
+            "without the prefetch: the set candidate, and the walk stops there"
+        );
+        assert_eq!(
+            cold_second_fetches, 1,
+            "so the next rotation pays its own download"
+        );
+        assert!(
+            warm_second < cold_second,
+            "the rotation served from the cache is faster than the one that fetches: \
+             {warm_second} ms against {cold_second} ms"
+        );
+        assert!(
+            warm_to_set < warm_first,
+            "the set is reported before the prefetch finishes: {warm_to_set} ms against \
+             {warm_first} ms for the whole rotation"
+        );
     }
 
     // -- what the index is asked before a fetch (4.1) -----------------------

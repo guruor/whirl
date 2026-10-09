@@ -171,6 +171,7 @@ fn main() -> ExitCode {
         platform,
         run: args.run,
         draw: pipeline::draw(args.run),
+        started: std::time::Instant::now(),
     };
 
     let result = match args.verb {

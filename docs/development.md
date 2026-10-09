@@ -1741,10 +1741,13 @@ target/debug/whirl-worker --config "$WHIRL_CONFIG" --verb rotate --run 1
 target/debug/whirl-worker --config "$WHIRL_CONFIG" --verb check --run 1
 ```
 
-When it rotates, its stdout is at most two lines, `downloaded: <digest> <abs path>`
-and `set: <digest> <origin_key> <abs path>`; the daemon reads the last non-empty
-line as the result. Running it by hand is the fastest way to see which stage
-failed, because stderr carries the failing stage and the exit code is non-zero
+When it rotates, its stdout is up to `2 + prefetch` lines: `downloaded: <digest>
+<abs path>`, then `set: <digest> <origin_key> <abs path>`, then one
+`prefetch: <digest> <origin_key> <abs path>` per candidate warmed ahead (the
+`prefetch` key of `docs/architecture.md` 4.2, 2 by default). The daemon reads the
+`set:` line as the result, wherever it sits. Running it by hand is the fastest way
+to see which stage failed, because stderr carries the failing stage and the exit
+code is non-zero
 (`docs/architecture.md` 1.6). `--verb check` prints the source and plan lines that
 `whirl config check` forwards, which is what the scaffold does; the architecture
 fixes the rotate contract, not the check output.
