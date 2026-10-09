@@ -54,11 +54,30 @@ impl Verb {
     }
 }
 
+/// One candidate the rotation warmed ahead of itself, as the daemon needs it to
+/// write the cache index entry (docs/architecture.md 1.6's `prefetch:` line and
+/// 7.3 step 4). The three fields are the `set:` line's, and the daemon does the
+/// same thing with them: it validates the path against the cache root and writes
+/// an index entry for the digest and the `origin_key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefetchRecord {
+    pub digest: String,
+    pub origin_key: String,
+    pub path: String,
+}
+
 /// What a finished worker gave back.
 #[derive(Debug)]
 pub enum Outcome {
-    /// A `set:` line, already turned into the four-field record of 2.6.
-    Set(SetRecord),
+    /// A `set:` line, already turned into the four-field record of 2.6, and the
+    /// `prefetch:` lines that followed it: the candidates this run stored for a
+    /// later rotation to set from the cache (docs/architecture.md 1.6). Empty
+    /// when `prefetch` is `0`, when there was nothing left to warm, or when every
+    /// warm attempt failed, which is not this worker's failure.
+    Set {
+        record: SetRecord,
+        prefetched: Vec<PrefetchRecord>,
+    },
     /// The check lines, forwarded verbatim.
     Lines(Vec<String>),
 }
@@ -305,10 +324,10 @@ impl Worker {
         // caller left it.
         *reaped = Some(child.id());
 
-        // Read after the exit. The contract caps stdout at two lines and stderr
-        // at one, so the pipe buffer cannot be full; a worker that ignored the
-        // contract and filled it was killed by the deadline above, which is what
-        // makes this read safe.
+        // Read after the exit. The contract caps stdout at `2 + prefetch` lines
+        // and stderr at one, and `PREFETCH_MAX` is small, so the pipe buffer
+        // cannot be full; a worker that ignored the contract and filled it was
+        // killed by the deadline above, which is what makes this read safe.
         let mut stdout = String::new();
         let mut stderr = String::new();
         if let Some(mut pipe) = child.stdout.take() {
@@ -366,25 +385,47 @@ impl Worker {
                     .collect(),
             )),
             Verb::Rotate | Verb::Set => {
+                // The `set:` line is the result wherever it sits in the capture,
+                // because docs/architecture.md 1.6 puts the `prefetch:` lines
+                // after it: a run that
+                // warmed two candidates ends with two lines that are not the
+                // result, and the contract that used to be "the last non-empty
+                // line" would read one of them as the result.
                 let last = stdout
                     .lines()
                     .rev()
                     .find(|line| !line.trim().is_empty())
                     .unwrap_or("")
                     .trim_end_matches('\r');
-                let (digest, origin_key, path) =
-                    protocol::parse_worker_set_line(last).ok_or_else(|| WorkerError::Failed {
-                        code: ErrorCode::WorkerFailed,
-                        message: format!(
-                            "the worker exited 0 without a set: line; last line was {last:?}"
-                        ),
-                    })?;
-                Ok(Outcome::Set(SetRecord {
-                    digest,
-                    origin_key,
-                    via: Via::Source,
-                    path: Some(path),
-                }))
+                let mut record = None;
+                let mut prefetched = Vec::new();
+                for line in stdout.lines() {
+                    let line = line.trim_end_matches('\r');
+                    if let Some((digest, origin_key, path)) = protocol::parse_worker_set_line(line)
+                    {
+                        record = Some(SetRecord {
+                            digest,
+                            origin_key,
+                            path: Some(path),
+                            via: Via::Source,
+                        });
+                    } else if let Some((digest, origin_key, path)) =
+                        protocol::parse_worker_prefetch_line(line)
+                    {
+                        prefetched.push(PrefetchRecord {
+                            digest,
+                            origin_key,
+                            path,
+                        });
+                    }
+                }
+                let record = record.ok_or_else(|| WorkerError::Failed {
+                    code: ErrorCode::WorkerFailed,
+                    message: format!(
+                        "the worker exited 0 without a set: line; last line was {last:?}"
+                    ),
+                })?;
+                Ok(Outcome::Set { record, prefetched })
             }
         }
     }
@@ -1318,17 +1359,17 @@ mod tests {
         }
     }
 
-    /// The happy path of the stdout parse: the *last* non-empty line is the
-    /// result, and a trailing carriage return is trimmed off it. Both are
-    /// asserted on the parsed record, so a parse that took the first line or
-    /// left the `\r` in the path fails on a field.
+    /// The happy path of the stdout parse: a `set:` line is the result wherever
+    /// it sits in the capture, and a trailing carriage return is trimmed off it.
+    /// Both are asserted on the parsed record, so a parse that took the first
+    /// line, or that left the `\r` in the path, fails on a field.
     ///
     /// The line here is the worker's own (`set: <digest> <origin_key> <abs
     /// path>`, 1.6's three fields), which is *not* the four-field `set:` line of
     /// 2.6: that one carries the `via` and is written by the daemon to a client.
     #[test]
-    fn the_last_non_empty_line_is_the_result() {
-        let scripts = Scripts::new("last-line");
+    fn a_set_line_is_the_result_wherever_it_sits_and_a_trailing_cr_is_trimmed() {
+        let scripts = Scripts::new("set-line");
         let digest = "a".repeat(64);
         let program = scripts.script(
             "set.sh",
@@ -1338,13 +1379,58 @@ mod tests {
         );
 
         match worker(program).run(Verb::Rotate, None, 7, generous()) {
-            Ok(Outcome::Set(record)) => {
+            Ok(Outcome::Set { record, .. }) => {
                 assert_eq!(record.digest, digest);
                 assert_eq!(record.origin_key, "pictures:0123456789abcdef");
                 assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"));
                 assert_eq!(record.via, Via::Source);
             }
-            other => panic!("the last line is a set: line: {other:?}"),
+            other => panic!("the set: line is the result: {other:?}"),
+        }
+    }
+
+    /// docs/architecture.md 1.6's `prefetch:` lines are read as what they are and
+    /// not as the result:
+    /// the `set:` line is the first line here and the two `prefetch:` lines
+    /// follow it, which is the shape a warming worker writes. Under the rule this
+    /// parse used to have, "the last non-empty line", the result would have been
+    /// a prefetch line, and the daemon would have recorded the wrong
+    /// `origin_key`. The count, the order and all three fields are asserted, so a
+    /// parse that dropped them or reordered them fails here.
+    #[test]
+    fn the_prefetch_lines_follow_the_set_line_and_are_not_the_result() {
+        let scripts = Scripts::new("prefetch-lines");
+        let digest = "d".repeat(64);
+        let second = "e".repeat(64);
+        let program = scripts.script(
+            "prefetch.sh",
+            &format!(
+                "#!/bin/sh\nprintf 'downloaded: {digest} /tmp/one.jpg\\n'\nprintf 'set: {digest} pictures:0123456789abcdef /tmp/one.jpg\\n'\nprintf 'prefetch: {second} pictures:fedcba9876543210 /tmp/two.jpg\\n'\nprintf 'prefetch: {digest} pictures:aaaaaaaabbbbbbbb /tmp/three.jpg\\n'\n"
+            ),
+        );
+
+        match worker(program).run(Verb::Rotate, None, 7, generous()) {
+            Ok(Outcome::Set { record, prefetched }) => {
+                assert_eq!(record.digest, digest);
+                assert_eq!(record.origin_key, "pictures:0123456789abcdef");
+                assert_eq!(record.path.as_deref(), Some("/tmp/one.jpg"));
+                assert_eq!(
+                    prefetched,
+                    vec![
+                        PrefetchRecord {
+                            digest: second,
+                            origin_key: "pictures:fedcba9876543210".to_string(),
+                            path: "/tmp/two.jpg".to_string(),
+                        },
+                        PrefetchRecord {
+                            digest,
+                            origin_key: "pictures:aaaaaaaabbbbbbbb".to_string(),
+                            path: "/tmp/three.jpg".to_string(),
+                        },
+                    ]
+                );
+            }
+            other => panic!("a prefetch line is not the result of the rotation: {other:?}"),
         }
     }
 
@@ -1370,7 +1456,7 @@ mod tests {
             );
         }
         match worker(program).run(Verb::Rotate, None, 1, generous()) {
-            Ok(Outcome::Set(record)) => {
+            Ok(Outcome::Set { record, .. }) => {
                 assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"))
             }
             other => panic!("the worker's stdin must be the null device: {other:?}"),
@@ -1510,7 +1596,7 @@ mod tests {
         releasing.join().expect("the writer thread");
 
         match outcome {
-            Ok(Outcome::Set(record)) => {
+            Ok(Outcome::Set { record, .. }) => {
                 assert_eq!(record.digest, digest);
                 assert_eq!(record.origin_key, "pictures:0123456789abcdef");
                 assert_eq!(record.path.as_deref(), Some("/tmp/candidate.jpg"));

@@ -578,9 +578,10 @@ impl FavoritesFile {
 /// Three fields of an entry are absent in what this build writes, and the reason
 /// is upstream rather than a preference here: `origin`, `width` and `height`
 /// come from the bytes, and the report the daemon builds an entry from is the
-/// two-line stdout contract of docs/architecture.md 1.6 (`downloaded:` and
-/// `set: <digest> <origin_key> <via> <path>`), which carries neither. The
-/// daemon holds no image bytes (docs/architecture.md 1.9) and does not sniff the
+/// stdout contract of docs/architecture.md 1.6 (`downloaded:`, `set: <digest>
+/// <origin_key> <path>` and the `prefetch:` lines that may follow it), which
+/// carries neither. The daemon holds no image bytes (docs/architecture.md 1.9)
+/// and does not sniff the
 /// file, so those three are written as `null` and are recovered when the
 /// digest's file is next read. 2.1's sentence that "the worker reports the
 /// digest and the origin" describes an origin the record form does not carry.
