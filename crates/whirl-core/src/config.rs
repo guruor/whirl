@@ -2595,6 +2595,7 @@ mod tests {
                 "sources[0].paths",
                 3,
             ),
+            ("{\n  \"prefetch\": 9\n}", "prefetch", 2),
         ];
         for (text, field, line) in cases {
             let error = refusal(text);
@@ -2781,6 +2782,37 @@ mod tests {
             1_048_576,
             "4.2's `log_max_bytes` default"
         );
+    }
+
+    /// `prefetch` (docs/architecture.md 4.2 and 4.3): `0` turns it off and has to
+    /// be written rather than inferred, the same shape `log_max_bytes` has, and a
+    /// value above the ceiling is refused rather than clamped, the same shape
+    /// `sources[0].pages` has. The refusal is the behaviour under test; the row in
+    /// `wrong_types_and_out_of_range_values_are_refused_with_their_line` pins the
+    /// key and the line, and this pins the message and both edges.
+    #[test]
+    fn the_prefetch_ceiling_accepts_its_edges_and_refuses_above() {
+        let loaded = Config::parse(r#"{"prefetch": 0}"#).expect("zero turns it off");
+        assert_eq!(loaded.config.prefetch, 0);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+        let text = format!("{{\n  \"prefetch\": {PREFETCH_MAX}\n}}");
+        let loaded = Config::parse(&text).expect("the ceiling itself is legal");
+        assert_eq!(loaded.config.prefetch, PREFETCH_MAX);
+
+        let error = refusal("{\n  \"prefetch\": 9\n}");
+        assert_eq!(error.field.as_deref(), Some("prefetch"));
+        assert_eq!(error.line, 2);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "prefetch (line 2): prefetch 9 is above {PREFETCH_MAX}; each one is a download inside the \
+                 rotation's own worker_deadline_seconds and an image held against cache.max_bytes"
+            )
+        );
+
+        // The default is the documented 2, and deleting the line keeps it.
+        assert_eq!(Config::default().prefetch, 2, "4.2's `prefetch` default");
     }
 
     #[test]
