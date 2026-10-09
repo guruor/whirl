@@ -16,8 +16,8 @@ use whirl_core::protocol::SourceRecord;
 /// The daemon's own flags. docs/architecture.md 4.3 says flags "exist only for
 /// tests and for the `--backend noop` switch", and names exactly these three.
 /// Everything else a test needs it can set in the environment: `WHIRL_CONFIG`,
-/// `WHIRL_SOCKET`, `WHIRL_STATE_DIR`, `WHIRL_CACHE_DIR` and `WHIRL_BACKEND` are
-/// the five of docs/development.md section 7.
+/// `WHIRL_SOCKET`, `WHIRL_STATE_DIR`, `WHIRL_CACHE_DIR`, `WHIRL_LOG` and
+/// `WHIRL_BACKEND` are the six of docs/development.md section 7.
 #[derive(Debug, Default)]
 pub struct Flags {
     pub config: Option<PathBuf>,
@@ -55,6 +55,12 @@ pub struct Effective {
     pub state_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub backend: Backend,
+    /// The file the supervisor hands this process as its standard output and
+    /// standard error, and the one the daemon holds to its cap
+    /// (`docs/architecture.md` 4.2's `log_max_bytes`). `None` when no platform
+    /// default is available and `WHIRL_LOG` is unset: then there is no file to
+    /// bound, and the daemon writes to whatever it was given.
+    pub log_path: Option<PathBuf>,
     /// The config this daemon is running under, behind a lock because a re-read
     /// replaces it while the accept loop and the scheduler read it
     /// (docs/architecture.md 4.2, 10.5). The resolved paths are not re-resolved:
@@ -118,12 +124,18 @@ impl Effective {
         }
         writable(&state_dir)?;
 
+        // The log's directory belongs to the supervisor, not to this process
+        // (4.1): the daemon never creates it and never creates the file, it only
+        // bounds what is already there.
+        let log_path = env_path("WHIRL_LOG").or_else(paths::log_file);
+
         Ok(Effective {
             config_path,
             socket_path,
             state_dir,
             cache_dir,
             backend,
+            log_path,
             config: RwLock::new(config),
         })
     }

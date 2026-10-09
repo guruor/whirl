@@ -24,7 +24,7 @@
 
 use crate::backend::{self, SetError};
 use crate::sources::Sources;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -37,25 +37,41 @@ use whirl_core::state::{self, IndexFile, StateFile};
 /// The largest header this build sniffs for the formats whose dimensions are in
 /// the first bytes: PNG's `IHDR`, a JPEG's frame header, WebP's `VP8`/`VP8L`/
 /// `VP8X` chunk. Section 3 step 5 asks for "the first bytes", and this is how
-/// many of them are kept. A HEIC is not one of these: see [`HEIC_WINDOW`].
+/// many of them are kept. Two formats are not like these: a HEIC's dimensions
+/// are behind `meta`, and a JPEG's frame header can sit behind a multi-kilobyte
+/// APP1/Exif segment, so each widens to [`WIDE_WINDOW`] when this window did not
+/// measure it.
 const HEAD_WINDOW: usize = 1024;
 
-/// The window a stream's or a file's head is widened to when the bytes
-/// themselves say HEIC and the small window did not measure them.
+/// The window a stream's or a file's head is widened to when the small window
+/// did not measure the bytes and the bytes themselves say they are a format
+/// whose dimensions can lie further in.
 ///
-/// A HEIC's dimensions live in an `ispe` box inside `iprp`/`ipco`, behind the
-/// `meta` box's `hdlr`, `dinf`, `pitm`, `iinf` and `iref`, so they are nothing
-/// like "the first bytes" - and the first `ispe` in the file is the *thumbnail*
-/// item's, which is why the walk below follows `pitm` and `ipma` to the primary
-/// item rather than taking the first or the largest box it finds. Measured
-/// against the thirteen `.heic` files Apple ships in
-/// `/System/Library/Desktop Pictures` on macOS 26.5: the first `ispe` in `ipco`,
-/// the thumbnail's, starts at 1245, 1680, 1781, 2686 and 3421, and the primary
-/// item's starts 20 bytes later in each file; every `meta` box ends by 5220, and
-/// one `.heic` that `sips` wrote puts an `ispe` at 1063. All of them are past
-/// 1024. 64 KiB is the worst of those with an order of magnitude to spare and is
-/// the size of the read buffer in [`store`] and in `Run::reference`, so a HEIC
-/// costs one wider first read and no second pass.
+/// Two formats need it, and [`sniffed`]'s own walk is what decides both:
+///
+/// - **A HEIC.** Its dimensions live in an `ispe` box inside `iprp`/`ipco`,
+///   behind the `meta` box's `hdlr`, `dinf`, `pitm`, `iinf` and `iref`, so they
+///   are nothing like "the first bytes" - and the first `ispe` in the file is
+///   the *thumbnail* item's, which is why the walk below follows `pitm` and
+///   `ipma` to the primary item rather than taking the first or the largest box
+///   it finds. Measured against the thirteen `.heic` files Apple ships in
+///   `/System/Library/Desktop Pictures` on macOS 26.5: the first `ispe` in
+///   `ipco`, the thumbnail's, starts at 1245, 1680, 1781, 2686 and 3421, and the
+///   primary item's starts 20 bytes later in each file; every `meta` box ends by
+///   5220, and one `.heic` that `sips` wrote puts an `ispe` at 1063. All of them
+///   are past 1024.
+/// - **A JPEG.** Its frame header sits behind whatever APP segments precede it,
+///   and an APP1/Exif segment is a photograph's own metadata: on the eight
+///   `wallhaven` files that first exposed this, the APP1 segment declares 3.0 KB
+///   to 6.0 KB, so the walk has to reach byte 3042 to 5970 while the small
+///   window holds 1024. Every JPEG already in a library begins with a small JFIF
+///   segment (`0xffe0`, length 16) whose frame header sits at byte 154 to 319,
+///   which is why the small window measured those and not these.
+///
+/// 64 KiB is the worst size measured here with an order of magnitude to spare,
+/// and it is the size of the read buffer in [`store`] and in `Run::reference`,
+/// so a file that needs the wide window costs one wider first read and no second
+/// pass.
 ///
 /// **What has to fit is the whole `meta` box, not the `ispe`.** The walk in
 /// [`boxes`] stops at the first box whose *declared* size runs past the read,
@@ -69,7 +85,7 @@ const HEAD_WINDOW: usize = 1024;
 /// is still not one whirl will promise to display (features.md 2.2), and it is
 /// dropped before candidacy rather than counted at a stage, which is why the
 /// worker reports it on stderr and this daemon forwards that to its log.
-const HEIC_WINDOW: usize = 64 * 1024;
+const WIDE_WINDOW: usize = 64 * 1024;
 
 /// A failed stage: what the daemon turns into the `ERR` code of 2.7.
 #[derive(Debug, Clone)]
@@ -341,9 +357,15 @@ pub fn stage_type(input: Vec<Seeking>, platform: Platform) -> Stage {
     stage
 }
 
-/// 2.5 step 5, the cheap half of dedupe: a candidate whose `origin_key` (or
-/// whose id) is in the recent window of 4.1, "the whole history ring (50 entries
-/// by default) plus the current index".
+/// 2.5 step 5: a candidate whose `origin_key` (or whose id) is in the recent
+/// window of 4.1, which is the history ring bounded by `dedupe.recent_entries`.
+///
+/// The cache index is not part of this set. It is the service map
+/// ([`Window::cached`]): a candidate the cache already holds is set from the
+/// cache rather than dropped, so the rule this stage enforces is "not the image
+/// whirl just set", and "not bytes whirl already has" costs no request and no
+/// download. What the index does not hold is a miss at both halves, and is
+/// fetched.
 ///
 /// A window that holds every candidate therefore empties this stage, and that is
 /// the answer 4.1 asks for rather than a case to work around: the rotation ends
@@ -421,28 +443,55 @@ pub fn settable(platform: Platform, ext: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The recent window: the origin keys and digests a candidate is compared
-/// against before it costs a request.
+/// against before it costs a request, and the cache index, which is what a
+/// candidate the cache already holds is served from.
 ///
-/// It is built from the history ring and the cache index, which are the daemon's
-/// files (7.2). This process only reads them, and it tolerates anything it finds:
-/// 7.1's rule is "No reader takes a lock, and every reader must tolerate any file
-/// being replaced under it", and a window that cannot be read is a missed
-/// preference, never a failed rotation. Nothing here writes either file.
+/// Both files are the daemon's (7.2). This process only reads them, and it
+/// tolerates anything it finds: 7.1's rule is "No reader takes a lock, and every
+/// reader must tolerate any file being replaced under it", and a window that
+/// cannot be read is a missed preference, never a failed rotation. Nothing here
+/// writes either file.
+///
+/// The two are not the same half of the dedupe, and the difference is the point
+/// of the whole struct. The history ring is the **rejection** set: a candidate
+/// in it is dropped, which is the rule that stops a `random` query setting the
+/// same wallpaper twice in a week. The index is the **service** map: a candidate
+/// whose `origin_key` the index names, under a file that is still there, is
+/// taken from the cache instead of fetched, so bytes whirl already holds are
+/// never downloaded a second time. The index is deliberately *not* part of the
+/// rejection set: an image the cache already holds is not a candidate to drop,
+/// it is one to set for free (4.1). An entry the sweep removed, or one that is
+/// listed but whose file is gone, is served by neither half and is fetched again
+/// like any other miss.
 #[derive(Debug, Clone, Default)]
 pub struct Window {
     keys: HashSet<String>,
+    held: HashMap<String, Held>,
+}
+
+/// One index entry, reduced to the two fields the cache path is built from: the
+/// digest, which is the file's own name, and the extension the name carries
+/// (docs/spec/state-and-cache.md 2.1 and section 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Held {
+    digest: String,
+    ext: String,
 }
 
 impl Window {
     pub fn empty() -> Window {
         Window {
             keys: HashSet::new(),
+            held: HashMap::new(),
         }
     }
 
-    /// A window from the two files, bounded by `dedupe.recent_entries` (4.1: the
-    /// whole ring, and the index). The state directory is where the ring lives;
-    /// the index lives in the cache root.
+    /// A window from the two files: the history ring bounded by
+    /// `dedupe.recent_entries` (4.1), and every index entry that names an
+    /// `origin_key`. The state directory is where the ring lives; the index lives
+    /// in the cache root. Either file may be absent, unreadable, of a newer
+    /// schema or malformed, and each case leaves that half empty rather than
+    /// failing: the rotation falls back to fetching.
     pub fn load(state_dir: &Path, index_path: &Path, bound: usize) -> Window {
         let mut window = Window::empty();
         if let Ok(Some(text)) = read_file(&state_dir.join(state::HISTORY_FILE)) {
@@ -465,8 +514,28 @@ impl Window {
             match IndexFile::parse(&text) {
                 Ok(StateFile::Read(index)) => {
                     for (digest, entry) in &index.entries {
-                        window.add(digest);
-                        window.add(&entry.origin_key);
+                        // An entry with no `origin_key` names no candidate, so it
+                        // has nothing to serve; the digest alone is not a key the
+                        // selection of 4.1 can look up.
+                        //
+                        // One `origin_key` can name two digests: a source that
+                        // re-encoded the same id has two entries for it. The map
+                        // keeps one of them, chosen by the index's own digest
+                        // order, and that is the one a rotation is served - so a
+                        // re-encode that happens after the window has moved past
+                        // the id is served the older bytes instead of being
+                        // fetched. That is the price of keying the service on the
+                        // id the source gave, which is the mapping the index is
+                        // for and the mapping no other file holds.
+                        if !entry.origin_key.is_empty() {
+                            window.held.insert(
+                                entry.origin_key.clone(),
+                                Held {
+                                    digest: digest.clone(),
+                                    ext: entry.ext.clone(),
+                                },
+                            );
+                        }
                     }
                 }
                 Ok(StateFile::SchemaNewer { found }) => {
@@ -500,11 +569,68 @@ impl Window {
         self.keys.contains(key)
     }
 
+    /// The cache file a candidate's `origin_key` is already held under, when the
+    /// index names one and the file it names really holds the bytes that name
+    /// claims. This is the whole of the consultation: a `Some` is a candidate
+    /// served from the cache with no request to the source (4.1).
+    ///
+    /// The check is the file's **bytes**, not its existence. A content-addressed
+    /// name is the digest of the bytes it was written from, so section 2's third
+    /// reason for the scheme - "a file whose bytes do not hash to its name was
+    /// truncated or damaged by something else, and that is detectable without a
+    /// second index" - is the condition of the hit rather than a report after it.
+    /// A file that is gone, unreadable, or whose bytes have moved off its name is
+    /// a miss, and the candidate falls through to the fetch like any other; the
+    /// index entry beside it is what the sweep will reclaim (5.5).
+    ///
+    /// The decision here is the rotation's and not the sweep's, which is what
+    /// makes an entry the sweep has taken, or one that is listed but whose file
+    /// is gone, a fetch again rather than a silent nothing.
+    pub fn cached(&self, cache: &Cache, origin_key: &str) -> Option<(String, PathBuf)> {
+        let held = self.held.get(origin_key)?;
+        let path = state::content_path(cache.root(), &held.digest, &held.ext);
+        if hashes_to(&path, &held.digest) {
+            return Some((held.digest.clone(), path));
+        }
+        None
+    }
+
     /// The same set as a list, which is what a source is handed so it can
     /// exclude the window in its own request where it can (`EnumContext.recent`).
+    /// It is the rejection set and only that: the cache index is consulted
+    /// through [`Window::cached`], not handed to a source to exclude.
     pub fn keys(&self) -> Vec<String> {
         self.keys.iter().cloned().collect()
     }
+}
+
+/// Whether the file at `path` really carries the bytes its name claims: a whole
+/// pass of SHA-256 that spells `digest`, the 64 lower-case hex characters the
+/// cache path is built from.
+///
+/// This is section 2's third reason for content-addressed names, used as a
+/// condition rather than as a report: "a file whose bytes do not hash to its
+/// name was truncated or damaged by something else, and that is detectable
+/// without a second index". A file that is gone, unreadable, or whose bytes have
+/// moved off its name answers `false`, and both callers read that as a miss: the
+/// hit is not taken, the candidate is fetched, and the bytes that arrive replace
+/// whatever the name was holding.
+fn hashes_to(path: &Path, digest: &str) -> bool {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = protocol::Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(_) => return false,
+        }
+    }
+    hasher.hex() == digest
 }
 
 fn read_file(path: &Path) -> Result<Option<String>, String> {
@@ -666,30 +792,87 @@ pub struct Header {
 /// What a downloaded file is, or `None` when nothing in the first bytes
 /// identifies one of the four formats of features.md 2.2.
 pub fn sniff(bytes: &[u8]) -> Option<Header> {
-    sniff_png(bytes)
-        .or_else(|| sniff_jpeg(bytes))
-        .or_else(|| sniff_webp(bytes))
-        .or_else(|| sniff_heic(bytes))
+    match sniffed(bytes) {
+        Sniffed::Measured(header) => Some(header),
+        Sniffed::BeyondWindow | Sniffed::NotAnImage => None,
+    }
+}
+
+/// What the first bytes say about the four formats of features.md 2.2, with the
+/// third answer a single [`sniff`] cannot carry.
+///
+/// A head is a window, and "the bytes did not measure" is two different facts.
+/// A JPEG's frame header can sit behind a multi-kilobyte APP1/Exif segment, and
+/// its segment walk then runs out of bytes while `ffd8` still says these are a
+/// picture: [`Sniffed::BeyondWindow`] is that case, and a caller must not report
+/// it as `not_an_image`, because the bound is the window and not the content. A
+/// HEIC answers the same question through the brand test [`is_heic`] rather than
+/// through this arm, because its walk cannot tell "no `meta` box" (not a picture
+/// this build promises, features.md 2.2) from "a `meta` box past the head".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sniffed {
+    /// The dimensions were read.
+    Measured(Header),
+    /// The bytes begin one of the four formats, and the walk that reads their
+    /// dimensions ran past the end of what was kept.
+    BeyondWindow,
+    /// The bytes are not one of the four formats of features.md 2.2.
+    NotAnImage,
+}
+
+fn sniffed(bytes: &[u8]) -> Sniffed {
+    if let Some(header) = sniff_png(bytes) {
+        return Sniffed::Measured(header);
+    }
+    match sniff_jpeg(bytes) {
+        Sniffed::Measured(header) => return Sniffed::Measured(header),
+        // A file whose first two bytes are `ffd8` is a JPEG and nothing else
+        // here, so the other two walks are not asked when the JPEG's own ran
+        // out of bytes.
+        Sniffed::BeyondWindow => return Sniffed::BeyondWindow,
+        Sniffed::NotAnImage => {}
+    }
+    if let Some(header) = sniff_webp(bytes) {
+        return Sniffed::Measured(header);
+    }
+    if let Some(header) = sniff_heic(bytes) {
+        return Sniffed::Measured(header);
+    }
+    Sniffed::NotAnImage
 }
 
 /// How many bytes the head of a file or a stream is worth keeping, given what
-/// has arrived so far: [`HEAD_WINDOW`], or [`HEIC_WINDOW`] once the small window
-/// is full, the bytes say HEIC, and the sniff still has not measured them.
+/// has arrived so far: [`HEAD_WINDOW`], or [`WIDE_WINDOW`] once the small window
+/// is full and the bytes say they are a format whose dimensions the small window
+/// did not measure.
 ///
 /// The questions are asked in that order because each one is cheaper to answer
 /// than the read it would cause. A file shorter than the small window is not
-/// widened: there is nothing more to read. A JPEG, a PNG or a WebP answers
-/// inside the small window, and so does a HEIC whose `ispe` happens to be in
-/// there. What is left is the case this exists for: a HEIC whose dimensions sit
-/// behind `meta`, which is every HEIC measured on this machine, at 1063 to 3421
-/// bytes in. Both callers of [`sniff`] ask this and not a constant of their own,
-/// so a file the local source admits is a file the pipeline can measure, and a
-/// file the local source drops is a file the pipeline would drop.
+/// widened: there is nothing more to read. A PNG or a WebP answers inside the
+/// small window, and so does a JPEG whose frame header is not behind a large
+/// segment and a HEIC whose `ispe` happens to sit early. What is left is the two
+/// cases this exists for: a HEIC whose dimensions sit behind `meta` - which is
+/// every HEIC measured on this machine, at 1063 to 3421 bytes in - and a JPEG
+/// whose frame header sits behind a multi-kilobyte APP1/Exif segment, at 3042 to
+/// 5970 bytes in on the files that exposed this. Both callers of [`sniff`] ask
+/// this and not a constant of their own, so a file the local source admits is a
+/// file the pipeline can measure, and a file the local source drops is a file
+/// the pipeline would drop.
 pub fn head_window(head: &[u8]) -> usize {
-    if head.len() >= HEAD_WINDOW && sniff(head).is_none() && is_heic(head) {
-        HEIC_WINDOW
-    } else {
-        HEAD_WINDOW
+    if head.len() < HEAD_WINDOW {
+        return HEAD_WINDOW;
+    }
+    match sniffed(head) {
+        Sniffed::Measured(_) => HEAD_WINDOW,
+        // A JPEG the small window could not walk: a wider head may reach its
+        // frame header, and one that outruns even the wide window is reported as
+        // bounded by it rather than as bad content (`store`).
+        Sniffed::BeyondWindow => WIDE_WINDOW,
+        // A HEIC the small window could not measure: its brand is what says the
+        // dimensions may be further in, because `sniffed` cannot walk into a
+        // `meta` box the head did not hold.
+        Sniffed::NotAnImage if is_heic(head) => WIDE_WINDOW,
+        Sniffed::NotAnImage => HEAD_WINDOW,
     }
 }
 
@@ -709,14 +892,14 @@ fn sniff_png(bytes: &[u8]) -> Option<Header> {
     })
 }
 
-fn sniff_jpeg(bytes: &[u8]) -> Option<Header> {
+fn sniff_jpeg(bytes: &[u8]) -> Sniffed {
     if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
-        return None;
+        return Sniffed::NotAnImage;
     }
     let mut at = 2;
     while at + 3 < bytes.len() {
         if bytes[at] != 0xff {
-            return None;
+            return Sniffed::NotAnImage;
         }
         let marker = bytes[at + 1];
         // Fill bytes and standalone markers carry no length.
@@ -730,13 +913,13 @@ fn sniff_jpeg(bytes: &[u8]) -> Option<Header> {
         }
         let length = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
         if length < 2 {
-            return None;
+            return Sniffed::NotAnImage;
         }
         // SOF0..SOF15 except DHT (c4), JPG (c8) and DAC (cc) carry the frame
         // header, and it is width and height in that order at a fixed offset.
         let frame = (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc);
         if frame && at + 9 < bytes.len() {
-            return Some(Header {
+            return Sniffed::Measured(Header {
                 ext: "jpg",
                 height: u16::from_be_bytes([bytes[at + 5], bytes[at + 6]]) as u32,
                 width: u16::from_be_bytes([bytes[at + 7], bytes[at + 8]]) as u32,
@@ -744,7 +927,11 @@ fn sniff_jpeg(bytes: &[u8]) -> Option<Header> {
         }
         at += 2 + length;
     }
-    None
+    // The walk reached the end of the bytes given before a frame header. For a
+    // whole file that is a truncated picture; for a stream it is a head window
+    // the photograph's own APP1/Exif segment runs past. Either way the bytes
+    // said `ffd8`, so this is not a claim that they are not a JPEG.
+    Sniffed::BeyondWindow
 }
 
 fn sniff_webp(bytes: &[u8]) -> Option<Header> {
@@ -1213,11 +1400,12 @@ pub fn store(
         }
         hasher.update(&buffer[..read]);
         // Section 3 step 5's head. It starts at the small window and widens, at
-        // most once, for a HEIC the small one cannot measure (`head_window`).
-        // That is why this takes as much of the chunk as the *current* window
-        // has room for instead of a fixed count: the file that needs the wide
-        // window can arrive whole in this one read, and capping the first take
-        // at 1024 bytes would lose the rest of it.
+        // most once, for a file the small one cannot measure (`head_window`: a
+        // JPEG behind a large Exif segment, a HEIC behind `meta`). That is why
+        // this takes as much of the chunk as the *current* window has room for
+        // instead of a fixed count: the file that needs the wide window can
+        // arrive whole in this one read, and capping the first take at 1024
+        // bytes would lose the rest of it.
         let mut taken = 0;
         while taken < read {
             let room = window.saturating_sub(head.len());
@@ -1239,9 +1427,23 @@ pub fn store(
         return Err(write_failure(origin, error));
     }
 
-    let header = match sniff(&head) {
-        Some(header) => header,
-        None => {
+    let header = match sniffed(&head) {
+        Sniffed::Measured(header) => header,
+        // A JPEG whose own walk ran out of head: the bytes said `ffd8`, so what
+        // the reader needs is the bound that stopped the measurement, not a
+        // claim that the bytes are not a picture. The code stays the protocol's
+        // `not_an_image` (2.7 has one code for a sniff that produced no header,
+        // and a new code would be a protocol change); the message is what
+        // distinguishes the two.
+        Sniffed::BeyondWindow => {
+            part.discard();
+            return Err(Failure::new(
+                "download",
+                ErrorCode::NotAnImage,
+                format!("{origin}: the header is past the {window}-byte head window"),
+            ));
+        }
+        Sniffed::NotAnImage => {
             part.discard();
             return Err(Failure::new(
                 "download",
@@ -1252,10 +1454,20 @@ pub fn store(
     };
     let digest = hasher.hex();
     let final_path = state::content_path(cache.root(), &digest, header.ext);
-    if final_path.is_file() {
+    if final_path.is_file() && hashes_to(&final_path, &digest) {
         // Section 3 step 7: "If the final path already exists, the bytes are
         // identical by construction, so `unlink` the part file and report a
         // cache hit (the daemon bumps `last_used`)."
+        //
+        // "By construction" is the file's own contents, not the fact that a
+        // directory entry is there: the arriving bytes already hash to `digest`,
+        // so the name is right, but a file something else truncated or replaced
+        // under that name is not the copy the name promises. That one fails
+        // [`hashes_to`] and falls through to the `rename` below, which replaces
+        // it with the bytes just fetched instead of handing the damaged copy to
+        // the setter. The same check decides [`Window::cached`], so the before-
+        // the-request hit and this after-the-download one agree about what a hit
+        // is.
         part.discard();
         return Ok(Stored {
             digest,
@@ -1471,6 +1683,16 @@ enum Filled {
     /// The bytes are a cache entry under `sha256/` (docs/spec/state-and-cache.md
     /// section 3): `copy`, and every kind that is not a `local` one.
     Stored(Stored),
+    /// The bytes were already in the cache, under the digest the index names for
+    /// this candidate's `origin_key`, and nothing was fetched (4.1). This is the
+    /// `hit` of section 3 step 7 reached *before* the request instead of after
+    /// it: the same bytes, the same content-addressed path, no download.
+    Cached {
+        /// The digest the index records for this `origin_key`.
+        digest: String,
+        /// The content-addressed path that digest names, `stat`ed and there.
+        path: PathBuf,
+    },
     /// Nothing was written, and the platform is pointed at the candidate's own
     /// path: features.md 2.2's `reference`, the printed default.
     Referenced {
@@ -1491,15 +1713,17 @@ impl Filled {
     fn digest(&self) -> &str {
         match self {
             Filled::Stored(stored) => &stored.digest,
+            Filled::Cached { digest, .. } => digest,
             Filled::Referenced { digest, .. } => digest,
         }
     }
 
-    /// The path the platform is given, which is the one thing the two arms
+    /// The path the platform is given, which is the one thing the arms
     /// disagree about: the cache file, or the user's own file.
     fn path(&self) -> &Path {
         match self {
             Filled::Stored(stored) => &stored.path,
+            Filled::Cached { path, .. } => path,
             Filled::Referenced { path, .. } => path,
         }
     }
@@ -1615,9 +1839,9 @@ impl Run<'_> {
                     // file is removed and "the error is reported", once.
                     Err(failure) => return Err(failure),
                 };
-                // 1.6's first line belongs to the store, and a reference-mode
-                // candidate reached the setter without one: nothing was
-                // downloaded, so nothing is claimed to have been.
+                // 1.6's first line belongs to the store, and neither a
+                // reference-mode candidate nor one served from the cache reached
+                // it: nothing was downloaded, so nothing is claimed to have been.
                 if let Filled::Stored(_) = &filled {
                     println!("{}", self.report(&seeking, &filled).downloaded_line());
                 }
@@ -1704,6 +1928,13 @@ impl Run<'_> {
     /// `reference` is why this branch is not the rare one: a `local` source that
     /// says nothing about `mode` does not copy the user's library.
     ///
+    /// The cache is consulted first, and only for the arm that would store:
+    /// 4.1's service map. A candidate whose `origin_key` the index names under a
+    /// file that is still there is taken from the cache without a request, which
+    /// is section 3 step 7's hit reached before the download instead of after it.
+    /// The other two answers are the same miss they always were: no entry, or an
+    /// entry whose file is gone, falls through to [`store`] and is fetched.
+    ///
     /// `Ok(None)` is the backstop of 2.5 step 1 for a candidate whose source did
     /// not report its dimensions: the header is the authority, and a file under
     /// the floor is not admissible. It is a rejection rather than a failure, so
@@ -1717,6 +1948,14 @@ impl Run<'_> {
     ) -> Result<Option<Filled>, Failure> {
         if matches!(self.mode_of(&seeking.source), Some(LocalMode::Reference)) {
             return self.reference(seeking).map(Some);
+        }
+        // 4.1: the index is asked before the request is made, not after it. The
+        // floor of 2.5 step 1 is not re-applied here: the source's own dimensions
+        // admitted this candidate at the resolution stage, and the file was
+        // admitted the first time it was stored, so a second measurement would
+        // read the same bytes to reach the same answer.
+        if let Some((digest, path)) = self.window.cached(self.cache, &seeking.origin_key()) {
+            return Ok(Some(Filled::Cached { digest, path }));
         }
         let cap = self
             .config
@@ -2087,13 +2326,13 @@ fn disabled_record(source: &SourceConfig, reason: String) -> String {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::io::Cursor;
     use std::rc::Rc;
     use whirl_core::config::{Config, ConfigError};
     use whirl_core::protocol::{Kind, Via};
     use whirl_core::source::{Capability, Enumerated, FilterSet, Source, SourceError};
-    use whirl_core::state::{HistoryEntry, HistoryFile};
+    use whirl_core::state::{CacheIndexEntry, HistoryEntry, HistoryFile, IndexFile};
 
     // -- the two things a test owns: a source and a byte source -------------
 
@@ -2292,6 +2531,65 @@ mod tests {
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes.extend_from_slice(&width.to_be_bytes());
         bytes.extend_from_slice(&[0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+        bytes
+    }
+
+    /// The payload of an APP1/Exif segment of `len` bytes: the Exif identifier
+    /// (`Exif\0\0`, JEITA CP-3451 4.7.2), then filler, so the segment has the
+    /// shape a camera or a wallpaper service writes. `len` is the payload length;
+    /// the segment's declared length is `len + 2` ([`jpeg_segment`]).
+    fn exif(len: usize) -> Vec<u8> {
+        let mut payload = b"Exif\0\0".to_vec();
+        assert!(len >= payload.len(), "an Exif payload holds its identifier");
+        let pad = len - payload.len();
+        filler(&mut payload, pad);
+        payload
+    }
+
+    /// The payload of an APP2/ICC segment of `len` bytes: the ICC signature
+    /// (`ICC_PROFILE\0`, ICC.1:2004-10 Annex B.4), then filler.
+    fn icc(len: usize) -> Vec<u8> {
+        let mut payload = b"ICC_PROFILE\0".to_vec();
+        assert!(len >= payload.len(), "an ICC payload holds its signature");
+        let pad = len - payload.len();
+        filler(&mut payload, pad);
+        payload
+    }
+
+    /// One JPEG segment as a real encoder writes it: `ff<marker>`, the declared
+    /// length, then the payload. ISO/IEC 10918-1 B.1.1.4: the length field counts
+    /// itself and the payload.
+    fn jpeg_segment(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let declared = payload.len() + 2;
+        assert!(
+            declared <= u16::MAX as usize,
+            "a JPEG segment's length field is 16 bits"
+        );
+        let mut bytes = vec![0xff, marker];
+        bytes.extend_from_slice(&(declared as u16).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    /// A JPEG in the shape a photograph from a camera or a wallpaper service has,
+    /// rather than the minimal JFIF one above: `ffd8`, then the APP segments the
+    /// test names (APP1/Exif, APP2/ICC, both skipped when empty), then the frame
+    /// header, then `image` bytes of coded data. The shape is the point: a
+    /// photograph's frame header sits behind its own metadata, which is
+    /// kilobytes, instead of at byte 30.
+    fn jpeg_photo(width: u16, height: u16, app1: &[u8], app2: &[u8], image: usize) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8];
+        if !app1.is_empty() {
+            bytes.extend_from_slice(&jpeg_segment(0xe1, app1));
+        }
+        if !app2.is_empty() {
+            bytes.extend_from_slice(&jpeg_segment(0xe2, app2));
+        }
+        bytes.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+        filler(&mut bytes, image);
         bytes
     }
 
@@ -2830,7 +3128,7 @@ mod tests {
         assert!(is_heic(small), "but the bytes say what they are");
         assert_eq!(
             head_window(small),
-            HEIC_WINDOW,
+            WIDE_WINDOW,
             "so a head is worth reading further, and this is by how much"
         );
         assert_eq!(
@@ -2844,18 +3142,25 @@ mod tests {
         );
     }
 
-    /// The widening is for that one case and no other: everything that answers
-    /// inside the small window keeps the 1 KiB read, which is every JPEG, PNG and
-    /// WebP in a library and every HEIC whose `ispe` happens to sit early.
+    /// The widening is for the two formats whose dimensions can sit past the
+    /// small window and no other: everything that answers inside it keeps the
+    /// 1 KiB read, which is every PNG and WebP in a library, every JPEG whose
+    /// frame header is not behind a large APP segment, and every HEIC whose
+    /// `ispe` happens to sit early.
     #[test]
-    fn the_window_widens_only_for_a_heic_the_small_one_cannot_measure() {
+    fn the_window_widens_only_for_a_file_the_small_window_cannot_measure() {
         assert_eq!(head_window(&png(1600, 900)), HEAD_WINDOW);
-        assert_eq!(head_window(&jpeg(1920, 1080)), HEAD_WINDOW);
+        assert_eq!(
+            head_window(&jpeg(1920, 1080)),
+            HEAD_WINDOW,
+            "the minimal JFIF fixture answers at byte 30, which is exactly the shape \
+             that hid this defect: a library of those is not a library of photographs"
+        );
         assert_eq!(head_window(&webp_lossless(800, 600)), HEAD_WINDOW);
         assert_eq!(
             head_window(b"<html>not a picture</html>"),
             HEAD_WINDOW,
-            "and a file that is not a picture is not a HEIC either"
+            "and a file that is not a picture is not a HEIC or a JPEG either"
         );
         assert_eq!(
             head_window(&heic_of((1024, 1024), (6016, 6016), 4096)[..200]),
@@ -2877,6 +3182,219 @@ mod tests {
             head_window(&long),
             HEAD_WINDOW,
             "the small window measured it, so there is nothing to widen for"
+        );
+    }
+
+    /// The defect the eight `wallhaven` files exposed, on a fixture shaped the way
+    /// a photograph is: `ffd8`, an APP1/Exif segment of 3.0 KB that declares its
+    /// own length, then the frame header. The minimal [`jpeg`] fixture above
+    /// begins with an APP0/JFIF segment of 16 bytes and answers at byte 30, which
+    /// is why every JPEG already in a cache passed while these did not.
+    #[test]
+    fn a_photograph_behind_a_large_exif_segment_is_measured() {
+        let photo = jpeg_photo(1920, 1080, &exif(3048), &[], 0);
+        assert!(
+            photo.len() > HEAD_WINDOW,
+            "the Exif segment alone outruns the small window: {} bytes",
+            photo.len()
+        );
+        let small = &photo[..HEAD_WINDOW];
+        assert_eq!(
+            sniff(small),
+            None,
+            "the small window cannot reach the frame header"
+        );
+        assert_eq!(
+            sniffed(small),
+            Sniffed::BeyondWindow,
+            "and the walk ran out of head rather than the bytes being something else"
+        );
+        assert_eq!(
+            head_window(small),
+            WIDE_WINDOW,
+            "so a head is worth reading further, and this is by how much"
+        );
+        assert_eq!(
+            sniff(&photo),
+            Some(Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            }),
+            "the bytes are a JPEG whose dimensions were only ever a window away"
+        );
+    }
+
+    /// The same rule with two large pre-frame segments in front of the frame
+    /// header, which is what a phone or an editor writes when it stores Exif and
+    /// an ICC profile: the walk has to step past both, and neither fits in the
+    /// small window.
+    #[test]
+    fn a_photograph_behind_exif_and_a_large_icc_segment_is_measured() {
+        let photo = jpeg_photo(3840, 2160, &exif(2048), &icc(3072), 0);
+        let small = &photo[..HEAD_WINDOW];
+        assert_eq!(sniff(small), None, "APP1 alone is past the small window");
+        assert_eq!(head_window(small), WIDE_WINDOW);
+        assert_eq!(
+            sniff(&photo),
+            Some(Header {
+                ext: "jpg",
+                width: 3840,
+                height: 2160
+            }),
+            "the walk steps past APP1 and APP2 to the frame header"
+        );
+    }
+
+    /// The whole stream, not the sniff alone: section 3 step 5 reads a head that
+    /// is assembled from the reads of a download, and a photograph is more than
+    /// one 64 KiB read. The fixture is a real shape - 3 KB of Exif, the frame
+    /// header, then 70 KB of coded image - so the head has to widen mid-stream,
+    /// the file is stored under its digest, and the dimensions the old 1 KiB
+    /// head could not measure are reported.
+    #[test]
+    fn a_streamed_photograph_is_sniffed_stored_and_reported_with_its_dimensions() {
+        let dir = scratch("worker-streamed-photo");
+        let photo = jpeg_photo(1920, 1080, &exif(3048), &[], 70_000);
+        assert!(
+            photo.len() > 64 * 1024,
+            "the fixture needs more than one read of store's 64 KiB buffer: {} bytes",
+            photo.len()
+        );
+        let cache = Cache::at(dir.join("cache"));
+        let transport = Bytes::of(&[("pictures/photo.jpg", photo.clone())]);
+
+        let stored = store(&cache, 1, "pictures/photo.jpg", &transport, 200_000)
+            .expect("a photograph the small head refused is stored");
+
+        assert_eq!(
+            stored.header,
+            Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert_eq!(stored.bytes, photo.len() as u64);
+        assert!(!stored.hit);
+        assert_eq!(
+            stored.path,
+            state::content_path(cache.root(), &protocol::sha256_hex(&photo), "jpg")
+        );
+        assert!(stored.path.is_file(), "the bytes are published");
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "the part file is renamed, not left behind"
+        );
+    }
+
+    /// A JPEG past even the wide window is a bound and not bad content: the same
+    /// fixture one order of magnitude larger, so its APP1/Exif segment (the
+    /// largest a JPEG segment can declare, `0xffff`) steps the walk to byte
+    /// 65539, three bytes past the 64 KiB window. The bytes are a well-formed
+    /// JPEG that a reader with the whole file measures, so the failure must name
+    /// the window rather than claim the file is not an image.
+    #[test]
+    fn a_head_that_runs_out_mid_walk_names_the_window_and_not_bad_content() {
+        let dir = scratch("worker-head-window");
+        let photo = jpeg_photo(1920, 1080, &exif(65_533), &[], 4_000);
+        assert!(photo.len() > WIDE_WINDOW);
+        assert_eq!(
+            sniff(&photo),
+            Some(Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            }),
+            "the file is a JPEG and only the window is short"
+        );
+        let cache = Cache::at(dir.join("cache"));
+        let transport = Bytes::of(&[("pictures/deep.jpg", photo.clone())]);
+
+        let failure = store(&cache, 1, "pictures/deep.jpg", &transport, 200_000)
+            .expect_err("the wide window cannot reach the frame header");
+
+        assert_eq!(
+            failure.code,
+            ErrorCode::NotAnImage,
+            "2.7 has one code for a sniff that read no header; the message tells the two apart"
+        );
+        assert_eq!(failure.stage, "download");
+        assert!(
+            failure.message.contains("65536-byte head window"),
+            "the message names the bound: {}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("not JPEG, PNG, WebP or HEIC"),
+            "the bytes are a JPEG, and the message does not say otherwise: {}",
+            failure.message
+        );
+        assert_eq!(count_files(&cache.root().join("sha256")), 0);
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "the part file is deleted on this path too"
+        );
+    }
+
+    /// The same bytes, both callers of the sniff. `sources/local.rs` admits a
+    /// file it can measure and `store` measures what it downloaded, and both ask
+    /// [`head_window`] how much of a head is worth reading, so one verdict has to
+    /// come back for one file: a file this source admits is a file the download
+    /// path accepts, and one it drops is one the download path refuses.
+    ///
+    /// The fixture is the shape that made the disagreement visible in review:
+    /// `ffd8`, a 4 KB APP1/Exif segment, an APP2/ICC segment, then the frame
+    /// header at byte 4032 - past the 1 KiB small window and well inside the
+    /// 64 KiB one. `whirl-worker --verb set --target <this file>` took it while
+    /// the same bytes over the wire came back `not_an_image`, because the small
+    /// window was the only one the download path ever asked for. Both accept now,
+    /// and neither refuses a head the other reads.
+    #[test]
+    fn a_file_admitted_locally_and_the_same_bytes_fetched_get_the_same_verdict() {
+        let photo = jpeg_photo(1920, 1080, &exif(3998), &icc(24), 0);
+        assert!(
+            photo.len() > HEAD_WINDOW,
+            "the fixture has to outrun the small window: {} bytes",
+            photo.len()
+        );
+        let dir = scratch("worker-two-callers");
+        let path = dir.join("photo.jpg");
+        std::fs::write(&path, &photo).expect("the fixture file");
+
+        // The local source's own admission: what decides whether the file is a
+        // candidate at all (`local::candidate`).
+        let local = crate::sources::local::header_of(&path);
+        // The download path, handed the same bytes over a transport.
+        let cache = Cache::at(dir.join("cache"));
+        let transport = Bytes::of(&[("photo.jpg", photo.clone())]);
+        let wire = store(&cache, 1, "photo.jpg", &transport, 200_000)
+            .expect("the same bytes the local source admits are stored, not refused");
+
+        assert_eq!(
+            local,
+            Some(Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            }),
+            "the local source reads the frame header behind the Exif segment"
+        );
+        assert_eq!(
+            wire.header,
+            Header {
+                ext: "jpg",
+                width: 1920,
+                height: 1080
+            },
+            "and the wire path measures the same frame header"
+        );
+        assert_eq!(
+            local.as_ref(),
+            Some(&wire.header),
+            "one function answers both callers"
         );
     }
 
@@ -3323,6 +3841,487 @@ mod tests {
             "the third rotation set nothing: the two calls are the two rotations before it"
         );
         assert_eq!(count_files(&cache.root().join("sha256")), 2);
+    }
+
+    // -- what the index is asked before a fetch (4.1) -----------------------
+
+    /// A [`Bytes`] that also records every origin it was asked for: the
+    /// accounting behind "the second rotation fetches zero bytes for that id".
+    struct Counting {
+        bodies: HashMap<String, Vec<u8>>,
+        opened: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Counting {
+        fn of(pairs: &[(&str, Vec<u8>)]) -> Counting {
+            Counting {
+                bodies: pairs
+                    .iter()
+                    .map(|(origin, bytes)| (origin.to_string(), bytes.clone()))
+                    .collect(),
+                opened: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        /// The origins this transport was asked to open, in order.
+        fn opened(&self) -> Vec<String> {
+            self.opened.borrow().clone()
+        }
+    }
+
+    impl Transport for Counting {
+        fn open(&self, origin: &str) -> Result<Box<dyn Read>, String> {
+            self.opened.borrow_mut().push(origin.to_string());
+            match self.bodies.get(origin) {
+                Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
+                None => Err(format!("{origin}: no such file")),
+            }
+        }
+    }
+
+    /// The daemon's own record for a rotation (`whirl_core::state`), so the file
+    /// a test writes is the file [`Window::load`] really reads.
+    fn history_entry(report: &Report) -> HistoryEntry {
+        HistoryEntry {
+            set_at: "2026-09-26T00:00:00Z".to_string(),
+            via: Via::Source,
+            kind: Kind::Local,
+            origin_key: report.origin_key.clone(),
+            digest: Some(report.digest.clone()),
+            path: Some(report.path.clone()),
+        }
+    }
+
+    /// `history.json`, written the way the daemon writes it (6.2: newest first).
+    fn write_history_at(state_dir: &Path, entries: &[HistoryEntry]) {
+        fs::create_dir_all(state_dir).expect("the state directory");
+        let file = HistoryFile {
+            seq: entries.len() as u64 + 1,
+            written_at: "2026-09-26T00:00:00Z".to_string(),
+            entries: entries.to_vec(),
+        };
+        fs::write(state_dir.join(state::HISTORY_FILE), file.encode())
+            .expect("history.json is written");
+    }
+
+    /// `cache/index.json`, in the shape `whirld::cache::record` writes: the digest
+    /// is the key, and the entry names the `origin_key` and the extension the
+    /// file's own name carries. The other fields are the daemon's and the
+    /// pipeline reads none of them.
+    fn write_index_at(cache: &Cache, entries: &[(&Report, &str)]) {
+        let mut index = IndexFile {
+            seq: 1,
+            written_at: "2026-09-26T00:00:00Z".to_string(),
+            root_id: "test-root".to_string(),
+            entries: BTreeMap::new(),
+            dangling: Vec::new(),
+        };
+        for (report, ext) in entries {
+            index.entries.insert(
+                report.digest.clone(),
+                CacheIndexEntry {
+                    ext: ext.to_string(),
+                    bytes: 1,
+                    first_seen: "2026-09-26T00:00:00Z".to_string(),
+                    last_used: "2026-09-26T00:00:00Z".to_string(),
+                    source: "pictures".to_string(),
+                    kind: Kind::Local,
+                    origin: None,
+                    origin_key: report.origin_key.clone(),
+                    width: None,
+                    height: None,
+                    pinned: false,
+                },
+            );
+        }
+        fs::write(cache.index_path(), index.encode()).expect("the index is written");
+    }
+
+    /// A candidate whose image the cache already holds is taken from the cache,
+    /// with no request to the source (4.1).
+    ///
+    /// Three rotations over a listing of two ids, with the window at
+    /// `dedupe.recent_entries = 1` so that an id comes round again: the first two
+    /// fetch, because nothing is held; the third offers the id the first one set,
+    /// finds it in the index under a file that is still there, and opens no
+    /// origin at all. The counting transport is the accounting, and the history
+    /// and the index are written between the runs exactly as the daemon writes
+    /// them (6.2), from the reports the rotations produced.
+    #[test]
+    fn a_candidate_the_cache_already_holds_is_set_without_a_fetch() {
+        let dir = scratch("worker-held");
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        // Rotation 1: nothing is held, so the first candidate is fetched.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation fetches");
+        assert_eq!(first.origin_key, "pictures:one");
+        assert_eq!(transport.opened(), vec!["pictures/one.png".to_string()]);
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+
+        // Rotation 2: the id just set is in the window, so the other candidate is
+        // fetched. The window is small enough that the first id comes round on the
+        // very next rotation.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation fetches the other candidate");
+        assert_eq!(second.origin_key, "pictures:two");
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string()
+            ]
+        );
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png"), (&second, "png")]);
+
+        // Rotation 3: the window holds only the second id, so the first is offered
+        // again. It is in the index, under a file that is still there, so it is
+        // set from the cache and the transport is asked for nothing.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the third rotation serves the first candidate from the cache");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(third.digest, first.digest);
+        assert_eq!(third.path, first.path);
+        assert_eq!(
+            fs::read(&first.path).expect("the cached file is readable"),
+            one,
+            "the bytes served from the cache are the origin's own"
+        );
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string()
+            ],
+            "the third rotation fetched nothing: the index was consulted first"
+        );
+        assert_eq!(
+            count_files(&state::tmp_dir(cache.root())),
+            0,
+            "a candidate served from the cache has no part file"
+        );
+        assert_eq!(
+            setter.targets(),
+            vec![first.path.clone(), second.path.clone(), first.path.clone()],
+            "every rotation set something, the last one from the cache"
+        );
+    }
+
+    /// The same id, whose cached file has been deleted, is fetched again: the
+    /// `stat` is the rotation's decision, so a file the index lists but the disk
+    /// does not have is a miss like any other (4.1).
+    #[test]
+    fn a_held_candidate_whose_file_is_gone_is_fetched_again() {
+        let dir = scratch("worker-held-gone");
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation fetches");
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation fetches the other candidate");
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png"), (&second, "png")]);
+
+        // The index still names the first file; the disk no longer has it.
+        let stored = state::content_path(cache.root(), &first.digest, "png");
+        fs::remove_file(&stored).expect("the cached file is removed");
+        assert!(!stored.exists(), "the fixture starts with the file gone");
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the rotation fetches the candidate again");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(third.digest, first.digest);
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/one.png".to_string(),
+            ],
+            "a listed file that is gone is fetched again, not served"
+        );
+        assert!(
+            stored.is_file(),
+            "the bytes are back under their own content-addressed name"
+        );
+    }
+
+    /// The same id, whose cached file is still there under its own name but no
+    /// longer holds the bytes that name spells, is fetched again: the hit is the
+    /// file's contents matching the index's digest, not the file's existence
+    /// (4.1, and section 2's third reason for content-addressed names).
+    ///
+    /// The bytes that arrive replace the damaged copy under the same name, so
+    /// the setter is handed the image the name promises rather than whatever was
+    /// sitting under it.
+    #[test]
+    fn a_held_candidate_whose_file_was_replaced_is_fetched_again() {
+        let dir = scratch("worker-held-replaced");
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation fetches");
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation fetches the other candidate");
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png"), (&second, "png")]);
+
+        // The index still names the first file and the file is still there under
+        // that name, but something replaced its bytes in place: another image,
+        // same name. It no longer hashes to what the name spells.
+        let stored = state::content_path(cache.root(), &first.digest, "png");
+        let tampered = long_png(1600, 902, 48);
+        assert_ne!(
+            protocol::sha256_hex(&tampered),
+            first.digest,
+            "the replacement must hash to a different name for the case to bite"
+        );
+        fs::write(&stored, &tampered).expect("the cached file is replaced in place");
+
+        // The consultation is the file's bytes, so this is a miss even though the
+        // `stat` succeeds.
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        assert!(
+            window.cached(&cache, "pictures:one").is_none(),
+            "a file whose bytes do not hash to its name is not a hit"
+        );
+
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the rotation fetches the candidate again");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(third.digest, first.digest);
+        assert_eq!(third.path, first.path);
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/one.png".to_string(),
+            ],
+            "a file whose bytes have moved off its name is fetched again, not served"
+        );
+        assert_eq!(
+            fs::read(&stored).expect("the cache file is readable"),
+            one,
+            "the bytes that arrived replaced the damaged copy under the same name"
+        );
+        assert_eq!(
+            setter.targets().last().expect("the third rotation set"),
+            &stored.display().to_string(),
+            "the setter was handed the repaired file, not the damaged one"
+        );
+    }
+
+    /// The same id, whose index entry the sweep has evicted, is fetched again:
+    /// the index is the service map, and an id it no longer names has nothing to
+    /// serve however healthy the file for it may be (4.1).
+    #[test]
+    fn a_swept_entry_is_fetched_again() {
+        let dir = scratch("worker-entry-swept");
+        let config = copy_config(&dir);
+        let one = long_png(1600, 900, 32);
+        let two = long_png(1600, 901, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![
+                candidate("one", "pictures/one.png", 1600, 900, one.len() as u64),
+                candidate("two", "pictures/two.png", 1600, 901, two.len() as u64),
+            ]),
+        );
+        let transport = Counting::of(&[
+            ("pictures/one.png", one.clone()),
+            ("pictures/two.png", two.clone()),
+        ]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 1)
+            .rotate()
+            .expect("the first rotation fetches");
+        write_history_at(&state_dir, &[history_entry(&first)]);
+        write_index_at(&cache, &[(&first, "png")]);
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 2)
+            .rotate()
+            .expect("the second rotation fetches the other candidate");
+        write_history_at(&state_dir, &[history_entry(&second), history_entry(&first)]);
+
+        // The sweep's eviction write: the index no longer names the first id,
+        // while the file it used to describe is untouched on disk.
+        write_index_at(&cache, &[(&second, "png")]);
+        let stored = state::content_path(cache.root(), &first.digest, "png");
+        assert!(
+            stored.is_file(),
+            "the file the evicted entry described stays"
+        );
+
+        let window = Window::load(&state_dir, &cache.index_path(), 1);
+        assert!(
+            window.cached(&cache, "pictures:one").is_none(),
+            "an id the index no longer names has nothing to serve"
+        );
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window, &setter, 3)
+            .rotate()
+            .expect("the rotation fetches the candidate again");
+        assert_eq!(third.origin_key, "pictures:one");
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/two.png".to_string(),
+                "pictures/one.png".to_string(),
+            ],
+            "an evicted entry is a miss, and the candidate is fetched"
+        );
+    }
+
+    /// A rotation still succeeds when the index is absent, unreadable or stale:
+    /// the index half of the window comes back empty and every candidate is
+    /// fetched, rather than the rotation failing on a file it only reads (7.1).
+    #[test]
+    fn a_rotation_survives_an_index_it_cannot_read() {
+        let dir = scratch("worker-index-unreadable");
+        let config = copy_config(&dir);
+        let bytes = long_png(1600, 900, 32);
+        let sources = table(
+            &config,
+            Fixture::with(vec![candidate(
+                "one",
+                "pictures/one.png",
+                1600,
+                900,
+                bytes.len() as u64,
+            )]),
+        );
+        let transport = Counting::of(&[("pictures/one.png", bytes.clone())]);
+        let cache = Cache::at(dir.join("cache"));
+        let state_dir = dir.join("state");
+        let setter = Recorder::default();
+        // The window is empty for the whole test - `dedupe.recent_entries` at 0 -
+        // so the candidate is offered every time and the only half under test is
+        // the index.
+        let window = || Window::load(&state_dir, &cache.index_path(), 0);
+
+        // Absent: the common case, and an empty index rather than an error.
+        assert!(!cache.index_path().exists());
+        assert!(window().cached(&cache, "pictures:one").is_none());
+        let first = noop_run_of(&config, &sources, &transport, &cache, &window(), &setter, 1)
+            .rotate()
+            .expect("an absent index does not fail a rotation");
+        assert_eq!(transport.opened(), vec!["pictures/one.png".to_string()]);
+
+        // Unreadable: text the schema cannot parse. The file is read, warned
+        // about and ignored, and the candidate is fetched like a miss.
+        fs::create_dir_all(cache.root()).expect("the cache root");
+        fs::write(cache.index_path(), "{ not the index at all\n").expect("a broken index");
+        assert!(window().cached(&cache, "pictures:one").is_none());
+        let second = noop_run_of(&config, &sources, &transport, &cache, &window(), &setter, 2)
+            .rotate()
+            .expect("an unreadable index does not fail a rotation");
+        assert_eq!(
+            transport.opened(),
+            vec![
+                "pictures/one.png".to_string(),
+                "pictures/one.png".to_string()
+            ],
+            "an unreadable index serves nothing, so the bytes are fetched"
+        );
+        assert_eq!(second.digest, first.digest);
+
+        // A newer schema is a downgrade rather than corruption (6.4 step 4): it
+        // is left alone, serves nothing, and the rotation still fetches.
+        fs::write(cache.index_path(), "{\n  \"schema\": 2\n}\n").expect("a newer index");
+        assert!(window().cached(&cache, "pictures:one").is_none());
+        let third = noop_run_of(&config, &sources, &transport, &cache, &window(), &setter, 3)
+            .rotate()
+            .expect("a newer index does not fail a rotation");
+        assert_eq!(
+            transport.opened().len(),
+            3,
+            "three rotations, three fetches"
+        );
+        assert_eq!(third.digest, first.digest);
+        assert_eq!(
+            fs::read_to_string(cache.index_path()).expect("the newer index"),
+            "{\n  \"schema\": 2\n}\n",
+            "a newer schema is left exactly as it is"
+        );
     }
 
     /// The invariant of section 3: a partial fetch never becomes a cache file.

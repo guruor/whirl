@@ -743,7 +743,24 @@ impl Daemon {
         // nothing the worker reported. `reaped` goes with it: under 8.7's
         // fallback it is what lets the sweep remove that worker's lock file (8.8).
         self.finish_rotation(reported.as_ref(), reaped);
+        // The log's cap (docs/spec/state-and-cache.md 1.1, 4.2's
+        // `log_max_bytes`) is checked at the end of every rotation, which is the
+        // one place both the scheduled rotation and the one a client asks for
+        // pass through. Everything this rotation wrote is on disk by now -- the
+        // plan line, the worker's lines, the sweep -- so only the caller's
+        // outcome line follows the check, and the trim leaves room for it.
+        self.enforce_log_cap();
         outcome
+    }
+
+    /// Hold the log file to the cap the config states as of this rotation:
+    /// `reconfigure` has just run, so an edited cap applies here rather than at
+    /// the next daemon start. A log the trim cannot bound is reported and the
+    /// rotation carries on, because a log is not worth failing a rotation over.
+    fn enforce_log_cap(&self) {
+        if let Some(path) = &self.effective.log_path {
+            crate::log::enforce_reporting(path, self.effective.config().log_max_bytes);
+        }
     }
 
     /// docs/architecture.md 4.2 and 10.5: the daemon re-reads the config on
@@ -1469,6 +1486,7 @@ mod tests {
     use super::*;
     use crate::lock::{Attempt, Mode};
     use crate::testkit::Scratch;
+    use std::io::Write;
     use std::path::Path;
     use whirl_core::config::{Backend, LocalMode, LocalSource, SourceConfig, SourceKind};
 
@@ -2162,6 +2180,188 @@ mod tests {
             history_path(&daemon),
             Some(user_file.clone()),
             "and its history entry carries it"
+        );
+
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 4.2's `log_max_bytes` and docs/spec/state-and-cache.md 1.1: a rotation
+    /// holds the daemon's log to its cap, and it does so on the rotation path
+    /// whether the rotation succeeded or not. The cheapest failure to force is a
+    /// worker program that is not there.
+    ///
+    /// The counters of the other two files whirl writes are taken here as well,
+    /// because "the log is the only thing this touched" is the substance of the
+    /// rule and not a detail of it.
+    #[test]
+    fn a_rotation_holds_the_log_to_the_cap_the_config_states() {
+        let root = std::env::temp_dir().join(format!("whirl-log-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the root");
+
+        let mut config = Config::default();
+        let cap = whirl_core::config::LOG_CAP_MIN_BYTES;
+        config.log_max_bytes = cap;
+        let mut daemon = daemon_with(&root, Attempt::Acquired, config);
+        daemon.worker = crate::worker::Worker::new(
+            root.join("no-worker"),
+            root.join("config.json"),
+            Backend::Noop,
+            root.join("state"),
+            root.join("cache"),
+        );
+
+        // The log this process would have been handed by its supervisor. It is
+        // written by the test because the daemon never writes it itself.
+        let log = daemon.effective.log_path.clone().expect("a log path");
+        let mut text = String::new();
+        for index in 0..2_000 {
+            text.push_str(&format!("whirld: line {index:04}\n"));
+        }
+        std::fs::write(&log, &text).expect("the log");
+        let before = std::fs::metadata(&log).expect("stat").len();
+
+        // The state directory and the cache, counted the way the card counts
+        // them: files and bytes, and any `*.part` left behind. One rotation runs
+        // first, because the sweep legitimately writes the cache's index the
+        // first time it runs and it is the *sequence* that must not accumulate.
+        let count = |dir: &Path| -> (usize, u64) {
+            let mut files = 0;
+            let mut bytes = 0;
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if let Ok(metadata) = entry.metadata() {
+                        files += 1;
+                        bytes += metadata.len();
+                    }
+                }
+            }
+            (files, bytes)
+        };
+        let outcome = daemon.rotation(1, Via::Source, Verb::Rotate, None);
+        assert!(
+            matches!(outcome, Rotation::Failed { .. }),
+            "the worker program does not exist: {outcome:?}"
+        );
+        let cache_after_one = count(&root.join("cache"));
+        let state_after_one = count(&root.join("state"));
+
+        let after = std::fs::metadata(&log).expect("stat").len();
+        assert!(
+            before > cap,
+            "the fixture has to be over the cap to test it: {before}"
+        );
+        assert!(
+            after <= cap,
+            "the log is {after} bytes against a cap of {cap}"
+        );
+        let kept = std::fs::read_to_string(&log).expect("the log reads");
+        assert!(text.ends_with(&kept), "the newest lines are what is kept");
+        assert!(
+            kept.starts_with("whirld: line "),
+            "the kept text starts at a line start, not mid-line"
+        );
+
+        // The daemon's own lines go to a descriptor this process cannot reach
+        // (`eprintln!` is the test binary's stderr), so the supervisor's half is
+        // played here: one line appended between two rotations, which is what
+        // makes this a test of the cap over a sequence rather than of one trim.
+        // The appended line is longer than the margin between the trim's budget
+        // and the cap is wide, so the file crosses the budget again before the
+        // next rotation and the cap has to hold every time round.
+        const NEXT: &str = "whirld: the line the supervisor appends between two rotations\n";
+        for run in 2..=10 {
+            let outcome = daemon.rotation(run, Via::Source, Verb::Rotate, None);
+            assert!(
+                matches!(outcome, Rotation::Failed { .. }),
+                "run {run}: {outcome:?}"
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .expect("the log, appended to the way a supervisor appends");
+            file.write_all(NEXT.as_bytes()).expect("the next line");
+            let size = std::fs::metadata(&log).expect("stat").len();
+            assert!(
+                size <= cap,
+                "run {run} left the log at {size} bytes against a cap of {cap}"
+            );
+            let kept = std::fs::read_to_string(&log).expect("the log reads");
+            assert!(
+                kept.ends_with(NEXT),
+                "run {run}: the newest line is the last one a reader sees"
+            );
+            assert!(
+                kept.starts_with("whirld: line ") || kept.starts_with("whirld: the line"),
+                "run {run}: the kept text starts at a line start, not mid-line"
+            );
+        }
+
+        // The other half of the judgement: a rotation still works once the log
+        // has crossed its cap, and the cap holds through it. A worker that
+        // reports `set:` is 1.6's success shape, which is the one
+        // `testkit::daemon_with_a_set` builds.
+        let program = crate::testkit::script(
+            &root,
+            "worker-set.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' 'set: {} {} {}/wall.jpg'\n",
+                crate::testkit::digest('c'),
+                "local:cap/1",
+                root.display()
+            ),
+        );
+        daemon.worker = crate::worker::Worker::new(
+            program,
+            root.join("config.json"),
+            Backend::Noop,
+            root.join("state"),
+            root.join("cache"),
+        );
+        let outcome = daemon.rotation(11, Via::Source, Verb::Rotate, None);
+        assert!(
+            matches!(outcome, Rotation::Set(_)),
+            "a rotation still works after the log has crossed its cap: {outcome:?}"
+        );
+        let after_success = std::fs::metadata(&log).expect("stat").len();
+        assert!(
+            after_success <= cap,
+            "the successful rotation left the log at {after_success} bytes against a cap of {cap}"
+        );
+        let (cache_files, cache_bytes) = count(&root.join("cache"));
+        assert_eq!(
+            cache_files, cache_after_one.0,
+            "ten failing rotations added no cache file"
+        );
+        assert!(
+            cache_bytes <= cache_after_one.1 + 256,
+            "the cache's own index is rewritten in place at every rotation, so its \
+             timestamps can move a few bytes ({} -> {cache_bytes}); what it must not do \
+             is accumulate with the rotations",
+            cache_after_one.1
+        );
+        assert!(
+            count(&root.join("state")) >= state_after_one,
+            "the state directory still holds what it held"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(root.join("cache/tmp"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".part"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a `.part` file survived the rotation: {leftovers:?}"
         );
 
         drop(daemon);

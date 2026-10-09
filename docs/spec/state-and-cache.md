@@ -85,7 +85,7 @@ repository for local (nonroaming) applications" [6].
 | `~/Library/Application Support/whirl/state/favorites.json` | The favorites collection. | No. The one irreversible file (section 6.4). |
 | `~/Library/Application Support/whirl/whirl.sock` | The control socket, `0600`. | Yes. Recreated on start. |
 | `~/Library/Caches/whirl/` | `index.json`, `sha256/**`, `tmp/**`. The whole directory. | Yes, for whirl. See 1.4 for the display caveat. |
-| `~/Library/Logs/whirl/whirl.log` | The log, one file rotated at 1 MiB, three kept. | Yes. Diagnostics only. |
+| `~/Library/Logs/whirl/whirl.log` | The log, one file, rewritten in place when it crosses `log_max_bytes` (`docs/architecture.md` 4.2), newest whole lines kept. | Yes. Diagnostics only. |
 
 `decision:` the directory is literally `whirl`, not a reverse-DNS bundle id.
 Apple's convention is "a subdirectory whose name matches the bundle identifier
@@ -101,6 +101,22 @@ follows the same naming convention as the two directories above. This is a
 convention call, not a quoted requirement: Apple's table is written for the
 system domain, and the reason to follow it is that a user with a disk-space
 problem can delete logs without wondering whether they were state.
+
+`decision:` the log is rewritten **in place** rather than rotated, and that is
+forced by who opens it. The daemon never opens the log: the launchd job's
+`StandardOutPath` and `StandardErrorPath` do
+(`crates/whirl-cli/src/daemon/macos.rs`), and launchd opens that descriptor with
+`O_APPEND` and offers no rotation key. An `O_APPEND` descriptor holds the inode,
+not the path, so renaming the log out of the way would leave the daemon appending
+to the renamed file: the archive would grow and the live log would stay empty,
+which is the opposite of what a rotation is for. Rewriting in place keeps the
+inode, so the daemon's next line lands on the kept text. The cap itself is
+`log_max_bytes` (4.2), and the daemon applies it at startup and at the end of
+every rotation. The one thing this asks of a setup that writes the log by hand is
+that its redirect append (`>>`, or any `O_APPEND` descriptor): a `>` redirect
+does not append, and a write at its stale offset after a trim would leave a NUL
+hole. Nothing in whirl redirects with `>`; the harness that spawns a daemon under
+test opens its log with `append(true)` for that reason.
 
 ### 1.2 Linux (XDG)
 
@@ -209,8 +225,9 @@ never from the URL.
 Why the name is the hash, and not the prototype's `wh-<source-id>.<ext>
 (main.go:282)`:
 
-1. Identity and filename become the same fact, so dedupe is a `stat`, not a
-   table lookup that can disagree with the disk.
+1. Identity and filename become the same fact, so dedupe is the file's bytes
+   hashing to the digest in its name, not a table lookup that can disagree with
+   the disk.
 2. A re-materialised favorite lands at the same path it had before, which is what
    makes "the evictor skips pinned files" (features.md 1.2) a stable rule rather
    than one that breaks after a cache clear.
@@ -307,15 +324,18 @@ The protocol, in order, for every candidate that needs bytes:
    also produces the extension used in the final name, so a URL ending in `.php`
    cannot choose it.
 6. Flush and close the part file. Compute the final path from the digest.
-7. If the final path already exists, the bytes are identical by construction, so
-   `unlink` the part file and report a cache **hit** (the daemon bumps
-   `last_used`). Otherwise `rename(tmp/.../<name>.part, sha256/aa/bb/<name>.<ext>)`.
+7. If the final path already exists **and its bytes still hash to the name it
+   carries**, the bytes are identical by construction, so `unlink` the part file
+   and report a cache **hit** (the daemon bumps `last_used`). Otherwise -
+   the path is free, or a file something else truncated or replaced is sitting
+   under it - `rename(tmp/.../<name>.part, sha256/aa/bb/<name>.<ext>)`, which
+   also repairs a damaged copy in place rather than handing it to the setter.
    `decision:` no `fsync` on this path: the file is a cache, a power failure may
-   cost a re-download, and the size check against the index (section 6.3) catches
-   a damaged copy. The publication guarantee we actually need is atomicity, not
-   durability, and that is what `rename` gives: "The rename() system call
-   guarantees that an instance of new will always exist, even if the system
-   should crash in the middle of the operation" [L 1].
+   cost a re-download, and the check that a file's bytes still spell its name
+   (section 2) catches a damaged copy. The publication guarantee we actually need
+   is atomicity, not durability, and that is what `rename` gives: "The rename()
+   system call guarantees that an instance of new will always exist, even if the
+   system should crash in the middle of the operation" [L 1].
 8. Hand the final path to the platform setter. Only now, with the setter's
    success, report the entry to the daemon on stdout (section 7.3).
 
@@ -369,21 +389,39 @@ failure path; `-set` no longer downloads at all, so it has nothing to prune.
 
 | Candidate identity | What it gets right | What it gets wrong | Verdict |
 |---|---|---|---|
-| Content hash (SHA-256 of the stored bytes) | Filename is identity; dedupe is a `stat`; the name verifies the bytes; a re-materialised file returns to a stable path, so pins survive | Costs a hash pass; two byte-identical images from different sources collapse, which is the point but must be a stated decision | **Chosen** as the primary identity |
+| Content hash (SHA-256 of the stored bytes) | Filename is identity; a hit is the file's bytes hashing to the digest in its name, so dedupe and the integrity check are one pass; a re-materialised file returns to a stable path, so pins survive | Costs a hash pass; two byte-identical images from different sources collapse, which is the point but must be a stated decision | **Chosen** as the primary identity |
 | Source-scoped ID (Wallhaven `id`, Wikimedia pageid, local path) | Free: the source already returned it; a cheap pre-download filter | Names are not identity: the same image from two sources has two ids and lands twice; a `local` id built from a filename (as `main.go:246-247` does) changes under a rename | **Kept as a secondary key**, `origin_key`, for the pre-download window check only |
 | Canonical URL | Free; human readable; it is what a re-download needs | Same URL can serve different bytes (re-encode, a `?cb=` query), and different URLs serve identical bytes (mirrors, thumbnails, a local copy of something downloaded earlier) | **Kept as the re-materialisation hint only**, field `origin`, never as identity |
 
 `decision:` because the two secondary keys are kept, the pipeline has both a
-cheap check and the correct one:
+cheap check and the correct one, and the recent window those keys are read from
+is two halves answering two different questions:
 
-1. Before any download, drop a candidate whose `origin_key` appears in the recent
-   window: the whole history ring (50 entries by default) plus the current index.
-   This is O(50) over in-memory data and it stops the common case (a `random`
-   query returning the same wallpaper) before it costs a request. features.md 2.5
-   says 20; section 9 records why this document uses the ring instead.
-2. After the download, drop a candidate whose digest already has a file in the
-   cache. This catches what the first check cannot: a local copy of an image that
-   was fetched earlier from a remote source, and two queries that overlap.
+1. Before any download, the **history ring** bounded by
+   `dedupe.recent_entries` (50 entries by default) is the **rejection** set: a
+   candidate whose `origin_key` (or whose id) appears in it is dropped. This is
+   O(50) over in-memory data and it stops the common case (a `random` query
+   returning the same wallpaper) before it costs a request. features.md 2.5 says
+   20; section 9 records why this document uses the ring instead.
+   The **cache index** is the other half and it is not part of that set: it is
+   the **service** map. When the index names the candidate's `origin_key` under a
+   file whose bytes still hash to the digest in its name, the bytes are already
+   held, and the candidate is set from the cache with no request to the source at
+   all. An image the cache holds is not a candidate to drop, it is one to serve
+   for free. A file that is gone, a file whose bytes no longer spell its name, an
+   entry the sweep has evicted, and an index that is absent, unreadable or of a
+   newer schema are every one of them a miss, and the candidate is fetched like
+   any other.
+2. After the download, a candidate whose digest already has a file in the cache
+   is not written a second time: the part file is dropped and the bytes are a
+   cache **hit** (the daemon bumps `last_used`). That is the same confirmation as
+   the index half above, taken after the fetch instead of before it, and it is
+   section 2's third reason for content-addressed names: the copy on disk counts
+   as the entry only while its bytes still hash to the name it carries, and a
+   file something else truncated or replaced under that name is overwritten with
+   the bytes just fetched rather than set. This step catches what the first check
+   cannot: a local copy of an image that was fetched earlier from a remote
+   source, and two queries that overlap.
 
 ### 4.2 The cost, measured
 
@@ -933,12 +971,12 @@ that opens the file.
 |---|---|---|---|
 | `config.json` | the user, in an editor | daemon, at start and on reload; the worker, once per run; the CLI, for the socket path | `whirl config path`, `whirl config check`, `whirl sources` |
 | `state/current.json` | daemon | daemon; humans | `whirl status`; `whirl pause`, `whirl resume` |
-| `state/history.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl history`; `whirl prev` |
+| `state/history.json` | daemon | daemon; the worker, for the rejection set of 4.1 | `whirl history`; `whirl prev` |
 | `state/favorites.json` | daemon | daemon | `whirl favorites`; `whirl favorite`, `whirl unfavorite` |
 | `log` | daemon | humans | none |
 | `state/locks/daemon.lock` | daemon (held for its lifetime) | a second daemon, at startup | `whirl status` (`lock_mode`) |
 | `state/locks/rotate.lock` | a worker, for the run; the daemon, for a sweep | both | `whirl status` (`sweep_deferred`) |
-| `cache/index.json` | daemon | daemon; the worker, for the recent window of 4.1 | `whirl status` (`cache_root_id`) |
+| `cache/index.json` | daemon | daemon; the worker, for the service map of 4.1 | `whirl status` (`cache_root_id`) |
 | `cache/sha256/**` | the worker run that created it | the setter call in that run; the daemon, `stat` only | `whirl status` (`cache_files`, `cache_bytes`) |
 | `cache/tmp/**` | the worker run that created it | nobody | none |
 

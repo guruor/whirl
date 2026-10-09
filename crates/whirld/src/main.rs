@@ -24,6 +24,8 @@ mod events;
 #[cfg(unix)]
 mod lock;
 #[cfg(unix)]
+mod log;
+#[cfg(unix)]
 mod plan;
 #[cfg(unix)]
 mod schedule;
@@ -116,12 +118,23 @@ fn run(flags: &plan::Flags) -> Result<(), String> {
         effective.cache_dir.clone(),
     );
     let socket_path = effective.socket_path.clone();
+    let log_path = effective.log_path.clone();
+    let log_cap = effective.config().log_max_bytes;
     // The state files are read here: a quarantine, a rebuild and the degraded
     // modes of docs/spec/state-and-cache.md 6.4 all happen before the socket is
     // bound, so the first `status` already reports them.
     let daemon = Arc::new(state::Daemon::load(effective, worker, lock));
     let listener = socket::bind(&socket_path)?;
     eprintln!("whirld: listening on {}", socket_path.display());
+
+    // The log of docs/spec/state-and-cache.md 1.1 is the file the supervisor
+    // opened for this process, so this process holds it to `log_max_bytes` rather
+    // than the other way round. The check runs after the startup lines above, so
+    // the cap applies to the whole file including them, and again at the end of
+    // every rotation.
+    if let Some(path) = &log_path {
+        log::enforce_reporting(path, log_cap);
+    }
 
     // 5.5's first trigger: "at daemon start (after the socket is bound and before
     // the first slot)". The socket is bound above, so a client that connects

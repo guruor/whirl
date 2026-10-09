@@ -27,6 +27,16 @@ use std::path::{Path, PathBuf};
 /// (docs/architecture.md 4.2, `config_schema`).
 pub const CONFIG_SCHEMA: i64 = 1;
 
+/// The floor a nonzero `log_max_bytes` must meet (docs/architecture.md 4.3).
+///
+/// `0` is the other legal value and means "keep everything", which has to be
+/// written rather than inferred. A nonzero cap below this floor is refused
+/// because a rotation's own lines (the plan line alone measured 484 bytes on a
+/// real install) would fill it, leaving a log that says nothing after the first
+/// trim. The daemon's trim leaves this much room free as well, so the two
+/// numbers move together.
+pub const LOG_CAP_MIN_BYTES: u64 = 4096;
+
 /// The source kinds the schema knows. Also the closed set an unknown `kind` is
 /// reported against (docs/spec/features.md 2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -325,6 +335,9 @@ pub struct Config {
     /// `socket`: `None` means the platform default.
     pub socket: Option<PathBuf>,
     pub log_level: LogLevel,
+    /// `log_max_bytes`: the cap on the daemon's own log file. `0` keeps
+    /// everything and is the only value that means that.
+    pub log_max_bytes: u64,
     pub schedule: Schedule,
     pub startup: Startup,
     pub display: DisplaySection,
@@ -346,6 +359,7 @@ impl Default for Config {
             config_schema: CONFIG_SCHEMA,
             socket: None,
             log_level: LogLevel::Info,
+            log_max_bytes: 1_048_576,
             schedule: Schedule {
                 interval_seconds: 1800,
                 worker_deadline_seconds: 300,
@@ -673,6 +687,10 @@ fn parse_root(root: &json::Node, warnings: &mut Vec<ConfigWarning>) -> Result<Co
             &LogLevel::ALL.map(LogLevel::as_str),
             LogLevel::parse,
         )?;
+    }
+    if let Some(node) = reader.field("log_max_bytes") {
+        let field = reader.path("log_max_bytes");
+        config.log_max_bytes = want_u64(node, &field)?;
     }
     if let Some(node) = reader.field("schedule") {
         let field = reader.path("schedule");
@@ -1352,6 +1370,19 @@ fn validate_ordering(config: &Config, lines: &Lines) -> Result<(), ConfigError> 
             format!(
                 "{} is less than 60",
                 config.schedule.worker_deadline_seconds
+            ),
+        ));
+    }
+    // `0` is "keep everything" and has to be written rather than inferred, so
+    // the floor applies to every other value and never to zero
+    // (docs/architecture.md 4.3).
+    if config.log_max_bytes != 0 && config.log_max_bytes < LOG_CAP_MIN_BYTES {
+        return Err(ConfigError::new(
+            "log_max_bytes",
+            *lines.get("log_max_bytes").unwrap_or(&0),
+            format!(
+                "{} is neither 0 (keep everything) nor at least {LOG_CAP_MIN_BYTES}",
+                config.log_max_bytes
             ),
         ));
     }
@@ -2153,7 +2184,7 @@ const DEFAULT_CONFIG_JSON: &str = r#"{
   "_comment_3": "every level. Every key below is written at its default value, so deleting a line",
   "_comment_4": "keeps the default and there is no key whose absence means something different.",
   "_comment_5": "Precedence, lowest first: compiled defaults, this file, the environment",
-  "_comment_6": "(WHIRL_CONFIG, WHIRL_SOCKET, WHIRL_STATE_DIR, WHIRL_CACHE_DIR, WHIRL_BACKEND,",
+  "_comment_6": "(WHIRL_CONFIG, WHIRL_SOCKET, WHIRL_STATE_DIR, WHIRL_CACHE_DIR, WHIRL_LOG, WHIRL_BACKEND,",
   "_comment_7": "WHIRL_WALLHAVEN_API_KEY), then daemon flags, which exist for tests only.",
   "_comment_8": "Two legacy names are still accepted and log a deprecation warning: `keep` for",
   "_comment_9": "cache.max_files and `cache_dir` for cache.root. Neither is written back.",
@@ -2166,6 +2197,9 @@ const DEFAULT_CONFIG_JSON: &str = r#"{
 
   "log_level": "info",
   "_comment_log_level": "off | error | warn | info | debug. The log is a file the daemon owns; it is never an interface.",
+
+  "log_max_bytes": 1048576,
+  "_comment_log_max_bytes": "1 MiB. The cap on the log file, checked at startup and at every rotation: past it the daemon rewrites the file keeping the newest whole lines and writes one line saying what it dropped. 0 means keep everything and is the only value that means that; any other value must be at least 4096.",
 
   "schedule": {
     "interval_seconds": 1800,
@@ -2310,6 +2344,7 @@ mod tests {
         let defaults = Config::default();
         assert_eq!(config.config_schema, defaults.config_schema);
         assert_eq!(config.log_level, defaults.log_level);
+        assert_eq!(config.log_max_bytes, defaults.log_max_bytes);
         assert_eq!(config.schedule, defaults.schedule);
         assert_eq!(config.startup, defaults.startup);
         assert_eq!(config.display, defaults.display);
@@ -2468,6 +2503,7 @@ mod tests {
                 "schedule.worker_deadline_seconds",
                 3,
             ),
+            ("{\n  \"log_max_bytes\": 4095\n}", "log_max_bytes", 2),
         ] {
             let error = refusal(text);
             assert_eq!(error.field.as_deref(), Some(field), "{text}");
@@ -2675,6 +2711,34 @@ mod tests {
         assert_eq!(loaded.config.cache.root, None);
         assert_eq!(loaded.config.backend, Backend::Native);
         assert!(loaded.config.sources.is_empty());
+    }
+
+    /// `log_max_bytes` (docs/architecture.md 4.3): zero is "keep everything" and
+    /// has to be written rather than inferred, and every other value has to clear
+    /// the floor.
+    #[test]
+    fn the_log_cap_accepts_zero_and_the_floor_and_refuses_between() {
+        let loaded = Config::parse("{\n  \"log_max_bytes\": 0\n}").expect("zero keeps everything");
+        assert_eq!(loaded.config.log_max_bytes, 0);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+        let loaded = Config::parse("{\n  \"log_max_bytes\": 4096\n}").expect("the floor");
+        assert_eq!(loaded.config.log_max_bytes, 4096);
+
+        let error = refusal("{\n  \"log_max_bytes\": 1\n}");
+        assert_eq!(error.field.as_deref(), Some("log_max_bytes"));
+        assert_eq!(error.line, 2);
+        assert_eq!(
+            error.to_string(),
+            "log_max_bytes (line 2): 1 is neither 0 (keep everything) nor at least 4096"
+        );
+
+        // The default is the documented 1 MiB, and deleting the line keeps it.
+        assert_eq!(
+            Config::default().log_max_bytes,
+            1_048_576,
+            "4.2's `log_max_bytes` default"
+        );
     }
 
     #[test]

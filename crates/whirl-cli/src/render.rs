@@ -33,6 +33,9 @@ pub const EXIT_USAGE: u8 = 3;
 pub enum Exit {
     /// Print it and keep reading.
     Line,
+    /// The one interim line, `queued` (2.6): print it, and the wait it opens is
+    /// the client's to narrate (`main`'s courtesy line).
+    Interim,
     /// Print it, and this one ends the subscription (`whirl idle`).
     Event,
     /// The response is complete: exit 0.
@@ -50,9 +53,12 @@ pub fn verdict(line: &str) -> Exit {
         LineKind::Err { code, .. } => Exit::Refused(code),
         LineKind::Event => Exit::Event,
         LineKind::Malformed => Exit::Malformed,
-        // The greeting, `queued`, and every `key: value` or positional record
-        // line: printed as it arrived, because the CLI formats nothing.
-        LineKind::Greeting | LineKind::Interim | LineKind::Data => Exit::Line,
+        // The greeting and every `key: value` or positional record line: printed
+        // as it arrived, because the CLI formats nothing.
+        LineKind::Greeting | LineKind::Data => Exit::Line,
+        // `queued` is printed too, and it is told apart from the data so the
+        // transport knows a worker is running and the wait has begun.
+        LineKind::Interim => Exit::Interim,
     }
 }
 
